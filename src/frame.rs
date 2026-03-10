@@ -1,0 +1,39 @@
+//! Core frame-domain types shared across the crate.
+
+use kornia_3d::camera::ImageSize;
+use kornia_3d::pose::Pose3d;
+pub use kornia_imgproc::features::OrbFeatures;
+
+/// `Frame` carries ORB features directly today.
+///
+/// If kornia-slam grows multiple frontend feature pipelines, this module is the
+/// place to introduce a higher-level abstraction above `OrbFeatures`.
+
+/// A camera observation: features extracted at a known pose.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// Frame index.
+    pub idx: usize,
+    /// Features extracted for this frame.
+    pub features: OrbFeatures,
+    /// Camera pose in world-to-camera convention.
+    pub pose_world_to_cam: Pose3d,
+    /// Image dimensions.
+    pub image_size: ImageSize,
+}
+
+impl Frame {
+    pub fn new(
+        idx: usize,
+        features: OrbFeatures,
+        pose_world_to_cam: Pose3d,
+        image_size: ImageSize,
+    ) -> Self {
+        Self {
+            idx,
+            features,
+            pose_world_to_cam,
+            image_size,
+        }
+    }
+}
