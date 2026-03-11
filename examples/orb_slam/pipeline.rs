@@ -98,6 +98,20 @@ impl ORBSLAMPipeline {
 mod tests {
     use super::*;
     use kornia_3d::camera::ImageSize;
+    use kornia_imgproc::features::OrbMatchConfig;
+
+    fn test_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 300.0,
+            fy: 300.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
 
     fn test_frame(idx: usize, keypoints_xy: Vec<[f32; 2]>, descriptors: Vec<[u8; 32]>) -> Frame {
         Frame::new(
@@ -115,18 +129,70 @@ mod tests {
         )
     }
 
+    fn synthetic_bootstrap_frames() -> (Frame, Frame) {
+        let camera = test_camera();
+        let world_points = [
+            (-0.8, -0.4, 3.0),
+            (-0.5, 0.3, 3.4),
+            (-0.2, -0.2, 3.8),
+            (0.1, 0.5, 4.2),
+            (0.4, -0.3, 4.6),
+            (0.7, 0.2, 3.7),
+            (-0.6, 0.1, 4.4),
+            (0.3, -0.5, 3.3),
+            (0.9, 0.4, 4.8),
+            (-0.1, 0.0, 5.1),
+        ];
+        let baseline = 0.4;
+
+        let project = |x: f64, y: f64, z: f64| -> [f32; 2] {
+            [
+                (camera.fx * x / z + camera.cx) as f32,
+                (camera.fy * y / z + camera.cy) as f32,
+            ]
+        };
+        let descriptor = |idx: usize| -> [u8; 32] {
+            let mut bits = [0u8; 32];
+            bits[idx] = 0xFF;
+            bits
+        };
+
+        let reference_keypoints = world_points
+            .iter()
+            .map(|&(x, y, z)| project(x, y, z))
+            .collect();
+        let current_keypoints = world_points
+            .iter()
+            .map(|&(x, y, z)| project(x - baseline, y, z))
+            .collect();
+        let descriptors: Vec<[u8; 32]> = (0..world_points.len()).map(descriptor).collect();
+
+        (
+            test_frame(0, reference_keypoints, descriptors.clone()),
+            test_frame(1, current_keypoints, descriptors),
+        )
+    }
+
+    fn permissive_two_view_init_config() -> TwoViewInitConfig {
+        let mut config = TwoViewInitConfig::default();
+        config.match_config = OrbMatchConfig {
+            nn_ratio: 0.8,
+            th_low: 255,
+            check_orientation: false,
+            histo_length: 30,
+        };
+        config.estimation_config.ransac_f.min_inliers = 8;
+        config.estimation_config.ransac_h.min_inliers = 4;
+        config.acceptance_config.min_matches = 8;
+        config.acceptance_config.min_inliers = 8;
+        config.acceptance_config.min_triangulated = 8;
+        config.estimation_config.min_parallax_deg = 0.5;
+        config
+    }
+
     #[test]
     fn process_frame_stores_first_bootstrap_frame_and_skips() {
-        let camera = PinholeCamera {
-            fx: 458.654,
-            fy: 457.296,
-            cx: 367.215,
-            cy: 248.375,
-            k1: -0.28340811,
-            k2: 0.07395907,
-            p1: 0.00019359,
-            p2: 1.76187114e-05,
-        };
+        let camera = test_camera();
         let mut system = ORBSLAMPipeline::new(
             camera,
             TwoViewInitConfig::default(),
@@ -142,16 +208,7 @@ mod tests {
 
     #[test]
     fn process_frame_uses_tracking_path_when_tracking_mode_is_active() {
-        let camera = PinholeCamera {
-            fx: 458.654,
-            fy: 457.296,
-            cx: 367.215,
-            cy: 248.375,
-            k1: -0.28340811,
-            k2: 0.07395907,
-            p1: 0.00019359,
-            p2: 1.76187114e-05,
-        };
+        let camera = test_camera();
         let mut system = ORBSLAMPipeline::new(
             camera,
             TwoViewInitConfig::default(),
@@ -164,5 +221,24 @@ mod tests {
         assert_eq!(result.status, OdometryStatus::Skipped);
         assert_eq!(system.state.consecutive_failures, 1);
         assert_eq!(system.state.state, OdometryMode::Tracking);
+    }
+
+    #[test]
+    fn process_frame_bootstraps_into_tracking_mode() {
+        let (reference_frame, current_frame) = synthetic_bootstrap_frames();
+        let mut system = ORBSLAMPipeline::new(
+            test_camera(),
+            permissive_two_view_init_config(),
+            MapProjectionConfig::default(),
+        );
+
+        let first = system.process_frame(reference_frame);
+        let second = system.process_frame(current_frame);
+
+        assert_eq!(first.status, OdometryStatus::Skipped);
+        assert_eq!(second.status, OdometryStatus::KeyframeAccepted);
+        assert_eq!(system.state.state, OdometryMode::Tracking);
+        assert_eq!(system.current_keyframe_idx(), Some(1));
+        assert!(system.num_map_points() >= 8);
     }
 }
