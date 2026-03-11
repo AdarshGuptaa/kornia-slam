@@ -12,8 +12,8 @@ use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::map_projection::MapProjectionConfig;
 use kornia_slam::estimation::two_view::TwoViewInitConfig;
 use kornia_slam::mapping::{Map, MapPoint};
-use kornia_slam::odometry::{OdometryMode, OdometryResult, OdometryState, OdometryStatus};
-use kornia_slam::{Frame, OrbFeatures};
+use kornia_slam::odometry::{OdometryMode, OdometryResult, OdometryState};
+use kornia_slam::Frame;
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct ORBSLAMPipeline {
@@ -99,6 +99,8 @@ mod tests {
     use super::*;
     use kornia_3d::camera::ImageSize;
     use kornia_imgproc::features::OrbMatchConfig;
+    use kornia_slam::OrbFeatures;
+    use kornia_slam::odometry::OdometryStatus;
 
     fn test_camera() -> PinholeCamera {
         PinholeCamera {
