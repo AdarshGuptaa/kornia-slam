@@ -3,87 +3,23 @@
 //! This is an example-specific orchestrator that wires together the building
 //! blocks from kornia-slam into a concrete ORB-based SLAM pipeline.
 
+use crate::bootstrap::run_bootstrap;
+
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{
-    TwoViewConfig, TwoViewModel, triangulate_midpoint_known_pose, two_view_estimate,
-};
+use kornia_3d::pose::{TwoViewConfig, TwoViewModel, triangulate_midpoint_known_pose, two_view_estimate};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use kornia_slam::mapping::ba::run_local_ba;
-use kornia_slam::mapping::{
-    cull_map_points, Keyframe, Map, MapPoint,
-};
+use kornia_slam::mapping::{cull_map_points, Keyframe, Map, MapPoint};
 use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::map_projection::{
     MapProjectionConfig, MapProjectionEstimateOutcome,
 };
-use kornia_slam::estimation::two_view::{
-    TwoViewInitConfig, TwoViewInitOutcome, try_initialize_two_view,
-};
+use kornia_slam::estimation::two_view::TwoViewInitConfig;
 use kornia_slam::odometry::{OdometryMode, OdometryResult, OdometryState, OdometryStatus};
 use kornia_slam::{Frame, OrbFeatures};
-
-fn materialize_bootstrap_map(
-    map: &mut Map,
-    reference_frame: Frame,
-    current_frame: Frame,
-    matches: &[(usize, usize)],
-    points3d: &[Vec3F64],
-    inlier_indices: &[usize],
-    median_depth: Option<f64>,
-) -> usize {
-    let mut reference_kf = Keyframe::from_frame(reference_frame);
-    let mut current_kf = Keyframe::from_frame(current_frame);
-    let depth_scale = median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
-    let reference_pose_inv = reference_kf.frame.pose_world_to_cam.inverse();
-    let mut added = 0usize;
-
-    for (p_cam, &match_idx) in points3d.iter().zip(inlier_indices.iter()) {
-        let Some(&(reference_desc_idx, current_desc_idx)) = matches.get(match_idx) else {
-            continue;
-        };
-        if reference_desc_idx >= reference_kf.map_point_by_desc_idx.len()
-            || current_desc_idx >= current_kf.map_point_by_desc_idx.len()
-        {
-            continue;
-        }
-
-        let descriptor = current_kf
-            .frame
-            .features
-            .descriptors
-            .get(current_desc_idx)
-            .copied()
-            .or_else(|| {
-                reference_kf
-                    .frame
-                    .features
-                    .descriptors
-                    .get(reference_desc_idx)
-                    .copied()
-            });
-        let Some(descriptor) = descriptor else {
-            continue;
-        };
-
-        let p_world = reference_pose_inv.transform_point(&(*p_cam / depth_scale));
-        let mp_idx = map.push_map_point(MapPoint::new(
-            p_world,
-            descriptor,
-            reference_kf.frame.idx,
-        ));
-        reference_kf.associate_map_point(reference_desc_idx, mp_idx);
-        current_kf.associate_map_point(current_desc_idx, mp_idx);
-        added += 1;
-    }
-
-    map.upsert_keyframe(reference_kf);
-    map.upsert_keyframe(current_kf);
-
-    added
-}
 
 fn grow_map_points_from_keyframe_pair(
     map: &mut Map,
@@ -302,70 +238,14 @@ impl ORBSLAMPipeline {
         &self.state.pose_world_to_cam
     }
 
-    fn bootstrap(&mut self, mut curr_frame: Frame) -> OdometryResult {
-        // Stamp frames with current odometry pose so bootstrap builds
-        // the new map in the existing coordinate frame (not at origin).
-        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
-
-        let Some(prev_bootstrap_frame) = self.state.bootstrap_frame.take() else {
-            // First bootstrap frame — store it and wait for a second frame.
-            self.state.bootstrap_frame = Some(curr_frame);
-            return OdometryResult {
-                pose_world_to_cam: self.state.pose_world_to_cam,
-                status: OdometryStatus::Skipped,
-            };
-        };
-
-        let outcome = try_initialize_two_view(
-            &prev_bootstrap_frame.features,
-            &prev_bootstrap_frame.pose_world_to_cam,
-            &curr_frame.features,
-            &curr_frame.pose_world_to_cam,
+    fn bootstrap(&mut self, curr_frame: Frame) -> OdometryResult {
+        run_bootstrap(
+            &mut self.state,
+            &mut self.map,
             self.estimator.camera(),
             &self.two_view_init_config,
-        );
-
-        match outcome {
-            TwoViewInitOutcome::Rejected { .. } => {
-                self.state.bootstrap_frame = Some(prev_bootstrap_frame);
-                OdometryResult {
-                    pose_world_to_cam: self.state.pose_world_to_cam,
-                    status: OdometryStatus::Skipped,
-                }
-            }
-            TwoViewInitOutcome::Initialized {
-                pose_world_to_cam,
-                motion_increment,
-                matches,
-                points3d,
-                inlier_indices,
-                median_depth,
-            } => {
-                self.state.velocity = Some(motion_increment);
-                self.state.pose_world_to_cam = pose_world_to_cam;
-                curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
-
-                let curr_idx = curr_frame.idx;
-                materialize_bootstrap_map(
-                    &mut self.map,
-                    prev_bootstrap_frame,
-                    curr_frame,
-                    &matches,
-                    &points3d,
-                    &inlier_indices,
-                    median_depth,
-                );
-
-                self.state.current_keyframe_idx = Some(curr_idx);
-                self.state.last_keyframe_idx = Some(curr_idx);
-                self.state.state = OdometryMode::Tracking;
-
-                OdometryResult {
-                    pose_world_to_cam: self.state.pose_world_to_cam,
-                    status: OdometryStatus::KeyframeAccepted,
-                }
-            }
-        }
+            curr_frame,
+        )
     }
 
     fn track(&mut self, frame: Frame) -> OdometryResult {
@@ -515,7 +395,6 @@ impl ORBSLAMPipeline {
 mod tests {
     use super::*;
     use kornia_3d::camera::ImageSize;
-    use kornia_algebra::Vec3F64;
     use kornia_imgproc::features::OrbMatchConfig;
     use kornia_imgproc::features::OrbFeatures;
     use kornia_3d::pose::TwoViewConfig;
@@ -534,32 +413,6 @@ mod tests {
                 height: 480.0,
             },
         )
-    }
-
-    #[test]
-    fn materialize_bootstrap_map_populates_map_and_keyframe_links() {
-        let mut map = Map::new();
-        let reference_frame = test_frame(0, vec![[100.0, 100.0]], vec![[7u8; 32]]);
-        let current_frame = test_frame(1, vec![[101.0, 99.0]], vec![[9u8; 32]]);
-
-        let added = materialize_bootstrap_map(
-            &mut map,
-            reference_frame,
-            current_frame,
-            &[(0usize, 0usize)],
-            &[Vec3F64::new(0.0, 0.0, 2.0)],
-            &[0],
-            Some(2.0),
-        );
-
-        assert_eq!(added, 1);
-        assert_eq!(map.map_points().len(), 1);
-        assert_eq!(map.map_points()[0].position, Vec3F64::new(0.0, 0.0, 1.0));
-
-        let kf0 = map.get_keyframe(0).expect("expected reference keyframe");
-        let kf1 = map.get_keyframe(1).expect("expected current keyframe");
-        assert_eq!(kf0.map_point_by_desc_idx[0], Some(0));
-        assert_eq!(kf1.map_point_by_desc_idx[0], Some(0));
     }
 
     #[test]
@@ -603,5 +456,30 @@ mod tests {
         assert_eq!(added, 0);
         assert_eq!(map.map_points().len(), 0);
         assert!(curr_kf_map_assoc.iter().all(|slot| slot.is_none()));
+    }
+
+    #[test]
+    fn process_frame_stores_first_bootstrap_frame_and_skips() {
+        let camera = PinholeCamera {
+            fx: 458.654,
+            fy: 457.296,
+            cx: 367.215,
+            cy: 248.375,
+            k1: -0.28340811,
+            k2: 0.07395907,
+            p1: 0.00019359,
+            p2: 1.76187114e-05,
+        };
+        let mut system = ORBSLAMPipeline::new(
+            camera,
+            TwoViewInitConfig::default(),
+            MapProjectionConfig::default(),
+        );
+
+        let result = system.process_frame(test_frame(0, vec![[10.0, 10.0]], vec![[1u8; 32]]));
+
+        assert_eq!(result.status, OdometryStatus::Skipped);
+        assert!(system.state.bootstrap_frame.is_some());
+        assert_eq!(system.state.state, OdometryMode::Bootstrap);
     }
 }
