@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_io::png::read_image_png_mono8;
-use kornia_slam::odometry::bootstrap::BootstrapConfig;
-use kornia_slam::odometry::estimation::map_projection::OdometryConfig;
+use kornia_slam::estimation::map_projection::MapProjectionConfig;
+use kornia_slam::estimation::two_view::TwoViewInitConfig;
 use kornia_slam::{Frame, OdometryStatus};
 
 use pipeline::ORBSLAMPipeline;
@@ -127,9 +127,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ── SLAM config & system ───────────────────────────────────────────────
-    let bootstrap_config = BootstrapConfig::default();
-    let odometry_config = OdometryConfig::default();
-    let mut system = ORBSLAMPipeline::new(camera, bootstrap_config, odometry_config);
+    let two_view_init_config = TwoViewInitConfig::default();
+    let map_projection_config = MapProjectionConfig::default();
+    let mut system = ORBSLAMPipeline::new(camera, two_view_init_config, map_projection_config);
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     let rec = if args.rerun_stream {

@@ -1,13 +1,8 @@
-//! Odometry: pose estimation, bootstrap, and frame association.
+//! Odometry: runtime state, mode transitions, and frame association.
 
 use kornia_3d::pose::Pose3d;
 
 use crate::frame::Frame;
-
-pub mod bootstrap;
-pub mod estimation;
-
-pub use estimation::Estimator;
 
 /// Status of an odometry step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

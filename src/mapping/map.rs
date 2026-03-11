@@ -1,18 +1,10 @@
-//! Map: keyframes, map points, triangulation, and culling.
+//! Map: keyframes, map points, local map selection, and culling.
 
 use std::collections::{HashMap, HashSet};
 
-use kornia_3d::camera::PinholeCamera;
-use kornia_3d::pose::{
-    Pose3d, TwoViewConfig, TwoViewModel, triangulate_midpoint_known_pose, two_view_estimate,
-};
 use kornia_algebra::Vec3F64;
-use kornia_imgproc::features::OrbMatchConfig;
 
-use crate::odometry::estimation::matching::match_orb_descriptors;
-use crate::frame::{Frame, OrbFeatures};
-
-// ── Domain types ─────────────────────────────────────────────────────────────
+use crate::frame::Frame;
 
 /// A frame promoted into the map, with descriptor-to-map-point associations.
 #[derive(Debug, Clone)]
@@ -30,6 +22,33 @@ impl Keyframe {
             frame,
             map_point_by_desc_idx,
         }
+    }
+
+    /// Associates a descriptor slot with a persistent map point.
+    pub fn associate_map_point(&mut self, desc_idx: usize, mp_idx: usize) {
+        if let Some(slot) = self.map_point_by_desc_idx.get_mut(desc_idx) {
+            *slot = Some(mp_idx);
+        }
+    }
+
+    /// Clears the map-point association for a descriptor slot.
+    pub fn clear_map_point(&mut self, desc_idx: usize) {
+        if let Some(slot) = self.map_point_by_desc_idx.get_mut(desc_idx) {
+            *slot = None;
+        }
+    }
+
+    /// Returns the associated map-point index for a descriptor slot.
+    pub fn map_point(&self, desc_idx: usize) -> Option<usize> {
+        self.map_point_by_desc_idx.get(desc_idx).copied().flatten()
+    }
+
+    /// Counts how many descriptor slots currently reference a map point.
+    pub fn num_associated_points(&self) -> usize {
+        self.map_point_by_desc_idx
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
     }
 }
 
@@ -50,7 +69,32 @@ pub struct MapPoint {
     pub culled: bool,
 }
 
-// ── Map container ────────────────────────────────────────────────────────────
+impl MapPoint {
+    /// Creates a fresh active map point.
+    pub fn new(position: Vec3F64, descriptor: [u8; 32], keyframe_idx: usize) -> Self {
+        Self {
+            position,
+            descriptor,
+            keyframe_idx,
+            n_visible: 1,
+            n_found: 1,
+            culled: false,
+        }
+    }
+
+    /// Marks the point as logically deleted.
+    pub fn mark_culled(&mut self) {
+        self.culled = true;
+    }
+
+    /// Returns the tracking success ratio for this point.
+    pub fn found_ratio(&self) -> f64 {
+        if self.n_visible == 0 {
+            return 0.0;
+        }
+        self.n_found as f64 / self.n_visible as f64
+    }
+}
 
 /// In-memory map storage for keyframes and persistent map points.
 #[derive(Debug, Clone, Default)]
@@ -73,6 +117,11 @@ impl Map {
     /// Returns all map points.
     pub fn map_points(&self) -> &[MapPoint] {
         &self.map_points
+    }
+
+    /// Returns the number of persistent map points.
+    pub fn num_map_points(&self) -> usize {
+        self.map_points.len()
     }
 
     /// Returns the keyframe with frame index `idx`, if present.
@@ -110,10 +159,7 @@ impl Map {
         &mut self.keyframes
     }
 
-    /// Build a local map of map points visible from nearby keyframes.
-    ///
-    /// Finds keyframes related by covisibility (shared map point observations)
-    /// and recency, then collects their visible map points.
+    /// Builds a local map of visible points from nearby keyframes.
     pub fn build_local_map_points(
         &self,
         tracked_matches: &[(usize, usize)],
@@ -175,247 +221,6 @@ impl Map {
     }
 }
 
-// ── Triangulation ────────────────────────────────────────────────────────────
-
-/// Build the initial map from a successful bootstrap step.
-///
-/// Takes the two-view data directly rather than the full `BootstrapOutcome` enum.
-/// Returns the number of map points added.
-pub fn build_initial_map(
-    map: &mut Map,
-    reference_frame: Frame,
-    current_frame: Frame,
-    matches: &[(usize, usize)],
-    points3d: &[Vec3F64],
-    inlier_indices: &[usize],
-    median_depth: Option<f64>,
-) -> usize {
-    let mut reference_kf = Keyframe::from_frame(reference_frame);
-    let mut current_kf = Keyframe::from_frame(current_frame);
-    let depth_scale = median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
-    let reference_pose_inv = reference_kf.frame.pose_world_to_cam.inverse();
-    let mut added = 0usize;
-
-    for (p_cam, &match_idx) in points3d.iter().zip(inlier_indices.iter()) {
-        let Some(&(reference_desc_idx, current_desc_idx)) = matches.get(match_idx) else {
-            continue;
-        };
-        if reference_desc_idx >= reference_kf.map_point_by_desc_idx.len()
-            || current_desc_idx >= current_kf.map_point_by_desc_idx.len()
-        {
-            continue;
-        }
-
-        let descriptor = current_kf
-            .frame
-            .features
-            .descriptors
-            .get(current_desc_idx)
-            .copied()
-            .or_else(|| {
-                reference_kf
-                    .frame
-                    .features
-                    .descriptors
-                    .get(reference_desc_idx)
-                    .copied()
-            });
-        let Some(descriptor) = descriptor else {
-            continue;
-        };
-
-        let p_world = reference_pose_inv.transform_point(&(*p_cam / depth_scale));
-        let mp_idx = map.push_map_point(MapPoint {
-            position: p_world,
-            descriptor,
-            keyframe_idx: reference_kf.frame.idx,
-            n_visible: 1,
-            n_found: 1,
-            culled: false,
-        });
-        reference_kf.map_point_by_desc_idx[reference_desc_idx] = Some(mp_idx);
-        current_kf.map_point_by_desc_idx[current_desc_idx] = Some(mp_idx);
-        added += 1;
-    }
-
-    map.upsert_keyframe(reference_kf);
-    map.upsert_keyframe(current_kf);
-
-    added
-}
-
-/// Triangulate new map points from a pair of keyframes.
-///
-/// Matches descriptors between `prev_kf` and `curr_features`, filters pairs that
-/// already have map-point associations, runs two-view estimation, and triangulates
-/// inlier matches. Returns the number of new map points added.
-pub fn grow_map_points_from_keyframe_pair(
-    map: &mut Map,
-    camera: &PinholeCamera,
-    curr_kf_idx: usize,
-    prev_kf: &Keyframe,
-    curr_features: &OrbFeatures,
-    curr_kf_map_assoc: &mut [Option<usize>],
-    pose_world_to_cam: &Pose3d,
-    match_config: OrbMatchConfig,
-    two_view_config: &TwoViewConfig,
-    min_parallax_deg: f64,
-) -> usize {
-    const MIN_GROWTH_MATCHES: usize = 20;
-    const MIN_GROWTH_INLIERS: usize = 15;
-    const REPROJ_THRESHOLD_PX: f64 = 3.0;
-    const MAX_TRIANGULATION_GAP: f64 = 0.25;
-
-    let matches = match_orb_descriptors(
-        &prev_kf.frame.features.orientations,
-        &prev_kf.frame.features.descriptors,
-        &curr_features.orientations,
-        &curr_features.descriptors,
-        match_config,
-    );
-    if matches.len() < MIN_GROWTH_MATCHES {
-        return 0;
-    }
-
-    let mut pair_indices: Vec<(usize, usize)> = Vec::with_capacity(matches.len());
-    for (prev_idx, curr_idx) in matches {
-        if prev_idx >= prev_kf.frame.features.keypoints_xy.len()
-            || curr_idx >= curr_features.keypoints_xy.len()
-        {
-            continue;
-        }
-        if curr_kf_map_assoc.get(curr_idx).is_some_and(|m| m.is_some()) {
-            continue;
-        }
-        if prev_kf.map_point_by_desc_idx
-            .get(prev_idx)
-            .is_some_and(|m| m.is_some())
-        {
-            continue;
-        }
-        pair_indices.push((prev_idx, curr_idx));
-    }
-
-    let (prev_pts, curr_pts) = camera.undistort_matched_pairs(
-        &prev_kf.frame.features.keypoints_xy,
-        &curr_features.keypoints_xy,
-        &pair_indices,
-    );
-    if pair_indices.len() < 8 {
-        return 0;
-    }
-
-    let k = camera.intrinsic_matrix();
-    let two_view = match two_view_estimate(&prev_pts, &curr_pts, &k, &k, two_view_config) {
-        Ok(tv) if matches!(tv.model, TwoViewModel::Fundamental(_)) => tv,
-        _ => return 0,
-    };
-    if two_view.inlier_indices.len() < MIN_GROWTH_INLIERS {
-        return 0;
-    }
-
-    let prev_pose = prev_kf.frame.pose_world_to_cam;
-    let curr_pose = *pose_world_to_cam;
-    let relative_pose = Pose3d::between(&prev_pose, &curr_pose);
-    let r_rel = relative_pose.rotation;
-    let t_rel = relative_pose.translation;
-    if t_rel.length() <= 1e-8 {
-        return 0;
-    }
-
-    let prev_pose_inv = prev_pose.inverse();
-    let reproj_th2 = REPROJ_THRESHOLD_PX * REPROJ_THRESHOLD_PX;
-    let mut n_added = 0usize;
-
-    for &inlier_idx in &two_view.inlier_indices {
-        let Some(&(_prev_idx, curr_idx)) = pair_indices.get(inlier_idx) else {
-            continue;
-        };
-        if curr_kf_map_assoc.get(curr_idx).is_some_and(|m| m.is_some()) {
-            continue;
-        }
-
-        let p_prev = prev_pts[inlier_idx];
-        let p_curr = curr_pts[inlier_idx];
-
-        let ray_prev = Vec3F64::new(
-            (p_prev.x - camera.cx) / camera.fx,
-            (p_prev.y - camera.cy) / camera.fy,
-            1.0,
-        )
-        .normalize();
-        let ray_curr = Vec3F64::new(
-            (p_curr.x - camera.cx) / camera.fx,
-            (p_curr.y - camera.cy) / camera.fy,
-            1.0,
-        )
-        .normalize();
-
-        let Some((p_cam_prev, triang_gap)) =
-            triangulate_midpoint_known_pose(&ray_prev, &ray_curr, &r_rel, &t_rel)
-        else {
-            continue;
-        };
-        if triang_gap > MAX_TRIANGULATION_GAP {
-            continue;
-        }
-
-        if p_cam_prev.z <= 1e-6 {
-            continue;
-        }
-        let p_cam_curr = r_rel * p_cam_prev + t_rel;
-        if p_cam_curr.z <= 1e-6 {
-            continue;
-        }
-
-        let c2 = -(r_rel.transpose() * t_rel);
-        let d1 = p_cam_prev.normalize();
-        let d2_vec = p_cam_prev - c2;
-        if d2_vec.length() <= 1e-12 {
-            continue;
-        }
-        let d2 = d2_vec.normalize();
-        let parallax_deg_val = d1.dot(d2).clamp(-1.0, 1.0).acos().to_degrees();
-        if parallax_deg_val < min_parallax_deg {
-            continue;
-        }
-
-        let Some(err_prev) = camera.reprojection_error_sq_cam(&p_cam_prev, p_prev.x, p_prev.y)
-        else {
-            continue;
-        };
-        if err_prev > reproj_th2 {
-            continue;
-        }
-        let Some(err_curr) = camera.reprojection_error_sq_cam(&p_cam_curr, p_curr.x, p_curr.y)
-        else {
-            continue;
-        };
-        if err_curr > reproj_th2 {
-            continue;
-        }
-
-        let p_world = prev_pose_inv.transform_point(&p_cam_prev);
-        let mp_idx = map.push_map_point(MapPoint {
-            position: p_world,
-            descriptor: curr_features.descriptors[curr_idx],
-            keyframe_idx: curr_kf_idx,
-            n_visible: 1,
-            n_found: 1,
-            culled: false,
-        });
-
-        if let Some(slot) = curr_kf_map_assoc.get_mut(curr_idx) {
-            *slot = Some(mp_idx);
-            n_added += 1;
-        }
-    }
-
-    n_added
-}
-
-// ── Culling ──────────────────────────────────────────────────────────────────
-
 /// Cull map points with poor observation ratios or that project behind cameras.
 pub fn cull_map_points(map: &mut Map) {
     const MIN_OBSERVATIONS: u32 = 5;
@@ -427,23 +232,20 @@ pub fn cull_map_points(map: &mut Map) {
         if mp.culled || mp.n_visible < MIN_OBSERVATIONS {
             continue;
         }
-        let ratio = mp.n_found as f64 / mp.n_visible as f64;
-        if ratio < MIN_FOUND_RATIO {
-            mp.culled = true;
+        if mp.found_ratio() < MIN_FOUND_RATIO {
+            mp.mark_culled();
             n_culled += 1;
         }
     }
 
     let mut behind_camera: Vec<usize> = Vec::new();
     for kf in map.keyframes() {
-        for mp_opt in &kf.map_point_by_desc_idx {
-            if let Some(mp_idx) = mp_opt {
-                if let Some(mp) = map.map_points().get(*mp_idx) {
-                    if !mp.culled {
-                        let p_cam = kf.frame.pose_world_to_cam.transform_point(&mp.position);
-                        if p_cam.z <= 1e-8 {
-                            behind_camera.push(*mp_idx);
-                        }
+        for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+            if let Some(mp) = map.map_points().get(*mp_idx) {
+                if !mp.culled {
+                    let p_cam = kf.frame.pose_world_to_cam.transform_point(&mp.position);
+                    if p_cam.z <= 1e-8 {
+                        behind_camera.push(*mp_idx);
                     }
                 }
             }
@@ -453,7 +255,7 @@ pub fn cull_map_points(map: &mut Map) {
     for mp_idx in &behind_camera {
         if let Some(mp) = map.map_points_mut().get_mut(*mp_idx) {
             if !mp.culled {
-                mp.culled = true;
+                mp.mark_culled();
                 n_culled += 1;
             }
         }
@@ -469,10 +271,10 @@ pub fn cull_map_points(map: &mut Map) {
             .collect();
 
         for kf in map.keyframes_mut() {
-            for mp_opt in &mut kf.map_point_by_desc_idx {
-                if let Some(mp_idx) = mp_opt {
-                    if culled_set.contains(mp_idx) {
-                        *mp_opt = None;
+            for desc_idx in 0..kf.map_point_by_desc_idx.len() {
+                if let Some(mp_idx) = kf.map_point(desc_idx) {
+                    if culled_set.contains(&mp_idx) {
+                        kf.clear_map_point(desc_idx);
                     }
                 }
             }
@@ -485,60 +287,84 @@ mod tests {
     use super::*;
     use kornia_3d::camera::ImageSize;
     use kornia_3d::pose::Pose3d;
-    use kornia_algebra::Vec3F64;
+    use kornia_imgproc::features::OrbFeatures;
+
+    fn test_frame(idx: usize, descriptors: Vec<[u8; 32]>) -> Frame {
+        Frame::new(
+            idx,
+            OrbFeatures {
+                keypoints_xy: descriptors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| [i as f32, i as f32])
+                    .collect(),
+                orientations: vec![0.0; descriptors.len()],
+                descriptors,
+            },
+            Pose3d::IDENTITY,
+            ImageSize {
+                width: 640.0,
+                height: 480.0,
+            },
+        )
+    }
 
     #[test]
     fn keyframe_from_frame_initializes_map_point_slots() {
-        let features = OrbFeatures {
-            keypoints_xy: vec![[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]],
-            orientations: vec![0.1, 0.2, 0.3],
-            descriptors: vec![[0u8; 32], [1u8; 32], [2u8; 32]],
-        };
-
-        let image_size = ImageSize { width: 640.0, height: 480.0 };
-        let frame = Frame::new(7, features, Pose3d::IDENTITY, image_size);
-        let keyframe = Keyframe::from_frame(frame);
+        let keyframe = Keyframe::from_frame(test_frame(7, vec![[0u8; 32], [1u8; 32], [2u8; 32]]));
 
         assert_eq!(keyframe.frame.idx, 7);
-        assert_eq!(keyframe.frame.features.descriptors.len(), 3);
         assert_eq!(keyframe.map_point_by_desc_idx.len(), 3);
-        assert!(
-            keyframe
-                .map_point_by_desc_idx
-                .iter()
-                .all(|slot| slot.is_none())
-        );
+        assert!(keyframe.map_point_by_desc_idx.iter().all(|slot| slot.is_none()));
+    }
+
+    #[test]
+    fn keyframe_association_helpers_work() {
+        let mut keyframe = Keyframe::from_frame(test_frame(1, vec![[0u8; 32], [1u8; 32]]));
+
+        keyframe.associate_map_point(1, 42);
+        assert_eq!(keyframe.map_point(1), Some(42));
+        assert_eq!(keyframe.num_associated_points(), 1);
+
+        keyframe.clear_map_point(1);
+        assert_eq!(keyframe.map_point(1), None);
+        assert_eq!(keyframe.num_associated_points(), 0);
+    }
+
+    #[test]
+    fn map_point_new_sets_active_defaults() {
+        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], 5);
+
+        assert_eq!(mp.position, Vec3F64::new(1.0, 2.0, 3.0));
+        assert_eq!(mp.descriptor, [9u8; 32]);
+        assert_eq!(mp.keyframe_idx, 5);
+        assert_eq!(mp.n_visible, 1);
+        assert_eq!(mp.n_found, 1);
+        assert!(!mp.culled);
+    }
+
+    #[test]
+    fn map_point_tracking_helpers_work() {
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0);
+        mp.n_visible = 10;
+        mp.n_found = 4;
+
+        assert!((mp.found_ratio() - 0.4).abs() < 1e-9);
+        mp.mark_culled();
+        assert!(mp.culled);
     }
 
     #[test]
     fn upsert_keyframe_replaces_existing_idx() {
         let mut map = Map::new();
-        let image_size = ImageSize { width: 640.0, height: 480.0 };
 
-        let first = Keyframe::from_frame(Frame::new(
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(
             10,
-            OrbFeatures {
-                keypoints_xy: vec![[0.0, 0.0], [1.0, 1.0]],
-                orientations: vec![0.1, 0.2],
-                descriptors: vec![[0u8; 32], [1u8; 32]],
-            },
-            Pose3d::IDENTITY,
-            image_size,
-        ));
-        map.upsert_keyframe(first);
+            vec![[0u8; 32], [1u8; 32]],
+        )));
         assert_eq!(map.keyframes().len(), 1);
 
-        let second = Keyframe::from_frame(Frame::new(
-            10,
-            OrbFeatures {
-                keypoints_xy: vec![[2.0, 2.0]],
-                orientations: vec![0.3],
-                descriptors: vec![[2u8; 32]],
-            },
-            Pose3d::IDENTITY,
-            image_size,
-        ));
-        map.upsert_keyframe(second);
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(10, vec![[2u8; 32]])));
 
         assert_eq!(map.keyframes().len(), 1);
         assert_eq!(
@@ -556,98 +382,28 @@ mod tests {
     fn push_map_point_returns_sequential_index() {
         let mut map = Map::new();
 
-        let first_idx = map.push_map_point(MapPoint {
-            position: Vec3F64::new(0.0, 0.0, 1.0),
-            descriptor: [0u8; 32],
-            keyframe_idx: 0,
-            n_visible: 0,
-            n_found: 0,
-            culled: false,
-        });
-        let second_idx = map.push_map_point(MapPoint {
-            position: Vec3F64::new(1.0, 0.0, 1.0),
-            descriptor: [1u8; 32],
-            keyframe_idx: 0,
-            n_visible: 0,
-            n_found: 0,
-            culled: false,
-        });
+        let first_idx = map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0));
+        let second_idx = map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 1.0), [1u8; 32], 0));
 
         assert_eq!(first_idx, 0);
         assert_eq!(second_idx, 1);
-        assert_eq!(map.map_points().len(), 2);
+        assert_eq!(map.num_map_points(), 2);
     }
 
     #[test]
-    fn test_cull_map_points_removes_low_ratio() {
+    fn cull_map_points_removes_low_ratio() {
         let mut map = Map::new();
 
-        map.push_map_point(MapPoint {
-            position: Vec3F64::new(0.0, 0.0, 5.0),
-            descriptor: [0u8; 32],
-            keyframe_idx: 0,
-            n_visible: 10,
-            n_found: 1,
-            culled: false,
-        });
-        map.push_map_point(MapPoint {
-            position: Vec3F64::new(1.0, 0.0, 5.0),
-            descriptor: [1u8; 32],
-            keyframe_idx: 0,
-            n_visible: 10,
-            n_found: 5,
-            culled: false,
-        });
+        let first_idx = map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 5.0), [0u8; 32], 0));
+        let second_idx = map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 5.0), [1u8; 32], 0));
+        map.map_points_mut()[first_idx].n_visible = 10;
+        map.map_points_mut()[first_idx].n_found = 1;
+        map.map_points_mut()[second_idx].n_visible = 10;
+        map.map_points_mut()[second_idx].n_found = 5;
 
         cull_map_points(&mut map);
 
-        assert!(map.map_points()[0].culled);
-        assert!(!map.map_points()[1].culled);
-    }
-
-    #[test]
-    fn build_initial_map_populates_map_and_keyframe_links() {
-        let mut map = Map::new();
-
-        let reference_features = OrbFeatures {
-            keypoints_xy: vec![[100.0, 100.0]],
-            orientations: vec![0.1],
-            descriptors: vec![[7u8; 32]],
-        };
-        let image_size = ImageSize { width: 640.0, height: 480.0 };
-        let reference_frame = Frame::new(0, reference_features, Pose3d::IDENTITY, image_size);
-
-        let current_features = OrbFeatures {
-            keypoints_xy: vec![[101.0, 99.0]],
-            orientations: vec![0.2],
-            descriptors: vec![[9u8; 32]],
-        };
-
-        let pose = Pose3d::IDENTITY;
-        let matches = vec![(0usize, 0usize)];
-        let points3d = vec![Vec3F64::new(0.0, 0.0, 2.0)];
-        let inlier_indices = vec![0];
-        let median_depth = Some(2.0);
-
-        let current_frame = Frame::new(1, current_features, pose, image_size);
-
-        let added = build_initial_map(
-            &mut map,
-            reference_frame,
-            current_frame,
-            &matches,
-            &points3d,
-            &inlier_indices,
-            median_depth,
-        );
-
-        assert_eq!(added, 1);
-        assert_eq!(map.map_points().len(), 1);
-        assert_eq!(map.map_points()[0].position, Vec3F64::new(0.0, 0.0, 1.0));
-
-        let kf0 = map.get_keyframe(0).expect("expected reference keyframe");
-        let kf1 = map.get_keyframe(1).expect("expected current keyframe");
-        assert_eq!(kf0.map_point_by_desc_idx[0], Some(0));
-        assert_eq!(kf1.map_point_by_desc_idx[0], Some(0));
+        assert!(map.map_points()[first_idx].culled);
+        assert!(!map.map_points()[second_idx].culled);
     }
 }

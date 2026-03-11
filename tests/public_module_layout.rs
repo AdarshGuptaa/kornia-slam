@@ -1,11 +1,14 @@
 use kornia_slam::frame::OrbFeatures;
 use kornia_slam::mapping::{Keyframe, Map, MapPoint};
-use kornia_slam::odometry::bootstrap::{
-    BootstrapConfig, BootstrapOutcome, BootstrapRejectReason, try_bootstrap,
+use kornia_slam::estimation::two_view::{
+    TwoViewAcceptanceConfig, TwoViewInitConfig, TwoViewInitOutcome, TwoViewInitRejectReason,
+    try_initialize_two_view,
 };
-use kornia_slam::odometry::estimation::MapProjectionEstimator;
-use kornia_slam::odometry::estimation::map_projection::{KeyframePolicy, OdometryConfig};
-use kornia_slam::odometry::estimation::pnp::PnpConfig;
+use kornia_slam::estimation::MapProjectionEstimator;
+use kornia_slam::estimation::map_projection::{
+    KeyframePolicy, MapProjectionConfig, MapProjectionEstimateOutcome, MapProjectionRejectReason,
+    PnpConfig,
+};
 use kornia_slam::{OdometryResult, OdometryStatus};
 
 #[test]
@@ -14,12 +17,15 @@ fn exposes_restructured_public_modules() {
         _: Option<OdometryResult>,
         _: Option<OdometryStatus>,
         _: Option<OrbFeatures>,
-        _: Option<BootstrapConfig>,
-        _: Option<BootstrapOutcome>,
-        _: Option<BootstrapRejectReason>,
+        _: Option<TwoViewAcceptanceConfig>,
+        _: Option<TwoViewInitConfig>,
+        _: Option<TwoViewInitOutcome>,
+        _: Option<TwoViewInitRejectReason>,
         _: Option<PnpConfig>,
         _: Option<KeyframePolicy>,
-        _: Option<OdometryConfig>,
+        _: Option<MapProjectionConfig>,
+        _: Option<MapProjectionEstimateOutcome>,
+        _: Option<MapProjectionRejectReason>,
         _: Option<Map>,
         _: Option<Keyframe>,
         _: Option<MapPoint>,
@@ -27,9 +33,10 @@ fn exposes_restructured_public_modules() {
     ) {
     }
 
-    let _ = try_bootstrap;
+    let _ = try_initialize_two_view;
 
     assert_public_api(
-        None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+        None,
     );
 }
