@@ -8,6 +8,8 @@
 //! ```
 
 mod pipeline;
+mod bootstrap;
+mod tracking;
 mod utils;
 #[path = "../common/datasets/mod.rs"]
 mod datasets;
