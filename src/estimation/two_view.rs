@@ -12,10 +12,10 @@
 //    '-----------' '-----------'
 //      frame 1        frame 2
 
+use kornia_algebra::Vec3F64;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TwoViewConfig, TwoViewModel, two_view_estimate};
-use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::OrbFeatures;
@@ -165,7 +165,7 @@ pub fn try_initialize_two_view(
     }
 
     let median_parallax_deg = result.median_parallax_deg(&reference_pts, &current_pts, camera);
-    if median_parallax_deg < config.estimation_config.min_parallax_deg {
+    if median_parallax_deg < config.estimation_config.triangulation.min_parallax_deg {
         return TwoViewInitOutcome::Rejected {
             reason: TwoViewInitRejectReason::LowParallax,
         };

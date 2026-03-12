@@ -1,16 +1,34 @@
 //! Map-projection-based estimator: matching, PnP, and tracking flow.
+//!
+//!        Map Points (3D)
+//!        *   *       *
+//!         \  |      /
+//!    project & match (ORB)
+//!           \|/
+//!    .---------------.
+//!   /    * . *      /   current frame
+//!  /       *       /    (2D keypoints)
+//!  '---------------'
+//!          |
+//!      solve PnP
+//!          |
+//!     [pose_w2c]
+//!          |
+//!   refine with local map
+//!          |
+//! Estimated { pose, inliers, matches }
 
 use std::collections::HashSet;
 
+use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
 use kornia_3d::camera::{ImageSize, PinholeCamera};
 use kornia_3d::pnp::{refine_pose_lm, LMRefineParams};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
 use kornia_imgproc::features::hamming_distance;
 use kornia_imgproc::features::{match_orb_descriptors, OrbMatchConfig};
 
 use crate::frame::Frame;
-use crate::mapping::{Map, MapPoint};
+use crate::map::{Map, MapPoint};
 
 // ── Public Types ───────────────────────────────────────────────────────────
 
@@ -44,6 +62,16 @@ pub struct ProjectionMatchConfig {
     pub search_radius: f32,
     /// Maximum Hamming distance to accept a descriptor match.
     pub max_hamming: u32,
+}
+
+impl Default for ProjectionMatchConfig {
+    fn default() -> Self {
+        Self {
+            min_depth: 0.0,
+            search_radius: 15.0,
+            max_hamming: 50,
+        }
+    }
 }
 
 /// PnP pose-estimation thresholds.
@@ -90,6 +118,10 @@ pub struct MapProjectionConfig {
     pub keyframe_policy: KeyframePolicy,
     /// PnP pose-estimation thresholds.
     pub pnp: PnpConfig,
+    /// Projection matching config for initial tracking.
+    pub projection: ProjectionMatchConfig,
+    /// Projection matching config for local-map refinement (wider search).
+    pub local_projection: ProjectionMatchConfig,
 }
 
 impl Default for MapProjectionConfig {
@@ -107,6 +139,12 @@ impl Default for MapProjectionConfig {
             enable_local_ba: true,
             keyframe_policy: KeyframePolicy::default(),
             pnp: PnpConfig::default(),
+            projection: ProjectionMatchConfig::default(),
+            local_projection: ProjectionMatchConfig {
+                search_radius: 30.0,
+                max_hamming: 60,
+                ..ProjectionMatchConfig::default()
+            },
         }
     }
 }
@@ -533,56 +571,61 @@ impl MapProjectionEstimator {
             frame,
             &self.camera,
             candidate_pose,
-            ProjectionMatchConfig {
-                min_depth: 0.0,
-                search_radius: 15.0,
-                max_hamming: 50,
-            },
+            self.config.projection,
         );
         let curr_keypoints_undist = &frame_match.keypoints_undist;
         let grid = &frame_match.grid;
         let projection_matches = frame_match.matches;
 
-        let last_reject = if projection_matches.len() >= MIN_PNP_CORRESPONDENCES {
-            match try_track(
-                map.map_points(),
-                &self.camera,
-                &self.config.pnp,
-                &projection_matches,
-                curr_keypoints_undist,
-                candidate_pose,
-                candidate_pose,
-                MIN_STAGE1_INLIERS,
-            ) {
-                TrackAttempt::Success { pose, inliers } => {
-                    return match self.refine_pose(
-                        curr_keypoints_undist,
-                        &frame.features.descriptors,
-                        grid,
-                        frame.image_size,
-                        candidate_pose,
-                        pose,
-                        inliers,
-                        projection_matches,
-                        map,
-                        current_keyframe_idx,
-                    ) {
-                        Ok((pose_world_to_cam, inliers, matches)) => {
-                            MapProjectionEstimateOutcome::Estimated {
-                                pose_world_to_cam,
-                                inliers,
-                                matches,
-                            }
-                        }
-                        Err(reason) => MapProjectionEstimateOutcome::Rejected { reason },
-                    };
+        // Shared logic: try_track → refine_pose → Estimated, or propagate rejection.
+        let try_track_and_refine =
+            |correspondences: Vec<(usize, usize)>,
+             pose_init: &Pose3d|
+             -> Result<MapProjectionEstimateOutcome, MapProjectionRejectReason> {
+                match try_track(
+                    map.map_points(),
+                    &self.camera,
+                    &self.config.pnp,
+                    &correspondences,
+                    curr_keypoints_undist,
+                    pose_init,
+                    candidate_pose,
+                    MIN_STAGE1_INLIERS,
+                ) {
+                    TrackAttempt::Success { pose, inliers } => {
+                        let (pose_world_to_cam, inliers, matches) = self.refine_pose(
+                            curr_keypoints_undist,
+                            &frame.features.descriptors,
+                            grid,
+                            frame.image_size,
+                            candidate_pose,
+                            pose,
+                            inliers,
+                            correspondences,
+                            map,
+                            current_keyframe_idx,
+                        );
+                        Ok(MapProjectionEstimateOutcome::Estimated {
+                            pose_world_to_cam,
+                            inliers,
+                            matches,
+                        })
+                    }
+                    TrackAttempt::Rejected(reason) => Err(reason),
                 }
-                TrackAttempt::Rejected(reason) => reason,
+            };
+
+        // Stage 2: PnP from projection matches.
+        let last_reject = if projection_matches.len() >= MIN_PNP_CORRESPONDENCES {
+            match try_track_and_refine(projection_matches, candidate_pose) {
+                Ok(outcome) => return outcome,
+                Err(reason) => reason,
             }
         } else {
             MapProjectionRejectReason::LowProjectionMatches
         };
 
+        // Stage 3: fallback — match against reference keyframe descriptors.
         let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
         let Some(current_kf) = current_kf else {
             return MapProjectionEstimateOutcome::Rejected {
@@ -620,38 +663,9 @@ impl MapProjectionEstimator {
             };
         }
 
-        match try_track(
-            map.map_points(),
-            &self.camera,
-            &self.config.pnp,
-            &ref_correspondences,
-            curr_keypoints_undist,
-            pose_before_tracking,
-            candidate_pose,
-            MIN_STAGE1_INLIERS,
-        ) {
-            TrackAttempt::Success { pose, inliers } => match self.refine_pose(
-                curr_keypoints_undist,
-                &frame.features.descriptors,
-                grid,
-                frame.image_size,
-                candidate_pose,
-                pose,
-                inliers,
-                ref_correspondences,
-                map,
-                current_keyframe_idx,
-            ) {
-                Ok((pose_world_to_cam, inliers, matches)) => {
-                    MapProjectionEstimateOutcome::Estimated {
-                        pose_world_to_cam,
-                        inliers,
-                        matches,
-                    }
-                }
-                Err(reason) => MapProjectionEstimateOutcome::Rejected { reason },
-            },
-            TrackAttempt::Rejected(reason) => MapProjectionEstimateOutcome::Rejected { reason },
+        match try_track_and_refine(ref_correspondences, pose_before_tracking) {
+            Ok(outcome) => outcome,
+            Err(reason) => MapProjectionEstimateOutcome::Rejected { reason },
         }
     }
 
@@ -663,26 +677,18 @@ impl MapProjectionEstimator {
         pose_world_to_cam: &Pose3d,
         image_size: ImageSize,
     ) {
-        let (fx, fy, cx, cy) = self.camera.intrinsics();
-        let img_w = image_size.width as f32;
-        let img_h = image_size.height as f32;
-
-        let mut matched_set: HashSet<usize> = HashSet::new();
-        for &(mp_idx, _) in matched {
-            matched_set.insert(mp_idx);
-        }
+        let matched_set: HashSet<usize> = matched.iter().map(|&(mp_idx, _)| mp_idx).collect();
 
         for (mp_idx, mp) in map.map_points_mut().iter_mut().enumerate() {
             if mp.culled {
                 continue;
             }
             let p_cam = pose_world_to_cam.transform_point(&mp.position);
-            if p_cam.z <= 0.0 {
-                continue;
-            }
-            let u = (fx * p_cam.x / p_cam.z + cx) as f32;
-            let v = (fy * p_cam.y / p_cam.z + cy) as f32;
-            if u < 0.0 || v < 0.0 || u >= img_w || v >= img_h {
+            if self
+                .camera
+                .project_to_image(&p_cam, 0.0, image_size)
+                .is_err()
+            {
                 continue;
             }
             mp.n_visible = mp.n_visible.saturating_add(1);
@@ -733,12 +739,13 @@ impl MapProjectionEstimator {
         mut matches: Vec<(usize, usize)>,
         map: &Map,
         current_keyframe_idx: Option<usize>,
-    ) -> Result<(Pose3d, usize, Vec<(usize, usize)>), MapProjectionRejectReason> {
+    ) -> (Pose3d, usize, Vec<(usize, usize)>) {
         if let Some((local_matches, local_pose, local_inliers)) = refine_with_local_map(
             map,
             current_keyframe_idx,
             &self.camera,
             &self.config.pnp,
+            self.config.local_projection,
             &matches,
             curr_keypoints_undist,
             curr_descriptors,
@@ -755,7 +762,7 @@ impl MapProjectionEstimator {
             }
         }
 
-        Ok((pose, inliers, matches))
+        (pose, inliers, matches)
     }
 }
 
@@ -802,6 +809,7 @@ fn refine_with_local_map(
     current_kf_idx: Option<usize>,
     camera: &PinholeCamera,
     pnp_config: &PnpConfig,
+    local_projection: ProjectionMatchConfig,
     tracked_matches: &[(usize, usize)],
     curr_keypoints_undist: &[[f32; 2]],
     curr_descriptors: &[[u8; 32]],
@@ -824,11 +832,7 @@ fn refine_with_local_map(
         pose_init,
         camera,
         image_size,
-        ProjectionMatchConfig {
-            min_depth: 0.0,
-            search_radius: 30.0,
-            max_hamming: 60,
-        },
+        local_projection,
     );
     if local_matches.len() < 4 {
         return None;

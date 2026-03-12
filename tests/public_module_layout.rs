@@ -1,5 +1,5 @@
 use kornia_slam::frame::OrbFeatures;
-use kornia_slam::mapping::{Keyframe, Map, MapPoint};
+use kornia_slam::map::{Keyframe, Map, MapPoint};
 use kornia_slam::estimation::two_view::{
     TwoViewAcceptanceConfig, TwoViewInitConfig, TwoViewInitOutcome, TwoViewInitRejectReason,
     try_initialize_two_view,
