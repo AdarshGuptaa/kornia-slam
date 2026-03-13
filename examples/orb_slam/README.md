@@ -37,9 +37,7 @@ Useful options:
 
 - `--max-frames 500` to limit the run length
 - `--start-frame 100` to skip initial frames
-- `--n-keypoints 1500` to change ORB feature density
 - `--rerun-stream` to spawn a Rerun viewer
-- `--rerun-addr 127.0.0.1:9876` to stream to an existing Rerun instance
 
 ## Local checks
 

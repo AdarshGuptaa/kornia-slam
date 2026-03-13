@@ -40,14 +40,6 @@ struct Args {
     #[argh(option, default = "0")]
     max_frames: usize,
 
-    /// number of ORB keypoints to detect per frame
-    #[argh(option, default = "1000")]
-    n_keypoints: usize,
-
-    /// connect to a Rerun viewer via TCP (e.g. "127.0.0.1:9876")
-    #[argh(option)]
-    rerun_addr: Option<String>,
-
     /// spawn a Rerun viewer and stream to it
     #[argh(switch)]
     rerun_stream: bool,
@@ -90,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── ORB detector (used externally before feeding Pipeline) ─────────────
     let detector = kornia_imgproc::features::OrbDetector {
-        n_keypoints: args.n_keypoints,
+        n_keypoints: 1000,
         ..Default::default()
     };
 
@@ -109,15 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     let rec = if args.rerun_stream {
-        let r = rerun::RecordingStreamBuilder::new("mono_vo").spawn()?;
-        r.log("/", &rerun::ViewCoordinates::RIGHT_HAND_Y_DOWN())?;
-        r.log("world/camera", &rerun::ViewCoordinates::RDF())?;
-        Some(r)
-    } else if let Some(addr) = args.rerun_addr.as_deref() {
-        // Connect to an already-running viewer/server over gRPC.
-        // Accepts host:port (e.g. 127.0.0.1:9876).
-        let r = rerun::RecordingStreamBuilder::new("mono_vo")
-            .connect_grpc_opts(format!("rerun+http://{addr}/proxy"))?;
+        let r = rerun::RecordingStreamBuilder::new("orb_slam").spawn()?;
         r.log("/", &rerun::ViewCoordinates::RIGHT_HAND_Y_DOWN())?;
         r.log("world/camera", &rerun::ViewCoordinates::RDF())?;
         Some(r)
