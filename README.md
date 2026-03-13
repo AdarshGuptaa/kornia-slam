@@ -46,19 +46,19 @@ The map is a persistent 3D representation of the environment — points, poses, 
 
 ### Integration with bubbaloop
 
-kornia-slam is intended to integrate with [bubbaloop](https://github.com/kornia/bubbaloop) as a spatial service node. In that direction, bubbaloop would provide the node runtime, Zenoh data plane, and agent-facing MCP layer, while kornia-slam would provide pose estimation and mapping.
+kornia-slam is intended to integrate with [bubbaloop](https://github.com/kornia/bubbaloop) as a spatial service within a broader robotics runtime. In that direction, kornia-slam would consume sensor streams, maintain its own map and localization state, and expose them through an MCP server. bubbaloop agents could then connect to that spatial interface as part of the surrounding system.
 
 ```
- Sensors / nodes        Zenoh pub/sub        Spatial service        MCP
+ Sensors / nodes        Zenoh pub/sub        Spatial service        MCP clients
 ┌──────────────┐   ┌──────────────────┐   ┌─────────────┐   ┌──────────────┐
-│ bubbaloop    │──>│ sensor streams   │──>│ kornia-slam │──>│ agents/tools │
-│ node runtime │   │ and commands     │   │             │   │ via bubbaloop│
+│ cameras/IMU/ │──>│ sensor streams   │──>│ kornia-slam │<──│ bubbaloop    │
+│ LiDAR/GNSS   │   │ and commands     │   │             │   │ agents/tools │
 └──────────────┘   └──────────────────┘   └─────────────┘   └──────────────┘
 ```
 
-- **Sensors via Zenoh** — bubbaloop nodes publish camera, IMU, LiDAR, and other streams on the data plane. kornia-slam subscribes and tracks against them.
-- **Spatial state via MCP** — bubbaloop's MCP layer can expose pose, map, and spatial query tools backed by kornia-slam.
-- **Agent-facing spatial tools** — through bubbaloop's daemon-side agent runtime and MCP server, agents would be able to inspect the live 3D map, query current pose and nearby structure, and invoke higher-level spatial computations such as localization, landmark lookup, geometric relationships, and map-based reasoning.
+- **Sensor access** — kornia-slam should be able to subscribe to camera, IMU, LiDAR, and other streams as part of the system data plane.
+- **Spatial state via MCP** — kornia-slam should expose pose, map, and spatial query tools through an MCP server.
+- **Agent-facing spatial tools** — bubbaloop agents should be able to connect to that MCP interface to inspect the live 3D map, query current pose and nearby structure, and invoke higher-level spatial computations such as localization, landmark lookup, geometric relationships, and map-based reasoning.
 
 ## Setup
 
