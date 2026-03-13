@@ -1,12 +1,18 @@
 [package]
-name = "kornia-slam"
+name = "orb_slam"
 version = "0.1.0"
 edition = "2024"
-description = "Spatial runtime for real-time pose estimation, mapping, and agent interaction."
+publish = false
+description = "Standalone ORB-SLAM example for kornia-slam"
 
 [dependencies]
+argh = "0.1"
+kornia-slam = { path = "../.." }
 kornia-3d = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
 kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
 kornia-image = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
 kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
+kornia-io = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
+kornia-tensor = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
+rerun = "0.29.2"
 thiserror = "2"

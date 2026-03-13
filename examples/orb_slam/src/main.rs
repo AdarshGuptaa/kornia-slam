@@ -4,10 +4,10 @@
 //! externally and feeding them to `process_frame`.
 //!
 //! ```text
-//! cargo run --example orb_slam -- --data /path/to/euroc/V1_01_easy
+//! cargo run --manifest-path examples/orb_slam/Cargo.toml -- --data /path/to/euroc/V1_01_easy
 //! ```
 
-#[path = "../common/datasets/mod.rs"]
+#[path = "../../common/datasets/mod.rs"]
 mod datasets;
 mod pipeline;
 mod utils;

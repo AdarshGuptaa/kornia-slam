@@ -31,18 +31,13 @@ jobs:
         with:
           path: kornia-slam
 
-      - name: Checkout kornia-rs
-        uses: actions/checkout@v4
-        with:
-          repository: kornia/kornia-rs
-          path: kornia-rs
-
-      - name: Restore sibling path layout
-        run: ln -s "$GITHUB_WORKSPACE/kornia-rs" "$GITHUB_WORKSPACE/../kornia-rs"
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run tests
         working-directory: kornia-slam
         run: cargo test
+
+      - name: Build standalone example
+        working-directory: kornia-slam
+        run: cargo run --manifest-path examples/orb_slam/Cargo.toml -- --help

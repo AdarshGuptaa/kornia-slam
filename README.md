@@ -1,4 +1,4 @@
-# kornia-slam
+# kornia-slam 📷🧭🗺️📍🤖
 
 Spatial runtime for real-time pose estimation, mapping, and agent interaction.
 
@@ -62,43 +62,9 @@ kornia-slam is intended to integrate with [bubbaloop](https://github.com/kornia/
 
 ## Setup
 
-The current runnable slice is the `orb_slam` example. It processes extracted EuRoC MAV sequences with a monocular ORB pipeline and prints per-frame tracking status to stderr.
+The current runnable package is the standalone ORB-SLAM example in [examples/orb_slam/README.md](examples/orb_slam/README.md).
 
-### Dataset setup
-
-You can download the EuRoC MAV dataset from the OpenVINS dataset guide: <https://docs.openvins.com/gs-datasets.html#gs-data-euroc>.
-
-The example expects the standard EuRoC directory layout:
-
-```text
-V1_01_easy/
-└── mav0/
-    ├── cam0/
-    │   ├── data.csv
-    │   └── data/
-    │       ├── 1403636579763555584.png
-    │       └── ...
-    └── state_groundtruth_estimate0/
-        └── data.csv
-```
-
-Only `mav0/cam0/data.csv` and `mav0/cam0/data/*.png` are required to run the example. Ground truth is optional and currently only loaded by the dataset reader. Other datasets are not wired into the example yet.
-
-The example currently uses EuRoC `cam0` intrinsics directly in [examples/orb_slam/main.rs](/home/christie/projects/kornia-slam/examples/orb_slam/main.rs). Running on another dataset requires a dataset adapter and the corresponding camera calibration.
-
-### Run the system
-
-```bash
-cargo run --example orb_slam -- --data /path/to/V1_01_easy
-```
-
-Useful options:
-
-- `--max-frames 500` to limit the run length
-- `--start-frame 100` to skip initial frames
-- `--n-keypoints 1500` to change ORB feature density
-- `--rerun-stream` to spawn a Rerun viewer
-- `--rerun-addr 127.0.0.1:9876` to stream to an existing Rerun instance
+Temporary dependency note: until [kornia-rs PR #803](https://github.com/kornia/kornia-rs/pull/803) is merged and released, this repository depends on unpublished `kornia-rs` crates from the `feat/slam-utils` branch. Cargo fetches them automatically on first build.
 
 ### Local checks
 
