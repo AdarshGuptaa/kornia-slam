@@ -1,5 +1,6 @@
 //! Map-projection-based estimator: matching, PnP, and tracking flow.
 //!
+//! ```text
 //!        Map Points (3D)
 //!        *   *       *
 //!         \  |      /
@@ -17,15 +18,16 @@
 //!   refine with local map
 //!          |
 //! Estimated { pose, inliers, matches }
+//! ```
 
 use std::collections::HashSet;
 
-use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
 use kornia_3d::camera::{ImageSize, PinholeCamera};
-use kornia_3d::pnp::{refine_pose_lm, LMRefineParams};
+use kornia_3d::pnp::{LMRefineParams, refine_pose_lm};
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
 use kornia_imgproc::features::hamming_distance;
-use kornia_imgproc::features::{match_orb_descriptors, OrbMatchConfig};
+use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
 use crate::map::{Map, MapPoint};
@@ -282,6 +284,7 @@ impl KeypointGrid {
 }
 
 /// Matches map points to current-frame keypoints by projection and descriptor comparison.
+#[allow(clippy::too_many_arguments)]
 pub fn match_by_projection(
     map_points: &[MapPoint],
     keypoints_xy: &[[f32; 2]],
@@ -650,10 +653,10 @@ impl MapProjectionEstimator {
 
         let mut ref_correspondences = Vec::with_capacity(ref_matches.len());
         for (kf_desc_idx, curr_idx) in ref_matches {
-            if let Some(Some(mp_idx)) = current_kf.map_point_by_desc_idx.get(kf_desc_idx) {
-                if *mp_idx < map.map_points().len() {
-                    ref_correspondences.push((*mp_idx, curr_idx));
-                }
+            if let Some(Some(mp_idx)) = current_kf.map_point_by_desc_idx.get(kf_desc_idx)
+                && *mp_idx < map.map_points().len()
+            {
+                ref_correspondences.push((*mp_idx, curr_idx));
             }
         }
 
@@ -727,6 +730,7 @@ impl MapProjectionEstimator {
         tracked_inliers >= 15 && tracked_inliers < weak_threshold
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn refine_pose(
         &self,
         curr_keypoints_undist: &[[f32; 2]],
@@ -768,6 +772,7 @@ impl MapProjectionEstimator {
 
 // ── Private Helpers ───────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn try_track(
     map_points: &[MapPoint],
     camera: &PinholeCamera,
@@ -804,6 +809,9 @@ fn try_track(
     }
 }
 
+type LocalMapRefineOutcome = (Vec<(usize, usize)>, Pose3d, usize);
+
+#[allow(clippy::too_many_arguments)]
 fn refine_with_local_map(
     map: &Map,
     current_kf_idx: Option<usize>,
@@ -816,7 +824,7 @@ fn refine_with_local_map(
     grid: &KeypointGrid,
     image_size: ImageSize,
     pose_init: &Pose3d,
-) -> Option<(Vec<(usize, usize)>, Pose3d, usize)> {
+) -> Option<LocalMapRefineOutcome> {
     let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
     let (local_map_points, local_to_global) =
         map.build_local_map_points(tracked_matches, current_kf);

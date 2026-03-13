@@ -1,0 +1,58 @@
+name: Rust Lint
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "examples/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust_lint.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "examples/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust_lint.yml"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Rustfmt
+            command: cargo fmt -- --check
+          - name: Clippy
+            command: cargo clippy --all-targets -- -D warnings
+
+    steps:
+      - name: Checkout kornia-slam
+        uses: actions/checkout@v4
+        with:
+          path: kornia-slam
+
+      - name: Checkout kornia-rs
+        uses: actions/checkout@v4
+        with:
+          repository: kornia/kornia-rs
+          path: kornia-rs
+
+      - name: Restore sibling path layout
+        run: ln -s "$GITHUB_WORKSPACE/kornia-rs" "$GITHUB_WORKSPACE/../kornia-rs"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run ${{ matrix.name }}
+        working-directory: kornia-slam
+        run: ${{ matrix.command }}

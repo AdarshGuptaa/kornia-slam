@@ -11,9 +11,7 @@ use kornia_3d::pose::{
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 use kornia_slam::estimation::MapProjectionEstimator;
-use kornia_slam::estimation::map_projection::{
-    MapProjectionConfig, MapProjectionEstimateOutcome,
-};
+use kornia_slam::estimation::map_projection::{MapProjectionConfig, MapProjectionEstimateOutcome};
 use kornia_slam::estimation::two_view::{
     TwoViewInitConfig, TwoViewInitOutcome, try_initialize_two_view,
 };
@@ -176,11 +174,9 @@ impl Pipeline {
             };
 
             let p_world = reference_pose_inv.transform_point(&(*p_cam / depth_scale));
-            let mp_idx = self.map.push_map_point(MapPoint::new(
-                p_world,
-                descriptor,
-                reference_kf.frame.idx,
-            ));
+            let mp_idx =
+                self.map
+                    .push_map_point(MapPoint::new(p_world, descriptor, reference_kf.frame.idx));
             reference_kf.associate_map_point(reference_desc_idx, mp_idx);
             current_kf.associate_map_point(current_desc_idx, mp_idx);
             added += 1;
@@ -215,7 +211,8 @@ impl Pipeline {
                 inliers,
                 matches,
             } => {
-                self.state.velocity = Some(Pose3d::between(&pose_before_tracking, &pose_world_to_cam));
+                self.state.velocity =
+                    Some(Pose3d::between(&pose_before_tracking, &pose_world_to_cam));
                 self.state.pose_world_to_cam = pose_world_to_cam;
                 (OdometryStatus::Tracked, matches, inliers)
             }
@@ -239,9 +236,7 @@ impl Pipeline {
 
         if status == OdometryStatus::Skipped {
             self.state.consecutive_failures += 1;
-            if self.state.consecutive_failures
-                >= self.estimator.config().max_consecutive_failures
-            {
+            if self.state.consecutive_failures >= self.estimator.config().max_consecutive_failures {
                 self.state.reset();
                 return self.bootstrap_step(frame);
             }
@@ -329,6 +324,7 @@ impl Pipeline {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn grow_map_points_from_keyframe_pair(
         &mut self,
         curr_kf_idx: usize,
@@ -399,8 +395,8 @@ impl Pipeline {
         }
 
         let prev_pose_inv = prev_pose.inverse();
-        let reproj_th2 =
-            triangulation_config.max_reprojection_error * triangulation_config.max_reprojection_error;
+        let reproj_th2 = triangulation_config.max_reprojection_error
+            * triangulation_config.max_reprojection_error;
         let mut n_added = 0usize;
 
         for &inlier_idx in &two_view.inlier_indices {

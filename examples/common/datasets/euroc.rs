@@ -22,6 +22,7 @@ pub enum DatasetError {
 #[derive(Debug, Clone)]
 pub struct DatasetSample {
     /// Timestamp in seconds.
+    #[allow(dead_code)]
     pub timestamp_sec: f64,
     /// Path to the image file.
     pub image_path: PathBuf,
@@ -31,20 +32,28 @@ pub struct DatasetSample {
 #[derive(Debug, Clone, Copy)]
 pub struct GroundTruthPose {
     /// Timestamp in seconds.
+    #[allow(dead_code)]
     pub timestamp_sec: f64,
     /// Position x (meters).
+    #[allow(dead_code)]
     pub tx: f64,
     /// Position y (meters).
+    #[allow(dead_code)]
     pub ty: f64,
     /// Position z (meters).
+    #[allow(dead_code)]
     pub tz: f64,
     /// Quaternion scalar part.
+    #[allow(dead_code)]
     pub qw: f64,
     /// Quaternion x.
+    #[allow(dead_code)]
     pub qx: f64,
     /// Quaternion y.
+    #[allow(dead_code)]
     pub qy: f64,
     /// Quaternion z.
+    #[allow(dead_code)]
     pub qz: f64,
 }
 
@@ -55,10 +64,12 @@ pub struct GroundTruthPose {
 #[derive(Debug, Clone)]
 pub struct EurocDataset {
     /// Base directory of the extracted dataset.
+    #[allow(dead_code)]
     pub root: std::path::PathBuf,
     /// Ordered camera samples.
     pub cam0_samples: Vec<DatasetSample>,
     /// Ground-truth poses (empty if GT file not present).
+    #[allow(dead_code)]
     pub ground_truth: Vec<GroundTruthPose>,
 }
 
@@ -120,6 +131,7 @@ impl EurocDataset {
     }
 
     /// Returns parsed ground-truth poses (possibly empty).
+    #[allow(dead_code)]
     pub fn ground_truth(&self) -> &[GroundTruthPose] {
         &self.ground_truth
     }

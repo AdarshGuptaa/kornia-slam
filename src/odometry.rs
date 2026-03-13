@@ -67,3 +67,9 @@ impl OdometryState {
         self.bootstrap_frame = None;
     }
 }
+
+impl Default for OdometryState {
+    fn default() -> Self {
+        Self::new()
+    }
+}

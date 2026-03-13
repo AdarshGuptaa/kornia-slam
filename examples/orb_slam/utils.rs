@@ -170,7 +170,10 @@ mod tests {
     #[test]
     fn trajectory_point_from_pose_uses_camera_to_world_translation() {
         let pose_world_to_cam = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(1.0, -2.0, 3.0));
-        assert_eq!(trajectory_point_from_pose(&pose_world_to_cam), [-1.0, 2.0, -3.0]);
+        assert_eq!(
+            trajectory_point_from_pose(&pose_world_to_cam),
+            [-1.0, 2.0, -3.0]
+        );
     }
 
     #[test]

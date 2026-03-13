@@ -7,17 +7,17 @@
 //! cargo run --example orb_slam -- --data /path/to/euroc/V1_01_easy
 //! ```
 
-mod pipeline;
-mod utils;
 #[path = "../common/datasets/mod.rs"]
 mod datasets;
+mod pipeline;
+mod utils;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_io::png::read_image_png_mono8;
+use kornia_slam::Frame;
 use kornia_slam::estimation::map_projection::MapProjectionConfig;
 use kornia_slam::estimation::two_view::TwoViewInitConfig;
-use kornia_slam::Frame;
 
 use pipeline::Pipeline;
 
@@ -96,8 +96,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── SLAM config & system ───────────────────────────────────────────────
     let mut two_view_init_config = TwoViewInitConfig::default();
-    two_view_init_config.estimation_config.triangulation.max_midpoint_gap = 0.25;
-    two_view_init_config.estimation_config.triangulation.max_reprojection_error = 3.0;
+    two_view_init_config
+        .estimation_config
+        .triangulation
+        .max_midpoint_gap = 0.25;
+    two_view_init_config
+        .estimation_config
+        .triangulation
+        .max_reprojection_error = 3.0;
     let map_projection_config = MapProjectionConfig::default();
     let mut system = Pipeline::new(camera, two_view_init_config, map_projection_config);
 

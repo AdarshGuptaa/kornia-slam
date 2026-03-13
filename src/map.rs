@@ -27,10 +27,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kornia_algebra::Vec3F64;
 use kornia_3d::ba::{self, BaObservation, BaParams};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
 
 use crate::frame::Frame;
 
@@ -269,23 +269,23 @@ pub fn cull_map_points(map: &mut Map) {
     let mut behind_camera: Vec<usize> = Vec::new();
     for kf in map.keyframes() {
         for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
-            if let Some(mp) = map.map_points().get(*mp_idx) {
-                if !mp.culled {
-                    let p_cam = kf.frame.pose_world_to_cam.transform_point(&mp.position);
-                    if p_cam.z <= 1e-8 {
-                        behind_camera.push(*mp_idx);
-                    }
+            if let Some(mp) = map.map_points().get(*mp_idx)
+                && !mp.culled
+            {
+                let p_cam = kf.frame.pose_world_to_cam.transform_point(&mp.position);
+                if p_cam.z <= 1e-8 {
+                    behind_camera.push(*mp_idx);
                 }
             }
         }
     }
 
     for mp_idx in &behind_camera {
-        if let Some(mp) = map.map_points_mut().get_mut(*mp_idx) {
-            if !mp.culled {
-                mp.mark_culled();
-                n_culled += 1;
-            }
+        if let Some(mp) = map.map_points_mut().get_mut(*mp_idx)
+            && !mp.culled
+        {
+            mp.mark_culled();
+            n_culled += 1;
         }
     }
 
@@ -300,10 +300,10 @@ pub fn cull_map_points(map: &mut Map) {
 
         for kf in map.keyframes_mut() {
             for desc_idx in 0..kf.map_point_by_desc_idx.len() {
-                if let Some(mp_idx) = kf.map_point(desc_idx) {
-                    if culled_set.contains(&mp_idx) {
-                        kf.clear_map_point(desc_idx);
-                    }
+                if let Some(mp_idx) = kf.map_point(desc_idx)
+                    && culled_set.contains(&mp_idx)
+                {
+                    kf.clear_map_point(desc_idx);
                 }
             }
         }
@@ -329,10 +329,10 @@ pub fn run_local_ba(map: &mut Map, camera: &PinholeCamera) {
     let mut mp_set: HashSet<usize> = HashSet::new();
     for kf in &map.keyframes()[active_start..] {
         for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
-            if let Some(mp) = map.map_points().get(*mp_idx) {
-                if !mp.culled {
-                    mp_set.insert(*mp_idx);
-                }
+            if let Some(mp) = map.map_points().get(*mp_idx)
+                && !mp.culled
+            {
+                mp_set.insert(*mp_idx);
             }
         }
     }
@@ -439,7 +439,12 @@ mod tests {
 
         assert_eq!(keyframe.frame.idx, 7);
         assert_eq!(keyframe.map_point_by_desc_idx.len(), 3);
-        assert!(keyframe.map_point_by_desc_idx.iter().all(|slot| slot.is_none()));
+        assert!(
+            keyframe
+                .map_point_by_desc_idx
+                .iter()
+                .all(|slot| slot.is_none())
+        );
     }
 
     #[test]
@@ -506,8 +511,10 @@ mod tests {
     fn push_map_point_returns_sequential_index() {
         let mut map = Map::new();
 
-        let first_idx = map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0));
-        let second_idx = map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 1.0), [1u8; 32], 0));
+        let first_idx =
+            map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0));
+        let second_idx =
+            map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 1.0), [1u8; 32], 0));
 
         assert_eq!(first_idx, 0);
         assert_eq!(second_idx, 1);
@@ -518,8 +525,10 @@ mod tests {
     fn cull_map_points_removes_low_ratio() {
         let mut map = Map::new();
 
-        let first_idx = map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 5.0), [0u8; 32], 0));
-        let second_idx = map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 5.0), [1u8; 32], 0));
+        let first_idx =
+            map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 5.0), [0u8; 32], 0));
+        let second_idx =
+            map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 5.0), [1u8; 32], 0));
         map.map_points_mut()[first_idx].n_visible = 10;
         map.map_points_mut()[first_idx].n_found = 1;
         map.map_points_mut()[second_idx].n_visible = 10;

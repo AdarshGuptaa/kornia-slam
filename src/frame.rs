@@ -8,7 +8,6 @@ pub use kornia_imgproc::features::OrbFeatures;
 ///
 /// If kornia-slam grows multiple frontend feature pipelines, this module is the
 /// place to introduce a higher-level abstraction above `OrbFeatures`.
-
 /// A camera observation: features extracted at a known pose.
 #[derive(Debug, Clone)]
 pub struct Frame {
