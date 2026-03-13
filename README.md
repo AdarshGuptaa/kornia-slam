@@ -2,6 +2,8 @@
 
 Spatial runtime for real-time pose estimation, mapping, and agent interaction.
 
+> **Work in progress**
+
 > **Early stage.** This README describes the long-term vision for kornia-slam, while the current implementation is a much narrower slice: monocular ORB-based odometry running end-to-end on EuRoC datasets. The current codebase is not yet a general SLAM framework: it is an ORB-specific monocular pipeline whose system orchestration still lives in the example layer rather than behind a stable library abstraction. The API, module layout, and internal abstractions are still taking shape, and broader multi-sensor SLAM, map serving, and agent integration remain roadmap work. Expect breaking changes. Contributions and feedback welcome.
 
 kornia-slam is a modular SLAM framework that estimates poses in real time from cameras, IMU, LiDAR, and GNSS, builds a persistent map of the environment, and makes that spatial state available to agents through MCP.
@@ -98,13 +100,11 @@ cargo test
 - [ ] Trajectory evaluation (ATE/RPE against ground truth)
 
 **Later — multi-sensor and real-time**
+- [ ] IMU preintegration
 - [ ] Stereo and RGB-D estimators
-- [ ] IMU preintegration estimator
 - [ ] Estimator fusion in odometry
-- [ ] Zenoh sensor integration
-- [ ] bubbaloop node integration
 - [ ] Map server (MCP)
-- [ ] LiDAR ICP estimator
+- [ ] bubbaloop node integration
 
 ## License
 
