@@ -122,10 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Load grayscale image and convert u8 → f32.
         let gray_u8 = read_image_png_mono8(&sample.image_path)?;
-        let image_size = kornia_3d::camera::ImageSize {
-            width: gray_u8.width() as f64,
-            height: gray_u8.height() as f64,
-        };
+        let image_size = gray_u8.size();
         let gray_f32 = {
             let mut dst = kornia_image::Image::from_size_val(
                 gray_u8.size(),

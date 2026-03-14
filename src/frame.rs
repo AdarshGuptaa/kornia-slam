@@ -1,7 +1,7 @@
 //! Core frame-domain types shared across the crate.
 
-use kornia_3d::camera::ImageSize;
 use kornia_3d::pose::Pose3d;
+use kornia_image::ImageSize;
 pub use kornia_imgproc::features::OrbFeatures;
 
 /// `Frame` carries ORB features directly today.

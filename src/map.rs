@@ -409,8 +409,8 @@ pub fn run_local_ba(map: &mut Map, camera: &PinholeCamera) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kornia_3d::camera::ImageSize;
     use kornia_3d::pose::Pose3d;
+    use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbFeatures;
 
     fn test_frame(idx: usize, descriptors: Vec<[u8; 32]>) -> Frame {
@@ -427,8 +427,8 @@ mod tests {
             },
             Pose3d::IDENTITY,
             ImageSize {
-                width: 640.0,
-                height: 480.0,
+                width: 640,
+                height: 480,
             },
         )
     }

@@ -22,10 +22,11 @@
 
 use std::collections::HashSet;
 
-use kornia_3d::camera::{ImageSize, PinholeCamera};
+use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pnp::{LMRefineParams, refine_pose_lm};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
+use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
@@ -1003,8 +1004,8 @@ mod matching_tests {
             &pose,
             &camera,
             ImageSize {
-                width: 640.0,
-                height: 480.0,
+                width: 640,
+                height: 480,
             },
             ProjectionMatchConfig {
                 min_depth: 0.0,
@@ -1051,8 +1052,8 @@ mod matching_tests {
             &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),
             &camera,
             ImageSize {
-                width: 640.0,
-                height: 480.0,
+                width: 640,
+                height: 480,
             },
             ProjectionMatchConfig {
                 min_depth: 0.0,
@@ -1098,8 +1099,8 @@ mod matching_tests {
             &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),
             &camera,
             ImageSize {
-                width: 640.0,
-                height: 480.0,
+                width: 640,
+                height: 480,
             },
             ProjectionMatchConfig {
                 min_depth: 0.0,
