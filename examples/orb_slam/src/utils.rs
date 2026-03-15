@@ -1,17 +1,12 @@
 //! Minimal Rerun visualization helpers for the ORB-SLAM example.
 
+use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
-use kornia_image::Image;
+use kornia_image::{Image, ImageSize};
 use kornia_slam::map::MapPoint;
 use kornia_tensor::CpuAllocator;
 
-const EUROC_FX: f32 = 458.654;
-const EUROC_FY: f32 = 457.296;
-const EUROC_CX: f32 = 367.215;
-const EUROC_CY: f32 = 248.375;
-const EUROC_IMAGE_WIDTH: f32 = 752.0;
-const EUROC_IMAGE_HEIGHT: f32 = 480.0;
 const CAMERA_IMAGE_PLANE_DISTANCE: f32 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -55,8 +50,13 @@ pub fn log_trajectory_to_rerun(rec: &rerun::RecordingStream, trajectory: &[[f32;
 }
 
 /// Log the current camera frustum in world coordinates.
-pub fn log_camera_to_rerun(rec: &rerun::RecordingStream, pose_world_to_cam: &Pose3d) {
-    let spec = camera_visualization_spec(pose_world_to_cam);
+pub fn log_camera_to_rerun(
+    rec: &rerun::RecordingStream,
+    pose_world_to_cam: &Pose3d,
+    camera: &PinholeCamera,
+    image_size: ImageSize,
+) {
+    let spec = camera_visualization_spec(pose_world_to_cam, camera, image_size);
 
     rec.log(
         "world/camera",
@@ -107,7 +107,11 @@ pub fn trajectory_point_from_pose(pose_world_to_cam: &Pose3d) -> [f32; 3] {
     ]
 }
 
-fn camera_visualization_spec(pose_world_to_cam: &Pose3d) -> CameraVisualizationSpec {
+fn camera_visualization_spec(
+    pose_world_to_cam: &Pose3d,
+    camera: &PinholeCamera,
+    image_size: ImageSize,
+) -> CameraVisualizationSpec {
     let cam_to_world = pose_world_to_cam.inverse();
     let t = cam_to_world.translation;
     let (qx, qy, qz, qw) = quat_xyzw_from_matrix(&cam_to_world.rotation);
@@ -115,9 +119,9 @@ fn camera_visualization_spec(pose_world_to_cam: &Pose3d) -> CameraVisualizationS
     CameraVisualizationSpec {
         translation: [t.x as f32, t.y as f32, t.z as f32],
         rotation_wxyz: [qw as f32, qx as f32, qy as f32, qz as f32],
-        focal_length: [EUROC_FX, EUROC_FY],
-        resolution: [EUROC_IMAGE_WIDTH, EUROC_IMAGE_HEIGHT],
-        principal_point: [EUROC_CX, EUROC_CY],
+        focal_length: [camera.fx as f32, camera.fy as f32],
+        resolution: [image_size.width as f32, image_size.height as f32],
+        principal_point: [camera.cx as f32, camera.cy as f32],
         image_plane_distance: CAMERA_IMAGE_PLANE_DISTANCE,
     }
 }
@@ -179,13 +183,27 @@ mod tests {
     #[test]
     fn camera_visualization_spec_uses_camera_to_world_pose() {
         let pose_world_to_cam = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(1.0, -2.0, 3.0));
-        let spec = camera_visualization_spec(&pose_world_to_cam);
+        let camera = PinholeCamera {
+            fx: 458.654,
+            fy: 457.296,
+            cx: 367.215,
+            cy: 248.375,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        };
+        let image_size = ImageSize {
+            width: 752,
+            height: 480,
+        };
+        let spec = camera_visualization_spec(&pose_world_to_cam, &camera, image_size);
 
         assert_eq!(spec.translation, [-1.0, 2.0, -3.0]);
         assert_eq!(spec.rotation_wxyz, [1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(spec.focal_length, [EUROC_FX, EUROC_FY]);
-        assert_eq!(spec.resolution, [EUROC_IMAGE_WIDTH, EUROC_IMAGE_HEIGHT]);
-        assert_eq!(spec.principal_point, [EUROC_CX, EUROC_CY]);
+        assert_eq!(spec.focal_length, [458.654, 457.296]);
+        assert_eq!(spec.resolution, [752.0, 480.0]);
+        assert_eq!(spec.principal_point, [367.215, 248.375]);
         assert_eq!(spec.image_plane_distance, CAMERA_IMAGE_PLANE_DISTANCE);
     }
 }

@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ── SLAM config & system ───────────────────────────────────────────────
-    let mut system = Pipeline::new(camera, PipelineConfig::default());
+    let mut system = Pipeline::new(camera.clone(), PipelineConfig::default());
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     let rec = if args.rerun_stream {
@@ -148,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Rerun logging.
         if let Some(ref rec) = rec {
             log_trajectory_to_rerun(rec, &trajectory);
-            log_camera_to_rerun(rec, &result.pose_world_to_cam);
+            log_camera_to_rerun(rec, &result.pose_world_to_cam, &camera, image_size);
             log_map_points_to_rerun(rec, system.map_points());
         }
     }
