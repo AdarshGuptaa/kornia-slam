@@ -2,7 +2,7 @@
 
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
-pub use kornia_imgproc::features::OrbFeatures;
+use kornia_imgproc::features::OrbFeatures;
 
 /// `Frame` carries ORB features directly today.
 ///
@@ -19,20 +19,4 @@ pub struct Frame {
     pub pose_world_to_cam: Pose3d,
     /// Image dimensions.
     pub image_size: ImageSize,
-}
-
-impl Frame {
-    pub fn new(
-        idx: usize,
-        features: OrbFeatures,
-        pose_world_to_cam: Pose3d,
-        image_size: ImageSize,
-    ) -> Self {
-        Self {
-            idx,
-            features,
-            pose_world_to_cam,
-            image_size,
-        }
-    }
 }

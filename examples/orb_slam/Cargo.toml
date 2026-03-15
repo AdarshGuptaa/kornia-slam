@@ -3,7 +3,7 @@ name = "orb_slam"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Standalone ORB-SLAM example for kornia-slam"
+description = "ORB-SLAM example for kornia-slam"
 
 [dependencies]
 argh = "0.1"
@@ -15,4 +15,6 @@ kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "feat/s
 kornia-io = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
 kornia-tensor = { git = "https://github.com/kornia/kornia-rs", branch = "feat/slam-utils" }
 rerun = "0.29.2"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 thiserror = "2"

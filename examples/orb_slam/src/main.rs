@@ -9,15 +9,14 @@
 
 #[path = "../../common/datasets/mod.rs"]
 mod datasets;
+mod config;
 mod pipeline;
 mod utils;
 
-use kornia_3d::camera::PinholeCamera;
+use config::PipelineConfig;
 use kornia_3d::pose::Pose3d;
 use kornia_io::png::read_image_png_mono8;
 use kornia_slam::Frame;
-use kornia_slam::estimation::map_projection::MapProjectionConfig;
-use kornia_slam::estimation::two_view::TwoViewInitConfig;
 
 use pipeline::Pipeline;
 
@@ -68,17 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.start_frame + n_frames
     );
 
-    // ── Camera (EuRoC cam0 intrinsics) ─────────────────────────────────────
-    let camera = PinholeCamera {
-        fx: 458.654,
-        fy: 457.296,
-        cx: 367.215,
-        cy: 248.375,
-        k1: -0.28340811,
-        k2: 0.07395907,
-        p1: 0.00019359,
-        p2: 1.76187114e-05,
-    };
+    // ── Camera (from EuRoC cam0 sensor.yaml) ───────────────────────────────
+    let camera = dataset.camera();
 
     // ── ORB detector (used externally before feeding Pipeline) ─────────────
     let detector = kornia_imgproc::features::OrbDetector {
@@ -87,17 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ── SLAM config & system ───────────────────────────────────────────────
-    let mut two_view_init_config = TwoViewInitConfig::default();
-    two_view_init_config
-        .estimation_config
-        .triangulation
-        .max_midpoint_gap = 0.25;
-    two_view_init_config
-        .estimation_config
-        .triangulation
-        .max_reprojection_error = 3.0;
-    let map_projection_config = MapProjectionConfig::default();
-    let mut system = Pipeline::new(camera, two_view_init_config, map_projection_config);
+    let mut system = Pipeline::new(camera, PipelineConfig::default());
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     let rec = if args.rerun_stream {
@@ -125,11 +105,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let image_size = gray_u8.size();
         let gray_f32 = {
             let mut dst = kornia_image::Image::from_size_val(
-                gray_u8.size(),
+                image_size,
                 0.0f32,
                 kornia_tensor::CpuAllocator,
             )
-            .unwrap();
+            ?;
             gray_u8
                 .as_slice()
                 .iter()
@@ -145,7 +125,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Run SLAM.
-        let frame = Frame::new(idx, features, Pose3d::IDENTITY, image_size);
+        let frame = Frame {
+            idx,
+            features,
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size,
+        };
         let result = system.process_frame(frame);
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_map_points();

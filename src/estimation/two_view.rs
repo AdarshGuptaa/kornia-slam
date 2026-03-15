@@ -18,7 +18,7 @@ use kornia_3d::pose::{TwoViewConfig, TwoViewModel, two_view_estimate};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
-use crate::frame::OrbFeatures;
+use crate::OrbFeatures;
 
 /// Configuration for two-view initialization.
 #[derive(Debug, Clone)]

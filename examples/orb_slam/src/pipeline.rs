@@ -3,6 +3,7 @@
 //! This example keeps the runtime flow in one file so it can be read from top
 //! to bottom in the same order frames move through the system.
 
+use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{
@@ -11,7 +12,7 @@ use kornia_3d::pose::{
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 use kornia_slam::estimation::MapProjectionEstimator;
-use kornia_slam::estimation::map_projection::{MapProjectionConfig, MapProjectionEstimateOutcome};
+use kornia_slam::estimation::map_projection::MapProjectionEstimateOutcome;
 use kornia_slam::estimation::two_view::{
     TwoViewInitConfig, TwoViewInitOutcome, try_initialize_two_view,
 };
@@ -29,14 +30,10 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Creates a new pipeline with identity pose.
-    pub fn new(
-        camera: PinholeCamera,
-        two_view_init_config: TwoViewInitConfig,
-        map_projection_config: MapProjectionConfig,
-    ) -> Self {
+    pub fn new(camera: PinholeCamera, config: PipelineConfig) -> Self {
         Self {
-            estimator: MapProjectionEstimator::new(camera, map_projection_config),
-            two_view_init_config,
+            estimator: MapProjectionEstimator::new(camera, config.map_projection),
+            two_view_init_config: config.two_view_init,
             map: Map::new(),
             state: OdometryState::new(),
         }
@@ -302,12 +299,12 @@ impl Pipeline {
             &estimation_config,
         );
 
-        let mut kf = Keyframe::from_frame(Frame::new(
-            frame.idx,
-            frame.features.clone(),
-            self.state.pose_world_to_cam,
-            frame.image_size,
-        ));
+        let mut kf = Keyframe::from_frame(Frame {
+            idx: frame.idx,
+            features: frame.features.clone(),
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            image_size: frame.image_size,
+        });
         kf.map_point_by_desc_idx = curr_kf_map_assoc;
         self.map.upsert_keyframe(kf);
         self.state.current_keyframe_idx = Some(frame.idx);

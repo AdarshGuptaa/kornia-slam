@@ -1,5 +1,7 @@
 //! Dataset readers for visual odometry benchmarks.
 
+use kornia_3d::camera::PinholeCamera;
+use serde::Deserialize;
 use std::{fs::File, io::BufRead, io::BufReader, path::Path, path::PathBuf};
 
 /// Error type used by dataset readers.
@@ -57,6 +59,51 @@ pub struct GroundTruthPose {
     pub qz: f64,
 }
 
+/// EuRoC `cam0` calibration loaded from `sensor.yaml`.
+#[derive(Debug, Clone, Copy)]
+pub struct EurocCameraCalibration {
+    /// Focal length in x.
+    pub fx: f64,
+    /// Focal length in y.
+    pub fy: f64,
+    /// Principal point x.
+    pub cx: f64,
+    /// Principal point y.
+    pub cy: f64,
+    /// Radial distortion coefficient.
+    pub k1: f64,
+    /// Radial distortion coefficient.
+    pub k2: f64,
+    /// Tangential distortion coefficient.
+    pub p1: f64,
+    /// Tangential distortion coefficient.
+    pub p2: f64,
+}
+
+impl EurocCameraCalibration {
+    /// Converts the parsed EuRoC calibration into a `PinholeCamera`.
+    pub fn to_pinhole_camera(self) -> PinholeCamera {
+        PinholeCamera {
+            fx: self.fx,
+            fy: self.fy,
+            cx: self.cx,
+            cy: self.cy,
+            k1: self.k1,
+            k2: self.k2,
+            p1: self.p1,
+            p2: self.p2,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EurocSensorYaml {
+    camera_model: String,
+    distortion_model: Option<String>,
+    intrinsics: Vec<f64>,
+    distortion_coefficients: Vec<f64>,
+}
+
 /// Reader for the EuRoC MAV dataset (ASL format).
 ///
 /// Expects `<root>/mav0/cam0/data.csv` with nanosecond timestamps and
@@ -68,6 +115,8 @@ pub struct EurocDataset {
     pub root: std::path::PathBuf,
     /// Ordered camera samples.
     pub cam0_samples: Vec<DatasetSample>,
+    /// Camera calibration for `cam0`.
+    pub cam0_calibration: EurocCameraCalibration,
     /// Ground-truth poses (empty if GT file not present).
     #[allow(dead_code)]
     pub ground_truth: Vec<GroundTruthPose>,
@@ -79,6 +128,7 @@ impl EurocDataset {
         let root = root.as_ref().to_path_buf();
         let csv = root.join("mav0").join("cam0").join("data.csv");
         let data_dir = root.join("mav0").join("cam0").join("data");
+        let cam0_calibration = Self::load_cam0_calibration(&root)?;
 
         if !csv.exists() {
             return Err(DatasetError::FileNotFound(csv));
@@ -121,6 +171,7 @@ impl EurocDataset {
         Ok(Self {
             root,
             cam0_samples: samples,
+            cam0_calibration,
             ground_truth,
         })
     }
@@ -128,6 +179,11 @@ impl EurocDataset {
     /// Returns ordered cam0 samples.
     pub fn samples(&self) -> &[DatasetSample] {
         &self.cam0_samples
+    }
+
+    /// Returns the `cam0` camera model.
+    pub fn camera(&self) -> PinholeCamera {
+        self.cam0_calibration.to_pinhole_camera()
     }
 
     /// Returns parsed ground-truth poses (possibly empty).
@@ -186,5 +242,173 @@ impl EurocDataset {
             });
         }
         poses
+    }
+
+    fn load_cam0_calibration(root: &Path) -> Result<EurocCameraCalibration, DatasetError> {
+        let sensor_yaml = root.join("mav0").join("cam0").join("sensor.yaml");
+        if !sensor_yaml.exists() {
+            return Err(DatasetError::FileNotFound(sensor_yaml));
+        }
+
+        let file = File::open(&sensor_yaml)?;
+        let sensor: EurocSensorYaml = serde_yaml::from_reader(file).map_err(|e| {
+            DatasetError::Parse(format!(
+                "invalid EuRoC cam0 calibration at {}: {e}",
+                sensor_yaml.display()
+            ))
+        })?;
+
+        if sensor.camera_model != "pinhole" {
+            return Err(DatasetError::Parse(format!(
+                "unsupported EuRoC camera_model '{}' at {}",
+                sensor.camera_model,
+                sensor_yaml.display()
+            )));
+        }
+
+        if let Some(distortion_model) = sensor.distortion_model.as_deref() {
+            if distortion_model != "radial-tangential" {
+                return Err(DatasetError::Parse(format!(
+                    "unsupported EuRoC distortion_model '{}' at {}",
+                    distortion_model,
+                    sensor_yaml.display()
+                )));
+            }
+        }
+
+        let [fx, fy, cx, cy] = sensor.intrinsics.as_slice() else {
+            return Err(DatasetError::Parse(format!(
+                "expected 4 intrinsics in {}",
+                sensor_yaml.display()
+            )));
+        };
+        let [k1, k2, p1, p2] = sensor.distortion_coefficients.as_slice() else {
+            return Err(DatasetError::Parse(format!(
+                "expected 4 distortion coefficients in {}",
+                sensor_yaml.display()
+            )));
+        };
+
+        Ok(EurocCameraCalibration {
+            fx: *fx,
+            fy: *fy,
+            cx: *cx,
+            cy: *cy,
+            k1: *k1,
+            k2: *k2,
+            p1: *p1,
+            p2: *p2,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "kornia-slam-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_minimal_euroc_tree(root: &Path, include_sensor_yaml: bool) {
+        let cam0_dir = root.join("mav0").join("cam0");
+        let data_dir = cam0_dir.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::write(cam0_dir.join("data.csv"), "#timestamp [ns],filename\n1403636579763555584,1403636579763555584.png\n").unwrap();
+        fs::write(data_dir.join("1403636579763555584.png"), []).unwrap();
+
+        if include_sensor_yaml {
+            fs::write(
+                cam0_dir.join("sensor.yaml"),
+                "sensor_type: camera\ncamera_model: pinhole\nintrinsics: [458.654, 457.296, 367.215, 248.375]\ndistortion_model: radial-tangential\ndistortion_coefficients: [-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05]\n",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn dataset_loads_cam0_calibration() {
+        let dir = TestDir::new("euroc-calibration-ok");
+        write_minimal_euroc_tree(dir.path(), true);
+
+        let dataset = EurocDataset::open(dir.path()).unwrap();
+        let camera = dataset.camera();
+
+        assert_eq!(camera.fx, 458.654);
+        assert_eq!(camera.fy, 457.296);
+        assert_eq!(camera.cx, 367.215);
+        assert_eq!(camera.cy, 248.375);
+        assert_eq!(camera.k1, -0.28340811);
+        assert_eq!(camera.k2, 0.07395907);
+        assert_eq!(camera.p1, 0.00019359);
+        assert_eq!(camera.p2, 1.76187114e-05);
+    }
+
+    #[test]
+    fn dataset_open_fails_when_sensor_yaml_is_missing() {
+        let dir = TestDir::new("euroc-calibration-missing");
+        write_minimal_euroc_tree(dir.path(), false);
+
+        let err = EurocDataset::open(dir.path()).unwrap_err();
+
+        match err {
+            DatasetError::FileNotFound(path) => {
+                assert_eq!(path, dir.path().join("mav0").join("cam0").join("sensor.yaml"));
+            }
+            other => panic!("expected FileNotFound for sensor.yaml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dataset_open_fails_when_sensor_yaml_is_malformed() {
+        let dir = TestDir::new("euroc-calibration-bad");
+        write_minimal_euroc_tree(dir.path(), true);
+        fs::write(
+            dir.path()
+                .join("mav0")
+                .join("cam0")
+                .join("sensor.yaml"),
+            "camera_model: pinhole\nintrinsics: [458.654, 457.296, 367.215]\ndistortion_coefficients: [-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05]\n",
+        )
+        .unwrap();
+
+        let err = EurocDataset::open(dir.path()).unwrap_err();
+
+        match err {
+            DatasetError::Parse(message) => {
+                assert!(message.contains("expected 4 intrinsics"));
+            }
+            other => panic!("expected Parse for malformed sensor.yaml, got {other:?}"),
+        }
     }
 }

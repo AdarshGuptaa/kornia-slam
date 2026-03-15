@@ -414,9 +414,9 @@ mod tests {
     use kornia_imgproc::features::OrbFeatures;
 
     fn test_frame(idx: usize, descriptors: Vec<[u8; 32]>) -> Frame {
-        Frame::new(
+        Frame {
             idx,
-            OrbFeatures {
+            features: OrbFeatures {
                 keypoints_xy: descriptors
                     .iter()
                     .enumerate()
@@ -425,12 +425,12 @@ mod tests {
                 orientations: vec![0.0; descriptors.len()],
                 descriptors,
             },
-            Pose3d::IDENTITY,
-            ImageSize {
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
                 width: 640,
                 height: 480,
             },
-        )
+        }
     }
 
     #[test]

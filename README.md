@@ -62,6 +62,10 @@ kornia-slam is intended to integrate with [bubbaloop](https://github.com/kornia/
 - **Spatial state via MCP** — kornia-slam should expose pose, map, and spatial query tools through an MCP server.
 - **Agent-facing spatial tools** — bubbaloop agents should be able to connect to that MCP interface to inspect the live 3D map, query current pose and nearby structure, and invoke higher-level spatial computations such as localization, landmark lookup, geometric relationships, and map-based reasoning.
 
+### Agentic SLAM — rethinking SLAM in the age of agents
+
+Beyond serving spatial state to external agents, kornia-slam is exploring the idea of agents operating *within* the SLAM system itself — monitoring and improving subsystems at runtime. For example, an agent that detects degraded feature matching in low-texture scenes and switches extraction strategy, or one that tunes bundle adjustment parameters based on observed residuals. This treats SLAM not as a fixed pipeline but as a system whose components can be inspected, tuned, and swapped by agents operating in sandboxed environments.
+
 ## Setup
 
 The current runnable package is the standalone ORB-SLAM example in [examples/orb_slam/README.md](examples/orb_slam/README.md).
@@ -98,6 +102,7 @@ cargo test
 **After that — robustness and evaluation**
 - [ ] Match a strong monocular ORB baseline on trajectory quality and tracking robustness
 - [ ] Trajectory evaluation (ATE/RPE against ground truth)
+- [ ] Comprehensive testing across multiple datasets (EuRoC, TUM-VI, etc.) and challenging scenarios
 
 **Later — multi-sensor and real-time**
 - [ ] IMU preintegration
@@ -105,6 +110,7 @@ cargo test
 - [ ] Estimator fusion in odometry
 - [ ] Map server (MCP)
 - [ ] bubbaloop node integration
+- [ ] Agentic SLAM (subsystem monitoring, strategy switching, parameter tuning)
 
 ## License
 

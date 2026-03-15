@@ -23,9 +23,9 @@ V1_01_easy/
         └── data.csv
 ```
 
-Only `mav0/cam0/data.csv` and `mav0/cam0/data/*.png` are required to run the example. Ground truth is optional and currently only loaded by the dataset reader.
+`mav0/cam0/data.csv`, `mav0/cam0/data/*.png`, and `mav0/cam0/sensor.yaml` are required to run the example. Ground truth is optional and currently only loaded by the dataset reader.
 
-The example currently uses EuRoC `cam0` intrinsics directly in [src/main.rs](src/main.rs). Running on another dataset requires a dataset adapter and the corresponding camera calibration.
+The example reads EuRoC `cam0` calibration from `sensor.yaml`. Running on another dataset requires a dataset adapter and the corresponding camera calibration.
 
 ## Run
 
