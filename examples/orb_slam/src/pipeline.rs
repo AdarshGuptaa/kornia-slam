@@ -17,7 +17,7 @@ use kornia_slam::estimation::two_view::{
     TwoViewInitConfig, TwoViewInitOutcome, try_initialize_two_view,
 };
 use kornia_slam::map::{Keyframe, Map, MapPoint};
-use kornia_slam::odometry::{OdometryMode, OdometryResult, OdometryState, OdometryStatus};
+use kornia_slam::system::{SystemMode, SystemState, TrackingResult, TrackingStatus};
 use kornia_slam::{Frame, OrbFeatures};
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
@@ -25,7 +25,7 @@ pub struct Pipeline {
     estimator: MapProjectionEstimator,
     two_view_init_config: TwoViewInitConfig,
     map: Map,
-    state: OdometryState,
+    state: SystemState,
 }
 
 impl Pipeline {
@@ -35,15 +35,15 @@ impl Pipeline {
             estimator: MapProjectionEstimator::new(camera, config.map_projection),
             two_view_init_config: config.two_view_init,
             map: Map::new(),
-            state: OdometryState::new(),
+            state: SystemState::new(),
         }
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
-    pub fn process_frame(&mut self, frame: Frame) -> OdometryResult {
-        match self.state.state {
-            OdometryMode::Bootstrap => self.bootstrap_step(frame),
-            OdometryMode::Tracking => self.tracking_step(frame),
+    pub fn process_frame(&mut self, frame: Frame) -> TrackingResult {
+        match self.state.mode {
+            SystemMode::Bootstrap => self.bootstrap_step(frame),
+            SystemMode::Tracking => self.tracking_step(frame),
         }
     }
 
@@ -64,16 +64,16 @@ impl Pipeline {
         self.map.map_points().len()
     }
 
-    fn bootstrap_step(&mut self, mut curr_frame: Frame) -> OdometryResult {
+    fn bootstrap_step(&mut self, mut curr_frame: Frame) -> TrackingResult {
         // Stamp frames with current odometry pose so bootstrap builds
         // the new map in the existing coordinate frame.
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
 
         let Some(prev_bootstrap_frame) = self.state.bootstrap_frame.take() else {
             self.state.bootstrap_frame = Some(curr_frame);
-            return OdometryResult {
+            return TrackingResult {
                 pose_world_to_cam: self.state.pose_world_to_cam,
-                status: OdometryStatus::Skipped,
+                status: TrackingStatus::Skipped,
             };
         };
 
@@ -89,9 +89,9 @@ impl Pipeline {
         match outcome {
             TwoViewInitOutcome::Rejected { .. } => {
                 self.state.bootstrap_frame = Some(prev_bootstrap_frame);
-                OdometryResult {
+                TrackingResult {
                     pose_world_to_cam: self.state.pose_world_to_cam,
-                    status: OdometryStatus::Skipped,
+                    status: TrackingStatus::Skipped,
                 }
             }
             TwoViewInitOutcome::Initialized {
@@ -117,11 +117,11 @@ impl Pipeline {
                 );
                 self.state.current_keyframe_idx = Some(curr_idx);
                 self.state.last_keyframe_idx = Some(curr_idx);
-                self.state.state = OdometryMode::Tracking;
+                self.state.mode = SystemMode::Tracking;
 
-                OdometryResult {
+                TrackingResult {
                     pose_world_to_cam: self.state.pose_world_to_cam,
-                    status: OdometryStatus::KeyframeAccepted,
+                    status: TrackingStatus::KeyframeAccepted,
                 }
             }
         }
@@ -184,7 +184,7 @@ impl Pipeline {
         added
     }
 
-    fn tracking_step(&mut self, frame: Frame) -> OdometryResult {
+    fn tracking_step(&mut self, frame: Frame) -> TrackingResult {
         let pose_before_tracking = self.state.pose_world_to_cam;
         let image_size = frame.image_size;
 
@@ -211,14 +211,14 @@ impl Pipeline {
                 self.state.velocity =
                     Some(Pose3d::between(&pose_before_tracking, &pose_world_to_cam));
                 self.state.pose_world_to_cam = pose_world_to_cam;
-                (OdometryStatus::Tracked, matches, inliers)
+                (TrackingStatus::Tracked, matches, inliers)
             }
             MapProjectionEstimateOutcome::Rejected { .. } => {
-                (OdometryStatus::Skipped, Vec::new(), 0)
+                (TrackingStatus::Skipped, Vec::new(), 0)
             }
         };
 
-        if status == OdometryStatus::Tracked {
+        if status == TrackingStatus::Tracked {
             self.estimator.update_map_point_observations(
                 &mut self.map,
                 &matches,
@@ -227,11 +227,11 @@ impl Pipeline {
             );
 
             if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {
-                status = OdometryStatus::KeyframeAccepted;
+                status = TrackingStatus::KeyframeAccepted;
             }
         }
 
-        if status == OdometryStatus::Skipped {
+        if status == TrackingStatus::Skipped {
             self.state.consecutive_failures += 1;
             if self.state.consecutive_failures >= self.estimator.config().max_consecutive_failures {
                 self.state.reset();
@@ -241,7 +241,7 @@ impl Pipeline {
             self.state.consecutive_failures = 0;
         }
 
-        OdometryResult {
+        TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
             status,
         }

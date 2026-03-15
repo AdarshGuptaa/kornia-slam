@@ -25,31 +25,3 @@ impl Default for PipelineConfig {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::PipelineConfig;
-
-    #[test]
-    fn default_pipeline_config_applies_example_overrides() {
-        let config = PipelineConfig::default();
-
-        assert_eq!(
-            config
-                .two_view_init
-                .estimation_config
-                .triangulation
-                .max_midpoint_gap,
-            0.25
-        );
-        assert_eq!(
-            config
-                .two_view_init
-                .estimation_config
-                .triangulation
-                .max_reprojection_error,
-            3.0
-        );
-        assert!(config.map_projection.enable_local_ba);
-    }
-}

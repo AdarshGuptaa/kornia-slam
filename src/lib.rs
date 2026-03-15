@@ -3,9 +3,9 @@
 pub mod estimation;
 pub mod frame;
 pub mod map;
-pub mod odometry;
+pub mod system;
 
 pub use estimation::MapProjectionEstimator;
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
-pub use odometry::{OdometryMode, OdometryResult, OdometryState, OdometryStatus};
+pub use system::{SystemMode, SystemState, TrackingResult, TrackingStatus};
