@@ -266,14 +266,14 @@ impl EurocDataset {
             )));
         }
 
-        if let Some(distortion_model) = sensor.distortion_model.as_deref() {
-            if distortion_model != "radial-tangential" {
-                return Err(DatasetError::Parse(format!(
-                    "unsupported EuRoC distortion_model '{}' at {}",
-                    distortion_model,
-                    sensor_yaml.display()
-                )));
-            }
+        if let Some(distortion_model) = sensor.distortion_model.as_deref()
+            && distortion_model != "radial-tangential"
+        {
+            return Err(DatasetError::Parse(format!(
+                "unsupported EuRoC distortion_model '{}' at {}",
+                distortion_model,
+                sensor_yaml.display()
+            )));
         }
 
         let [fx, fy, cx, cy] = sensor.intrinsics.as_slice() else {

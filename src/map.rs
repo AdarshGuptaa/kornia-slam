@@ -21,8 +21,8 @@
 //!      * upsert_keyframe
 //!      * push_map_point
 //!      * build_local_map_points
-//!      * cull_map_points
-//!      * run_local_ba
+//!      * cull
+//!      * optimize
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -247,161 +247,159 @@ impl Map {
             .collect();
         (local_map_points, global_indices)
     }
-}
 
-/// Cull map points with poor observation ratios or that project behind cameras.
-pub fn cull_map_points(map: &mut Map) {
-    const MIN_OBSERVATIONS: u32 = 5;
-    const MIN_FOUND_RATIO: f64 = 0.20;
+    /// Cull map points with poor observation ratios or that project behind cameras.
+    pub fn cull(&mut self) {
+        const MIN_OBSERVATIONS: u32 = 5;
+        const MIN_FOUND_RATIO: f64 = 0.20;
 
-    let mut n_culled = 0usize;
+        let mut n_culled = 0usize;
 
-    for mp in map.map_points_mut().iter_mut() {
-        if mp.culled || mp.n_visible < MIN_OBSERVATIONS {
-            continue;
+        for mp in self.map_points.iter_mut() {
+            if mp.culled || mp.n_visible < MIN_OBSERVATIONS {
+                continue;
+            }
+            if mp.found_ratio() < MIN_FOUND_RATIO {
+                mp.mark_culled();
+                n_culled += 1;
+            }
         }
-        if mp.found_ratio() < MIN_FOUND_RATIO {
-            mp.mark_culled();
-            n_culled += 1;
-        }
-    }
 
-    let mut behind_camera: Vec<usize> = Vec::new();
-    for kf in map.keyframes() {
-        for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
-            if let Some(mp) = map.map_points().get(*mp_idx)
+        let mut behind_camera: Vec<usize> = Vec::new();
+        for kf in &self.keyframes {
+            for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+                if let Some(mp) = self.map_points.get(*mp_idx)
+                    && !mp.culled
+                {
+                    let p_cam = kf.frame.pose_world_to_cam.transform_point(&mp.position);
+                    if p_cam.z <= 1e-8 {
+                        behind_camera.push(*mp_idx);
+                    }
+                }
+            }
+        }
+
+        for mp_idx in &behind_camera {
+            if let Some(mp) = self.map_points.get_mut(*mp_idx)
                 && !mp.culled
             {
-                let p_cam = kf.frame.pose_world_to_cam.transform_point(&mp.position);
-                if p_cam.z <= 1e-8 {
-                    behind_camera.push(*mp_idx);
+                mp.mark_culled();
+                n_culled += 1;
+            }
+        }
+
+        if n_culled > 0 {
+            let culled_set: HashSet<usize> = self
+                .map_points
+                .iter()
+                .enumerate()
+                .filter(|(_, mp)| mp.culled)
+                .map(|(i, _)| i)
+                .collect();
+
+            for kf in &mut self.keyframes {
+                for desc_idx in 0..kf.map_point_by_desc_idx.len() {
+                    if let Some(mp_idx) = kf.map_point(desc_idx)
+                        && culled_set.contains(&mp_idx)
+                    {
+                        kf.clear_map_point(desc_idx);
+                    }
                 }
             }
         }
     }
 
-    for mp_idx in &behind_camera {
-        if let Some(mp) = map.map_points_mut().get_mut(*mp_idx)
-            && !mp.culled
-        {
-            mp.mark_culled();
-            n_culled += 1;
-        }
-    }
+    /// Run local bundle adjustment over recent keyframes and their observed map points.
+    ///
+    /// Collects the last N active keyframes, gathers observations (undistorting keypoints
+    /// via camera), calls `kornia_3d::ba::bundle_adjust`, and writes back optimized poses
+    /// and point positions.
+    pub fn optimize(&mut self, camera: &PinholeCamera) {
+        const MAX_ACTIVE_KFS: usize = 3;
+        const MIN_OBSERVATIONS: usize = 8;
 
-    if n_culled > 0 {
-        let culled_set: HashSet<usize> = map
-            .map_points()
+        let n_kfs = self.keyframes.len();
+        if n_kfs < 2 {
+            return;
+        }
+
+        let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+
+        let mut mp_set: HashSet<usize> = HashSet::new();
+        for kf in &self.keyframes[active_start..] {
+            for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+                if let Some(mp) = self.map_points.get(*mp_idx)
+                    && !mp.culled
+                {
+                    mp_set.insert(*mp_idx);
+                }
+            }
+        }
+        if mp_set.is_empty() {
+            return;
+        }
+
+        let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
+        mp_global_indices.sort_unstable();
+
+        let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
             .iter()
             .enumerate()
-            .filter(|(_, mp)| mp.culled)
-            .map(|(i, _)| i)
+            .map(|(local, &global)| (global, local))
             .collect();
 
-        for kf in map.keyframes_mut() {
-            for desc_idx in 0..kf.map_point_by_desc_idx.len() {
-                if let Some(mp_idx) = kf.map_point(desc_idx)
-                    && culled_set.contains(&mp_idx)
-                {
-                    kf.clear_map_point(desc_idx);
+        let points: Vec<Vec3F64> = mp_global_indices
+            .iter()
+            .map(|&idx| self.map_points[idx].position)
+            .collect();
+
+        let poses: Vec<Pose3d> = self
+            .keyframes
+            .iter()
+            .map(|kf| kf.frame.pose_world_to_cam)
+            .collect();
+
+        let mut observations = Vec::new();
+        for (kf_idx, kf) in self.keyframes.iter().enumerate() {
+            let is_fixed = kf_idx < active_start;
+            for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
+                if let Some(mp_idx) = mp_opt {
+                    let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
+                        continue;
+                    };
+                    if let Some(kp) = kf.frame.features.keypoints_xy.get(desc_idx) {
+                        let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                        observations.push(BaObservation {
+                            pose_idx: kf_idx,
+                            point_idx,
+                            pixel: [p.x as f32, p.y as f32],
+                            fixed_pose: is_fixed,
+                        });
+                    }
                 }
             }
         }
-    }
-}
 
-/// Run local bundle adjustment over recent keyframes and their observed map points.
-///
-/// Collects the last N active keyframes, gathers observations (undistorting keypoints
-/// via camera), calls `kornia_3d::ba::bundle_adjust`, and writes back optimized poses
-/// and point positions into the map.
-pub fn run_local_ba(map: &mut Map, camera: &PinholeCamera) {
-    const MAX_ACTIVE_KFS: usize = 3;
-    const MIN_OBSERVATIONS: usize = 8;
+        if observations.len() < MIN_OBSERVATIONS {
+            return;
+        }
 
-    let n_kfs = map.keyframes().len();
-    if n_kfs < 2 {
-        return;
-    }
+        let ba_result =
+            match ba::bundle_adjust(&poses, &points, &observations, camera, &BaParams::default()) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
 
-    let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
-
-    let mut mp_set: HashSet<usize> = HashSet::new();
-    for kf in &map.keyframes()[active_start..] {
-        for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
-            if let Some(mp) = map.map_points().get(*mp_idx)
-                && !mp.culled
-            {
-                mp_set.insert(*mp_idx);
+        for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
+            if kf_idx >= active_start {
+                self.keyframes[kf_idx].frame.pose_world_to_cam = *pose;
             }
         }
-    }
-    if mp_set.is_empty() {
-        return;
-    }
 
-    let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
-    mp_global_indices.sort_unstable();
-
-    let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
-        .iter()
-        .enumerate()
-        .map(|(local, &global)| (global, local))
-        .collect();
-
-    let points: Vec<Vec3F64> = mp_global_indices
-        .iter()
-        .map(|&idx| map.map_points()[idx].position)
-        .collect();
-
-    let poses: Vec<Pose3d> = map
-        .keyframes()
-        .iter()
-        .map(|kf| kf.frame.pose_world_to_cam)
-        .collect();
-
-    let mut observations = Vec::new();
-    for (kf_idx, kf) in map.keyframes().iter().enumerate() {
-        let is_fixed = kf_idx < active_start;
-        for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
-            if let Some(mp_idx) = mp_opt {
-                let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
-                    continue;
-                };
-                if let Some(kp) = kf.frame.features.keypoints_xy.get(desc_idx) {
-                    let p = camera.undistort(kp[0] as f64, kp[1] as f64);
-                    observations.push(BaObservation {
-                        pose_idx: kf_idx,
-                        point_idx,
-                        pixel: [p.x as f32, p.y as f32],
-                        fixed_pose: is_fixed,
-                    });
-                }
+        for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
+            if let Some(mp) = self.map_points.get_mut(global_idx) {
+                mp.position = ba_result.points[local_idx];
             }
-        }
-    }
-
-    if observations.len() < MIN_OBSERVATIONS {
-        return;
-    }
-
-    let ba_result =
-        match ba::bundle_adjust(&poses, &points, &observations, camera, &BaParams::default()) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-
-    let keyframes = map.keyframes_mut();
-    for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
-        if kf_idx >= active_start {
-            keyframes[kf_idx].frame.pose_world_to_cam = *pose;
-        }
-    }
-
-    let map_points = map.map_points_mut();
-    for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
-        if let Some(mp) = map_points.get_mut(global_idx) {
-            mp.position = ba_result.points[local_idx];
         }
     }
 }
@@ -534,7 +532,7 @@ mod tests {
         map.map_points_mut()[second_idx].n_visible = 10;
         map.map_points_mut()[second_idx].n_found = 5;
 
-        cull_map_points(&mut map);
+        map.cull();
 
         assert!(map.map_points()[first_idx].culled);
         assert!(!map.map_points()[second_idx].culled);

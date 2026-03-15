@@ -7,7 +7,7 @@ use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{
-    TwoViewConfig, TwoViewModel, triangulate_midpoint_known_pose, two_view_estimate,
+    TwoViewConfig, TwoViewModel, triangulate_matched_points, two_view_estimate,
 };
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
@@ -16,7 +16,7 @@ use kornia_slam::estimation::map_projection::MapProjectionEstimateOutcome;
 use kornia_slam::estimation::two_view::{
     TwoViewInitConfig, TwoViewInitOutcome, try_initialize_two_view,
 };
-use kornia_slam::map::{Keyframe, Map, MapPoint, cull_map_points, run_local_ba};
+use kornia_slam::map::{Keyframe, Map, MapPoint};
 use kornia_slam::odometry::{OdometryMode, OdometryResult, OdometryState, OdometryStatus};
 use kornia_slam::{Frame, OrbFeatures};
 
@@ -311,13 +311,13 @@ impl Pipeline {
         self.state.last_keyframe_idx = Some(frame.idx);
 
         if enable_local_ba {
-            run_local_ba(&mut self.map, self.estimator.camera());
+            self.map.optimize(self.estimator.camera());
             if let Some(newest_kf) = self.map.keyframes().last() {
                 self.state.pose_world_to_cam = newest_kf.frame.pose_world_to_cam;
             }
         }
 
-        cull_map_points(&mut self.map);
+        self.map.cull();
         true
     }
 
@@ -382,91 +382,39 @@ impl Pipeline {
             return 0;
         }
 
-        let prev_pose = prev_kf.frame.pose_world_to_cam;
-        let curr_pose = *pose_world_to_cam;
-        let relative_pose = Pose3d::between(&prev_pose, &curr_pose);
-        let r_rel = relative_pose.rotation;
-        let t_rel = relative_pose.translation;
-        if t_rel.length() <= 1e-8 {
-            return 0;
-        }
+        // Collect inlier undistorted points for triangulation.
+        let inlier_prev: Vec<_> = two_view
+            .inlier_indices
+            .iter()
+            .map(|&i| prev_pts[i])
+            .collect();
+        let inlier_curr: Vec<_> = two_view
+            .inlier_indices
+            .iter()
+            .map(|&i| curr_pts[i])
+            .collect();
 
-        let prev_pose_inv = prev_pose.inverse();
-        let reproj_th2 = triangulation_config.max_reprojection_error
-            * triangulation_config.max_reprojection_error;
+        let triangulated = triangulate_matched_points(
+            &inlier_prev,
+            &inlier_curr,
+            &prev_kf.frame.pose_world_to_cam,
+            pose_world_to_cam,
+            camera,
+            triangulation_config,
+        );
+
         let mut n_added = 0usize;
-
-        for &inlier_idx in &two_view.inlier_indices {
+        for tp in &triangulated {
+            let inlier_idx = two_view.inlier_indices[tp.pair_index];
             let Some(&(_prev_idx, curr_idx)) = pair_indices.get(inlier_idx) else {
                 continue;
             };
-            if curr_kf_map_assoc.get(curr_idx).is_some_and(|m| m.is_some()) {
+            if curr_kf_map_assoc.get(curr_idx).is_some_and(|m: &Option<usize>| m.is_some()) {
                 continue;
             }
 
-            let p_prev = prev_pts[inlier_idx];
-            let p_curr = curr_pts[inlier_idx];
-
-            let ray_prev = Vec3F64::new(
-                (p_prev.x - camera.cx) / camera.fx,
-                (p_prev.y - camera.cy) / camera.fy,
-                1.0,
-            )
-            .normalize();
-            let ray_curr = Vec3F64::new(
-                (p_curr.x - camera.cx) / camera.fx,
-                (p_curr.y - camera.cy) / camera.fy,
-                1.0,
-            )
-            .normalize();
-
-            let Some((p_cam_prev, triang_gap)) =
-                triangulate_midpoint_known_pose(&ray_prev, &ray_curr, &r_rel, &t_rel)
-            else {
-                continue;
-            };
-            if triang_gap > triangulation_config.max_midpoint_gap {
-                continue;
-            }
-
-            if p_cam_prev.z <= 1e-6 {
-                continue;
-            }
-            let p_cam_curr = r_rel * p_cam_prev + t_rel;
-            if p_cam_curr.z <= 1e-6 {
-                continue;
-            }
-
-            let c2 = -(r_rel.transpose() * t_rel);
-            let d1 = p_cam_prev.normalize();
-            let d2_vec = p_cam_prev - c2;
-            if d2_vec.length() <= 1e-12 {
-                continue;
-            }
-            let d2 = d2_vec.normalize();
-            let parallax_deg_val = d1.dot(d2).clamp(-1.0, 1.0).acos().to_degrees();
-            if parallax_deg_val < triangulation_config.min_parallax_deg {
-                continue;
-            }
-
-            let Some(err_prev) = camera.reprojection_error_sq_cam(&p_cam_prev, p_prev.x, p_prev.y)
-            else {
-                continue;
-            };
-            if err_prev > reproj_th2 {
-                continue;
-            }
-            let Some(err_curr) = camera.reprojection_error_sq_cam(&p_cam_curr, p_curr.x, p_curr.y)
-            else {
-                continue;
-            };
-            if err_curr > reproj_th2 {
-                continue;
-            }
-
-            let p_world = prev_pose_inv.transform_point(&p_cam_prev);
             let mp_idx = self.map.push_map_point(MapPoint::new(
-                p_world,
+                tp.position,
                 curr_features.descriptors[curr_idx],
                 curr_kf_idx,
             ));
