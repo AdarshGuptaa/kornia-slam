@@ -1,6 +1,7 @@
 //! Pose estimation algorithms and estimator modules.
 
 pub mod map_projection;
+pub mod pnp;
 pub mod two_view;
 
 use kornia_3d::pose::Pose3d;

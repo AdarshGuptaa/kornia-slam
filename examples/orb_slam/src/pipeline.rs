@@ -217,8 +217,8 @@ impl Pipeline {
 
         if status == TrackingStatus::Tracked {
             let visible =
-                self.estimator
-                    .visible_map_points(&self.map, &candidate_pose, image_size);
+                self.map
+                    .map_points_in_frustum(self.estimator.camera(), &candidate_pose, image_size);
             self.map.update_observation_counts(&visible, &matches);
 
             if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {

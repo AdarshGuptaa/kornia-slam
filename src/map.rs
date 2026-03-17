@@ -31,6 +31,7 @@ use kornia_3d::ba::{self, BaObservation, BaParams};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
+use kornia_image::ImageSize;
 
 use crate::frame::Frame;
 
@@ -185,6 +186,26 @@ impl Map {
     /// Returns a mutable reference to all keyframes.
     pub fn keyframes_mut(&mut self) -> &mut Vec<Keyframe> {
         &mut self.keyframes
+    }
+
+    /// Returns indices of non-culled map points that project inside the image frustum.
+    pub fn map_points_in_frustum(
+        &self,
+        camera: &PinholeCamera,
+        pose_world_to_cam: &Pose3d,
+        image_size: ImageSize,
+    ) -> HashSet<usize> {
+        let mut visible = HashSet::new();
+        for (mp_idx, mp) in self.map_points.iter().enumerate() {
+            if mp.culled {
+                continue;
+            }
+            let p_cam = pose_world_to_cam.transform_point(&mp.position);
+            if camera.project_to_image(&p_cam, 0.0, image_size).is_ok() {
+                visible.insert(mp_idx);
+            }
+        }
+        visible
     }
 
     /// Update `n_visible` and `n_found` counters for map points.

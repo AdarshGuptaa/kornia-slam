@@ -20,106 +20,22 @@
 //! Estimated { pose, inliers, matches }
 //! ```
 
-use std::collections::HashSet;
+mod keypoint_grid;
 
 use kornia_3d::camera::PinholeCamera;
-use kornia_3d::pnp::{LMRefineParams, refine_pose_lm};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3AF32, Mat3F64, Vec2F32, Vec3AF32, Vec3F64};
+use kornia_algebra::Vec2F32;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
+
+use super::pnp::{self, PnpConfig};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
 use crate::map::{Map, MapPoint};
 
 use super::Estimate;
-
-
-/// Result of matching map points against a frame.
-struct FrameMatchResult {
-    pub matches: Vec<(usize, usize)>,
-    pub keypoints_undist: Vec<[f32; 2]>,
-    pub grid: KeypointGrid,
-}
-
-/// Result of a PnP tracking attempt.
-enum TrackAttempt {
-    Success { pose: Pose3d, inliers: usize },
-    Rejected(MapProjectionRejectReason),
-}
-
-/// A 2D grid that bins keypoints by their image position for O(1) spatial queries.
-struct KeypointGrid {
-    cells: Vec<Vec<usize>>,
-    cell_w: f32,
-    cell_h: f32,
-    n_cols: usize,
-    n_rows: usize,
-    img_w: f32,
-    img_h: f32,
-}
-
-impl KeypointGrid {
-    /// Builds a grid over `keypoints_xy` (each `[x, y]`) for an image of size `img_w x img_h`.
-    ///
-    /// Each cell is `cell_size x cell_size` pixels. Points outside the image are clamped.
-    fn new(keypoints_xy: &[[f32; 2]], img_w: f32, img_h: f32, cell_size: f32) -> Self {
-        let n_cols = (img_w / cell_size).ceil() as usize;
-        let n_rows = (img_h / cell_size).ceil() as usize;
-        let n_cells = n_cols * n_rows;
-        let mut cells = vec![Vec::new(); n_cells];
-
-        for (i, kp) in keypoints_xy.iter().enumerate() {
-            let col = ((kp[0] / cell_size) as usize).min(n_cols - 1);
-            let row = ((kp[1] / cell_size) as usize).min(n_rows - 1);
-            cells[row * n_cols + col].push(i);
-        }
-
-        Self {
-            cells,
-            cell_w: cell_size,
-            cell_h: cell_size,
-            n_cols,
-            n_rows,
-            img_w,
-            img_h,
-        }
-    }
-
-    /// Returns indices of keypoints within `radius` pixels of `(x, y)`.
-    fn query_radius(
-        &self,
-        x: f32,
-        y: f32,
-        radius: f32,
-        keypoints_xy: &[[f32; 2]],
-    ) -> Vec<usize> {
-        let r_sq = radius * radius;
-
-        let col_min = ((x - radius).max(0.0) / self.cell_w) as usize;
-        let col_max =
-            (((x + radius).min(self.img_w - 1.0) / self.cell_w) as usize).min(self.n_cols - 1);
-        let row_min = ((y - radius).max(0.0) / self.cell_h) as usize;
-        let row_max =
-            (((y + radius).min(self.img_h - 1.0) / self.cell_h) as usize).min(self.n_rows - 1);
-
-        let mut result = Vec::new();
-        for r in row_min..=row_max {
-            for c in col_min..=col_max {
-                for &idx in &self.cells[r * self.n_cols + c] {
-                    let kp = keypoints_xy[idx];
-                    let dx = kp[0] - x;
-                    let dy = kp[1] - y;
-                    if dx * dx + dy * dy <= r_sq {
-                        result.push(idx);
-                    }
-                }
-            }
-        }
-        result
-    }
-}
+use keypoint_grid::KeypointGrid;
 
 /// Tunable parameters for projection-guided matching.
 #[derive(Debug, Clone, Copy)]
@@ -138,30 +54,6 @@ impl Default for ProjectionMatchConfig {
             min_depth: 0.0,
             search_radius: 15.0,
             max_hamming: 50,
-        }
-    }
-}
-
-/// PnP pose-estimation thresholds.
-#[derive(Debug, Clone)]
-pub struct PnpConfig {
-    /// Reprojection threshold (px) for filtering correspondences against the prior pose.
-    pub prior_reproj_threshold_px: f64,
-    /// Reprojection threshold (px) for counting final inliers after LM refinement.
-    pub final_reproj_threshold_px: f64,
-    /// Minimum number of 3D-2D correspondences required for PnP solving.
-    pub min_correspondences: usize,
-    /// Minimum inliers to accept a PnP solution.
-    pub min_inliers: usize,
-}
-
-impl Default for PnpConfig {
-    fn default() -> Self {
-        Self {
-            prior_reproj_threshold_px: 25.0,
-            final_reproj_threshold_px: 3.0,
-            min_correspondences: 4,
-            min_inliers: 30,
         }
     }
 }
@@ -245,49 +137,52 @@ impl MapProjectionEstimator {
         map: &Map,
         current_keyframe_idx: Option<usize>,
     ) -> Result<Estimate, MapProjectionRejectReason> {
-        const MIN_PNP_CORRESPONDENCES: usize = 4;
-        const MIN_STAGE1_INLIERS: usize = 10;
+        let pnp = &self.config.pnp;
 
-        let frame_match = self.match_map_to_frame(map.map_points(), frame, candidate_pose);
-        let curr_keypoints_undist = &frame_match.keypoints_undist;
-        let grid = &frame_match.grid;
-        let projection_matches = frame_match.matches;
+        let (projection_matches, curr_keypoints_undist, grid) =
+            self.match_map_to_frame(map.map_points(), frame, candidate_pose);
 
         // Shared logic: try_track → refine_pose → Estimate, or propagate rejection.
         let try_track_and_refine = |correspondences: Vec<(usize, usize)>,
                                     pose_init: &Pose3d|
          -> Result<Estimate, MapProjectionRejectReason> {
-            match self.try_track(
-                map.map_points(),
-                &correspondences,
-                curr_keypoints_undist,
-                pose_init,
-                MIN_STAGE1_INLIERS,
-            ) {
-                TrackAttempt::Success { pose, inliers } => {
-                    let (pose, inliers, matches) = self.refine_pose(
-                        curr_keypoints_undist,
-                        &frame.features.descriptors,
-                        grid,
-                        frame.image_size,
-                        pose,
-                        inliers,
-                        correspondences,
-                        map,
-                        current_keyframe_idx,
-                    );
-                    Ok(Estimate {
-                        pose,
-                        inliers,
-                        matches,
-                    })
-                }
-                TrackAttempt::Rejected(reason) => Err(reason),
+            let (mut pose, mut inliers) = self
+                .solve_pnp(
+                    map.map_points(),
+                    &correspondences,
+                    &curr_keypoints_undist,
+                    pose_init,
+                )
+                .ok_or(MapProjectionRejectReason::PnpFailed)?;
+            if inliers < pnp.min_inliers_early {
+                return Err(MapProjectionRejectReason::LowPnpInliers);
             }
+            let mut matches = correspondences;
+            if let Some(local) = self.refine_with_local_map(
+                map,
+                current_keyframe_idx,
+                &matches,
+                &curr_keypoints_undist,
+                &frame.features.descriptors,
+                &grid,
+                frame.image_size,
+                &pose,
+            ) {
+                matches = local.matches;
+                if local.inliers >= self.config.pnp.min_inliers {
+                    pose = local.pose;
+                    inliers = local.inliers;
+                }
+            }
+            Ok(Estimate {
+                pose,
+                inliers,
+                matches,
+            })
         };
 
         // PnP from projection matches.
-        let last_reject = if projection_matches.len() >= MIN_PNP_CORRESPONDENCES {
+        let last_reject = if projection_matches.len() >= pnp.min_correspondences {
             match try_track_and_refine(projection_matches, candidate_pose) {
                 Ok(estimate) => return Ok(estimate),
                 Err(reason) => reason,
@@ -324,91 +219,11 @@ impl MapProjectionEstimator {
             }
         }
 
-        if ref_correspondences.len() < MIN_PNP_CORRESPONDENCES {
+        if ref_correspondences.len() < pnp.min_correspondences {
             return Err(MapProjectionRejectReason::LowReferenceCorrespondences);
         }
 
         try_track_and_refine(ref_correspondences, pose_before_tracking)
-    }
-
-    /// Returns indices of map points visible in the current camera frustum.
-    pub fn visible_map_points(
-        &self,
-        map: &Map,
-        pose_world_to_cam: &Pose3d,
-        image_size: ImageSize,
-    ) -> HashSet<usize> {
-        let mut visible = HashSet::new();
-        for (mp_idx, mp) in map.map_points().iter().enumerate() {
-            if mp.culled {
-                continue;
-            }
-            let p_cam = pose_world_to_cam.transform_point(&mp.position);
-            if self
-                .camera
-                .project_to_image(&p_cam, 0.0, image_size)
-                .is_ok()
-            {
-                visible.insert(mp_idx);
-            }
-        }
-        visible
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn refine_pose(
-        &self,
-        curr_keypoints_undist: &[[f32; 2]],
-        curr_descriptors: &[[u8; 32]],
-        grid: &KeypointGrid,
-        image_size: ImageSize,
-        mut pose: Pose3d,
-        mut inliers: usize,
-        mut matches: Vec<(usize, usize)>,
-        map: &Map,
-        current_keyframe_idx: Option<usize>,
-    ) -> (Pose3d, usize, Vec<(usize, usize)>) {
-        if let Some(local) = self.refine_with_local_map(
-            map,
-            current_keyframe_idx,
-            &matches,
-            curr_keypoints_undist,
-            curr_descriptors,
-            grid,
-            image_size,
-            &pose,
-        ) {
-            matches = local.matches;
-            if local.inliers >= self.config.pnp.min_inliers {
-                pose = local.pose;
-                inliers = local.inliers;
-            }
-        }
-
-        (pose, inliers, matches)
-    }
-
-    fn try_track(
-        &self,
-        map_points: &[MapPoint],
-        correspondences: &[(usize, usize)],
-        keypoints_undist: &[[f32; 2]],
-        pose_init: &Pose3d,
-        min_inliers: usize,
-    ) -> TrackAttempt {
-        match self.solve_pnp(map_points, correspondences, keypoints_undist, pose_init) {
-            Some((new_pose, inliers)) => {
-                if inliers >= min_inliers {
-                    TrackAttempt::Success {
-                        pose: new_pose,
-                        inliers,
-                    }
-                } else {
-                    TrackAttempt::Rejected(MapProjectionRejectReason::LowPnpInliers)
-                }
-            }
-            None => TrackAttempt::Rejected(MapProjectionRejectReason::PnpFailed),
-        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -469,7 +284,7 @@ impl MapProjectionEstimator {
         })
     }
 
-    /// Solve PnP from map-point to keypoint correspondences using LM refinement.
+    /// Gather 3D-2D correspondences from map points and keypoints, then solve PnP.
     fn solve_pnp(
         &self,
         map_points: &[MapPoint],
@@ -477,108 +292,21 @@ impl MapProjectionEstimator {
         keypoints_undist: &[[f32; 2]],
         pose_init: &Pose3d,
     ) -> Option<(Pose3d, usize)> {
-        let config = &self.config.pnp;
-        let camera = &self.camera;
-
         let mut points_world = Vec::with_capacity(correspondences.len());
-        let mut points_world_f64 = Vec::with_capacity(correspondences.len());
         let mut points_image = Vec::with_capacity(correspondences.len());
         for &(mp_idx, kp_idx) in correspondences {
             if let (Some(mp), Some(&kp)) = (map_points.get(mp_idx), keypoints_undist.get(kp_idx)) {
-                points_world.push(Vec3AF32::new(
-                    mp.position.x as f32,
-                    mp.position.y as f32,
-                    mp.position.z as f32,
-                ));
-                points_world_f64.push(mp.position);
+                points_world.push(mp.position);
                 points_image.push(Vec2F32::new(kp[0], kp[1]));
             }
         }
-        if points_world.len() < config.min_correspondences {
-            return None;
-        }
-
-        let prior_th2 = config.prior_reproj_threshold_px * config.prior_reproj_threshold_px;
-        let mut prior_inliers = Vec::new();
-        for (i, pw) in points_world_f64.iter().enumerate() {
-            if camera
-                .reprojection_error_sq_world(
-                    pose_init,
-                    pw,
-                    points_image[i].x as f64,
-                    points_image[i].y as f64,
-                )
-                .is_some_and(|err_sq| err_sq <= prior_th2)
-            {
-                prior_inliers.push(i);
-            }
-        }
-        if prior_inliers.len() < config.min_correspondences {
-            return None;
-        }
-
-        let k = Mat3AF32::from_cols(
-            Vec3AF32::new(camera.fx as f32, 0.0, 0.0),
-            Vec3AF32::new(0.0, camera.fy as f32, 0.0),
-            Vec3AF32::new(camera.cx as f32, camera.cy as f32, 1.0),
-        );
-        let mut world_inliers = Vec::with_capacity(prior_inliers.len());
-        let mut image_inliers = Vec::with_capacity(prior_inliers.len());
-        for &i in &prior_inliers {
-            world_inliers.push(points_world[i]);
-            image_inliers.push(points_image[i]);
-        }
-
-        let r_init_f32 = Mat3AF32::from_cols(
-            Vec3AF32::new(
-                pose_init.rotation.col(0).x as f32,
-                pose_init.rotation.col(0).y as f32,
-                pose_init.rotation.col(0).z as f32,
-            ),
-            Vec3AF32::new(
-                pose_init.rotation.col(1).x as f32,
-                pose_init.rotation.col(1).y as f32,
-                pose_init.rotation.col(1).z as f32,
-            ),
-            Vec3AF32::new(
-                pose_init.rotation.col(2).x as f32,
-                pose_init.rotation.col(2).y as f32,
-                pose_init.rotation.col(2).z as f32,
-            ),
-        );
-        let t_init_f32 = Vec3AF32::new(
-            pose_init.translation.x as f32,
-            pose_init.translation.y as f32,
-            pose_init.translation.z as f32,
-        );
-
-        let lm = refine_pose_lm(
-            &world_inliers,
-            &image_inliers,
-            &k,
-            &r_init_f32,
-            &t_init_f32,
-            None,
-            &LMRefineParams::default(),
-        )
-        .ok()?;
-
-        let r = &lm.rotation;
-        let t = lm.translation;
-        let r_new = Mat3F64::from_cols(
-            Vec3F64::new(r.col(0).x as f64, r.col(0).y as f64, r.col(0).z as f64),
-            Vec3F64::new(r.col(1).x as f64, r.col(1).y as f64, r.col(1).z as f64),
-            Vec3F64::new(r.col(2).x as f64, r.col(2).y as f64, r.col(2).z as f64),
-        );
-        let t_new = Vec3F64::new(t.x as f64, t.y as f64, t.z as f64);
-        let pose_new = Pose3d::new(r_new, t_new);
-        let final_inliers = self.count_reprojection_inliers(
-            &pose_new,
-            &points_world_f64,
+        pnp::solve_pnp(
+            &points_world,
             &points_image,
-            config.final_reproj_threshold_px,
-        );
-        Some((pose_new, final_inliers))
+            &self.camera,
+            pose_init,
+            &self.config.pnp,
+        )
     }
 
     /// Undistorts keypoints, builds a spatial grid, and runs projection matching
@@ -588,7 +316,7 @@ impl MapProjectionEstimator {
         map_points: &[MapPoint],
         frame: &Frame,
         pose: &Pose3d,
-    ) -> FrameMatchResult {
+    ) -> (Vec<(usize, usize)>, Vec<[f32; 2]>, KeypointGrid) {
         const KEYPOINT_GRID_CELL_SIZE: f32 = 64.0;
         const MIN_MATCHES_BEFORE_WIDE: usize = 20;
 
@@ -635,11 +363,7 @@ impl MapProjectionEstimator {
             );
         }
 
-        FrameMatchResult {
-            matches,
-            keypoints_undist,
-            grid,
-        }
+        (matches, keypoints_undist, grid)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -662,7 +386,9 @@ impl MapProjectionEstimator {
             }
 
             let p_cam = pose_world_to_cam.transform_point(&mp.position);
-            let Ok(pixel) = self.camera.project_to_image(&p_cam, config.min_depth, image_size)
+            let Ok(pixel) = self
+                .camera
+                .project_to_image(&p_cam, config.min_depth, image_size)
             else {
                 continue;
             };
@@ -692,28 +418,6 @@ impl MapProjectionEstimator {
 
         matches
     }
-
-    /// Count map-point reprojection inliers given a camera pose.
-    fn count_reprojection_inliers(
-        &self,
-        pose_world_to_cam: &Pose3d,
-        points_world: &[Vec3F64],
-        points_image: &[Vec2F32],
-        threshold_px: f64,
-    ) -> usize {
-        let th2 = threshold_px * threshold_px;
-        let mut inliers = 0usize;
-        for (pw, pi) in points_world.iter().zip(points_image.iter()) {
-            if self
-                .camera
-                .reprojection_error_sq_world(pose_world_to_cam, pw, pi.x as f64, pi.y as f64)
-                .is_some_and(|err_sq| err_sq <= th2)
-            {
-                inliers += 1;
-            }
-        }
-        inliers
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -738,57 +442,7 @@ mod estimator_tests {
 #[cfg(test)]
 mod matching_tests {
     use super::*;
-
-    #[test]
-    fn test_empty_grid() {
-        let grid = KeypointGrid::new(&[], 640.0, 480.0, 64.0);
-        let result = grid.query_radius(320.0, 240.0, 50.0, &[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_single_point_found() {
-        let kps = [[100.0, 100.0]];
-        let grid = KeypointGrid::new(&kps, 640.0, 480.0, 64.0);
-
-        let result = grid.query_radius(100.0, 100.0, 10.0, &kps);
-        assert_eq!(result, vec![0]);
-
-        let result = grid.query_radius(500.0, 400.0, 10.0, &kps);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_radius_boundary() {
-        let kps = [[50.0, 50.0], [60.0, 50.0], [100.0, 50.0]];
-        let grid = KeypointGrid::new(&kps, 640.0, 480.0, 32.0);
-
-        let mut result = grid.query_radius(55.0, 50.0, 15.0, &kps);
-        result.sort();
-        assert_eq!(result, vec![0, 1]);
-    }
-
-    #[test]
-    fn test_corner_clamping() {
-        let kps = [[0.0, 0.0], [639.0, 479.0]];
-        let grid = KeypointGrid::new(&kps, 640.0, 480.0, 64.0);
-
-        let result = grid.query_radius(0.0, 0.0, 5.0, &kps);
-        assert_eq!(result, vec![0]);
-
-        let result = grid.query_radius(639.0, 479.0, 5.0, &kps);
-        assert_eq!(result, vec![1]);
-    }
-
-    #[test]
-    fn test_multiple_points_per_cell() {
-        let kps = [[10.0, 10.0], [12.0, 11.0], [15.0, 13.0]];
-        let grid = KeypointGrid::new(&kps, 640.0, 480.0, 64.0);
-
-        let mut result = grid.query_radius(12.0, 12.0, 20.0, &kps);
-        result.sort();
-        assert_eq!(result, vec![0, 1, 2]);
-    }
+    use kornia_algebra::{Mat3F64, Vec3F64};
 
     fn make_test_estimator(camera: PinholeCamera) -> MapProjectionEstimator {
         MapProjectionEstimator::new(camera, MapProjectionConfig::default())
