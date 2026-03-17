@@ -1,10 +1,13 @@
 use kornia_slam::estimation::map_projection::MapProjectionConfig;
 use kornia_slam::estimation::two_view::TwoViewInitConfig;
+use kornia_slam::system::KeyframePolicy;
 
 /// Example-local pipeline preset used by the standalone ORB-SLAM binary.
 pub struct PipelineConfig {
     pub two_view_init: TwoViewInitConfig,
     pub map_projection: MapProjectionConfig,
+    pub keyframe_policy: KeyframePolicy,
+    pub enable_local_ba: bool,
 }
 
 impl Default for PipelineConfig {
@@ -22,6 +25,8 @@ impl Default for PipelineConfig {
         Self {
             two_view_init,
             map_projection: MapProjectionConfig::default(),
+            keyframe_policy: KeyframePolicy::default(),
+            enable_local_ba: true,
         }
     }
 }

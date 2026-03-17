@@ -16,9 +16,9 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TwoViewConfig, TwoViewModel, two_view_estimate};
 use kornia_algebra::Vec3F64;
-use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
+use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptors};
 
-use crate::OrbFeatures;
+use super::Estimate;
 
 /// Configuration for two-view initialization.
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl Default for TwoViewInitConfig {
 
 /// Two-view initialization rejection reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TwoViewInitRejectReason {
+pub enum TwoViewRejectReason {
     /// Not enough descriptor matches to run two-view estimation.
     LowMatches,
     /// Two-view estimation failed.
@@ -78,30 +78,17 @@ pub enum TwoViewInitRejectReason {
     LowParallax,
 }
 
-/// Result of one two-view initialization attempt.
-#[allow(clippy::large_enum_variant)]
+/// Bootstrap-specific data produced alongside the shared [`Estimate`].
 #[derive(Debug, Clone)]
-pub enum TwoViewInitOutcome {
-    /// Attempt was rejected by two-view initialization gates.
-    Rejected {
-        /// Why the two-view initialization attempt failed.
-        reason: TwoViewInitRejectReason,
-    },
-    /// Two-view initialization succeeded.
-    Initialized {
-        /// New world-to-camera pose for the current frame.
-        pose_world_to_cam: Pose3d,
-        /// Estimated constant-velocity increment (between previous pose and new pose).
-        motion_increment: Pose3d,
-        /// Descriptor match pairs `(reference_desc_idx, current_desc_idx)`.
-        matches: Vec<(usize, usize)>,
-        /// Triangulated 3D points in the reference camera frame.
-        points3d: Vec<Vec3F64>,
-        /// Indices into `matches` that were inliers in two-view estimation.
-        inlier_indices: Vec<usize>,
-        /// Median positive depth in the two-view triangulation (if available).
-        median_depth: Option<f64>,
-    },
+pub struct TwoViewEstimate {
+    /// Shared pose estimate.
+    pub estimate: Estimate,
+    /// Triangulated 3D points in the reference camera frame.
+    pub points3d: Vec<Vec3F64>,
+    /// Indices into `estimate.matches` that were inliers in two-view estimation.
+    pub inlier_indices: Vec<usize>,
+    /// Median positive depth in the two-view triangulation (if available).
+    pub median_depth: Option<f64>,
 }
 
 /// Attempt two-view initialization between a reference frame and the current frame.
@@ -109,10 +96,9 @@ pub fn try_initialize_two_view(
     ref_features: &OrbFeatures,
     ref_pose: &Pose3d,
     curr_features: &OrbFeatures,
-    curr_pose: &Pose3d,
     camera: &PinholeCamera,
     config: &TwoViewInitConfig,
-) -> TwoViewInitOutcome {
+) -> Result<TwoViewEstimate, TwoViewRejectReason> {
     let acceptance = &config.acceptance_config;
 
     let matches = match_orb_descriptors(
@@ -123,9 +109,7 @@ pub fn try_initialize_two_view(
         config.match_config,
     );
     if matches.len() < acceptance.min_matches {
-        return TwoViewInitOutcome::Rejected {
-            reason: TwoViewInitRejectReason::LowMatches,
-        };
+        return Err(TwoViewRejectReason::LowMatches);
     }
 
     let (reference_pts, current_pts) = camera.undistort_matched_pairs(
@@ -135,41 +119,30 @@ pub fn try_initialize_two_view(
     );
 
     let k = camera.intrinsic_matrix();
-    let Ok(result) = two_view_estimate(
+    let result = two_view_estimate(
         &reference_pts,
         &current_pts,
         &k,
         &k,
         &config.estimation_config,
-    ) else {
-        return TwoViewInitOutcome::Rejected {
-            reason: TwoViewInitRejectReason::EstimationFailed,
-        };
-    };
+    )
+    .map_err(|_| TwoViewRejectReason::EstimationFailed)?;
 
     if !matches!(result.model, TwoViewModel::Fundamental(_)) {
-        return TwoViewInitOutcome::Rejected {
-            reason: TwoViewInitRejectReason::WrongModel,
-        };
+        return Err(TwoViewRejectReason::WrongModel);
     }
 
     if result.points3d.len() < acceptance.min_triangulated {
-        return TwoViewInitOutcome::Rejected {
-            reason: TwoViewInitRejectReason::LowTriangulated,
-        };
+        return Err(TwoViewRejectReason::LowTriangulated);
     }
 
     if result.inlier_indices.len() < acceptance.min_inliers {
-        return TwoViewInitOutcome::Rejected {
-            reason: TwoViewInitRejectReason::LowInliers,
-        };
+        return Err(TwoViewRejectReason::LowInliers);
     }
 
     let median_parallax_deg = result.median_parallax_deg(&reference_pts, &current_pts, camera);
     if median_parallax_deg < config.estimation_config.triangulation.min_parallax_deg {
-        return TwoViewInitOutcome::Rejected {
-            reason: TwoViewInitRejectReason::LowParallax,
-        };
+        return Err(TwoViewRejectReason::LowParallax);
     }
 
     let mut t_scaled = result.translation;
@@ -184,20 +157,22 @@ pub fn try_initialize_two_view(
         t_scaled /= md;
     }
 
-    let new_pose = Pose3d::new(
+    let pose = Pose3d::new(
         result.rotation * ref_pose.rotation,
         result.rotation * ref_pose.translation + t_scaled,
     );
-    let motion_increment = Pose3d::between(curr_pose, &new_pose);
+    let inliers = result.inlier_indices.len();
 
-    TwoViewInitOutcome::Initialized {
-        pose_world_to_cam: new_pose,
-        motion_increment,
-        matches,
+    Ok(TwoViewEstimate {
+        estimate: Estimate {
+            pose,
+            matches,
+            inliers,
+        },
         points3d: result.points3d,
         inlier_indices: result.inlier_indices,
         median_depth,
-    }
+    })
 }
 
 /// Computes the median of a mutable slice in-place.

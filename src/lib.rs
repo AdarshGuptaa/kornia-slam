@@ -8,4 +8,4 @@ pub mod system;
 pub use estimation::MapProjectionEstimator;
 pub use frame::Frame;
 pub use kornia_imgproc::features::OrbFeatures;
-pub use system::{SystemMode, SystemState, TrackingResult, TrackingStatus};
+pub use system::{KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus};

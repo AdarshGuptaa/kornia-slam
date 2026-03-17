@@ -187,6 +187,24 @@ impl Map {
         &mut self.keyframes
     }
 
+    /// Update `n_visible` and `n_found` counters for map points.
+    pub fn update_observation_counts(
+        &mut self,
+        visible: &HashSet<usize>,
+        matched: &[(usize, usize)],
+    ) {
+        let matched_set: HashSet<usize> = matched.iter().map(|&(mp_idx, _)| mp_idx).collect();
+
+        for &mp_idx in visible {
+            if let Some(mp) = self.map_points.get_mut(mp_idx) {
+                mp.n_visible = mp.n_visible.saturating_add(1);
+                if matched_set.contains(&mp_idx) {
+                    mp.n_found = mp.n_found.saturating_add(1);
+                }
+            }
+        }
+    }
+
     /// Builds a local map of visible points from nearby keyframes.
     pub fn build_local_map_points(
         &self,
