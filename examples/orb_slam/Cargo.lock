@@ -4824,7 +4824,6 @@ dependencies = [
 [[package]]
 name = "kornia-3d"
 version = "0.1.11"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fslam-utils#f252be81e9cf6f4598e1751f68d29d13e144da8c"
 dependencies = [
  "bincode 2.0.1",
  "faer",
@@ -4842,7 +4841,6 @@ dependencies = [
 [[package]]
 name = "kornia-algebra"
 version = "0.1.11"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fslam-utils#f252be81e9cf6f4598e1751f68d29d13e144da8c"
 dependencies = [
  "glam",
  "nalgebra",
@@ -4853,7 +4851,6 @@ dependencies = [
 [[package]]
 name = "kornia-image"
 version = "0.1.11"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fslam-utils#f252be81e9cf6f4598e1751f68d29d13e144da8c"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -4864,7 +4861,6 @@ dependencies = [
 [[package]]
 name = "kornia-imgproc"
 version = "0.1.11"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fslam-utils#f252be81e9cf6f4598e1751f68d29d13e144da8c"
 dependencies = [
  "fast_image_resize",
  "kornia-algebra",
@@ -4879,7 +4875,6 @@ dependencies = [
 [[package]]
 name = "kornia-io"
 version = "0.1.11"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fslam-utils#f252be81e9cf6f4598e1751f68d29d13e144da8c"
 dependencies = [
  "jpeg-encoder",
  "kornia-image",
@@ -4906,7 +4901,6 @@ dependencies = [
 [[package]]
 name = "kornia-tensor"
 version = "0.1.11"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fslam-utils#f252be81e9cf6f4598e1751f68d29d13e144da8c"
 dependencies = [
  "num-traits",
  "rayon",

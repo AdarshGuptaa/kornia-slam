@@ -12,19 +12,26 @@ use kornia_3d::pose::{
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 use kornia_slam::estimation::MapProjectionEstimator;
-use kornia_slam::estimation::map_projection::MapProjectionEstimateOutcome;
-use kornia_slam::estimation::two_view::{
-    TwoViewInitConfig, TwoViewInitOutcome, try_initialize_two_view,
-};
+use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::map::{Keyframe, Map, MapPoint};
-use kornia_slam::system::{SystemMode, SystemState, TrackingResult, TrackingStatus};
+use kornia_slam::system::{
+    KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
+};
 use kornia_slam::{Frame, OrbFeatures};
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
+    // Primary pose estimator
     estimator: MapProjectionEstimator,
+    // Boostrap pose estimator
     two_view_init_config: TwoViewInitConfig,
+    // Keyframe insertion policy
+    keyframe_policy: KeyframePolicy,
+    // Enable local bundle adjustment after keyframe insertion
+    enable_local_ba: bool,
+    // Map object
     map: Map,
+    // System state
     state: SystemState,
 }
 
@@ -34,6 +41,8 @@ impl Pipeline {
         Self {
             estimator: MapProjectionEstimator::new(camera, config.map_projection),
             two_view_init_config: config.two_view_init,
+            keyframe_policy: config.keyframe_policy,
+            enable_local_ba: config.enable_local_ba,
             map: Map::new(),
             state: SystemState::new(),
         }
@@ -77,53 +86,47 @@ impl Pipeline {
             };
         };
 
-        let outcome = try_initialize_two_view(
+        let result = try_initialize_two_view(
             &prev_bootstrap_frame.features,
             &prev_bootstrap_frame.pose_world_to_cam,
             &curr_frame.features,
-            &curr_frame.pose_world_to_cam,
             self.estimator.camera(),
             &self.two_view_init_config,
         );
 
-        match outcome {
-            TwoViewInitOutcome::Rejected { .. } => {
+        let tv = match result {
+            Err(_) => {
                 self.state.bootstrap_frame = Some(prev_bootstrap_frame);
-                TrackingResult {
+                return TrackingResult {
                     pose_world_to_cam: self.state.pose_world_to_cam,
                     status: TrackingStatus::Skipped,
-                }
+                };
             }
-            TwoViewInitOutcome::Initialized {
-                pose_world_to_cam,
-                motion_increment,
-                matches,
-                points3d,
-                inlier_indices,
-                median_depth,
-            } => {
-                self.state.velocity = Some(motion_increment);
-                self.state.pose_world_to_cam = pose_world_to_cam;
-                curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
+            Ok(tv) => tv,
+        };
 
-                let curr_idx = curr_frame.idx;
-                self.build_initial_map(
-                    prev_bootstrap_frame,
-                    curr_frame,
-                    &matches,
-                    &points3d,
-                    &inlier_indices,
-                    median_depth,
-                );
-                self.state.current_keyframe_idx = Some(curr_idx);
-                self.state.last_keyframe_idx = Some(curr_idx);
-                self.state.mode = SystemMode::Tracking;
+        let motion_increment =
+            Pose3d::between(&curr_frame.pose_world_to_cam, &tv.estimate.pose);
+        self.state.velocity = Some(motion_increment);
+        self.state.pose_world_to_cam = tv.estimate.pose;
+        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
 
-                TrackingResult {
-                    pose_world_to_cam: self.state.pose_world_to_cam,
-                    status: TrackingStatus::KeyframeAccepted,
-                }
-            }
+        let curr_idx = curr_frame.idx;
+        self.build_initial_map(
+            prev_bootstrap_frame,
+            curr_frame,
+            &tv.estimate.matches,
+            &tv.points3d,
+            &tv.inlier_indices,
+            tv.median_depth,
+        );
+        self.state.current_keyframe_idx = Some(curr_idx);
+        self.state.last_keyframe_idx = Some(curr_idx);
+        self.state.mode = SystemMode::Tracking;
+
+        TrackingResult {
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            status: TrackingStatus::KeyframeAccepted,
         }
     }
 
@@ -194,7 +197,7 @@ impl Pipeline {
             self.state.pose_world_to_cam
         };
 
-        let estimate = self.estimator.estimate_pose(
+        let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
             &pose_before_tracking,
@@ -202,29 +205,21 @@ impl Pipeline {
             self.state.current_keyframe_idx,
         );
 
-        let (mut status, matches, tracked_inliers) = match estimate {
-            MapProjectionEstimateOutcome::Estimated {
-                pose_world_to_cam,
-                inliers,
-                matches,
-            } => {
+        let (mut status, matches, tracked_inliers) = match result {
+            Ok(estimate) => {
                 self.state.velocity =
-                    Some(Pose3d::between(&pose_before_tracking, &pose_world_to_cam));
-                self.state.pose_world_to_cam = pose_world_to_cam;
-                (TrackingStatus::Tracked, matches, inliers)
+                    Some(Pose3d::between(&pose_before_tracking, &estimate.pose));
+                self.state.pose_world_to_cam = estimate.pose;
+                (TrackingStatus::Tracked, estimate.matches, estimate.inliers)
             }
-            MapProjectionEstimateOutcome::Rejected { .. } => {
-                (TrackingStatus::Skipped, Vec::new(), 0)
-            }
+            Err(_) => (TrackingStatus::Skipped, Vec::new(), 0),
         };
 
         if status == TrackingStatus::Tracked {
-            self.estimator.update_map_point_observations(
-                &mut self.map,
-                &matches,
-                &candidate_pose,
-                image_size,
-            );
+            let visible =
+                self.map
+                    .map_points_in_frustum(self.estimator.camera(), &candidate_pose, image_size);
+            self.map.update_observation_counts(&visible, &matches);
 
             if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {
                 status = TrackingStatus::KeyframeAccepted;
@@ -233,7 +228,7 @@ impl Pipeline {
 
         if status == TrackingStatus::Skipped {
             self.state.consecutive_failures += 1;
-            if self.state.consecutive_failures >= self.estimator.config().max_consecutive_failures {
+            if self.state.consecutive_failures >= self.state.max_consecutive_failures {
                 self.state.reset();
                 return self.bootstrap_step(frame);
             }
@@ -260,7 +255,7 @@ impl Pipeline {
             .map(|kf| kf.num_associated_points())
             .unwrap_or(0);
 
-        if !self.estimator.need_new_keyframe(
+        if !self.keyframe_policy.should_insert(
             frame.idx,
             self.state.last_keyframe_idx,
             tracked_inliers,
@@ -285,7 +280,7 @@ impl Pipeline {
             }
         }
 
-        let enable_local_ba = self.estimator.config().enable_local_ba;
+        let enable_local_ba = self.enable_local_ba;
         let pose_world_to_cam = self.state.pose_world_to_cam;
         let match_config = self.two_view_init_config.match_config;
         let estimation_config = self.two_view_init_config.estimation_config.clone();
