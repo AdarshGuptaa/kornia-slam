@@ -241,7 +241,8 @@ impl MapProjectionEstimator {
         let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
         let (local_map_points, local_to_global) =
             map.build_local_map_points(tracked_matches, current_kf);
-        if local_map_points.len() < 4 {
+        let min_corr = self.config.pnp.min_correspondences;
+        if local_map_points.len() < min_corr {
             return None;
         }
 
@@ -254,7 +255,7 @@ impl MapProjectionEstimator {
             image_size,
             self.config.local_projection,
         );
-        if local_matches.len() < 4 {
+        if local_matches.len() < min_corr {
             return None;
         }
 
@@ -267,7 +268,7 @@ impl MapProjectionEstimator {
                     .map(|global_mp_idx| (global_mp_idx, curr_idx))
             })
             .collect();
-        if global_matches.len() < 4 {
+        if global_matches.len() < min_corr {
             return None;
         }
 
