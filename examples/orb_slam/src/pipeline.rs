@@ -21,6 +21,8 @@ use kornia_slam::{Frame, OrbFeatures};
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
+    // Camera intrinsics (shared across subsystems)
+    camera: PinholeCamera,
     // Primary pose estimator
     estimator: MapProjectionEstimator,
     // Boostrap pose estimator
@@ -39,7 +41,8 @@ impl Pipeline {
     /// Creates a new pipeline with identity pose.
     pub fn new(camera: PinholeCamera, config: PipelineConfig) -> Self {
         Self {
-            estimator: MapProjectionEstimator::new(camera, config.map_projection),
+            estimator: MapProjectionEstimator::new(camera.clone(), config.map_projection),
+            camera,
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
             enable_local_ba: config.enable_local_ba,
@@ -90,11 +93,11 @@ impl Pipeline {
             &prev_bootstrap_frame.features,
             &prev_bootstrap_frame.pose_world_to_cam,
             &curr_frame.features,
-            self.estimator.camera(),
+            &self.camera,
             &self.two_view_init_config,
         );
 
-        let tv = match result {
+        let two_view_estimate = match result {
             Err(_) => {
                 self.state.bootstrap_frame = Some(prev_bootstrap_frame);
                 return TrackingResult {
@@ -105,20 +108,23 @@ impl Pipeline {
             Ok(tv) => tv,
         };
 
-        let motion_increment =
-            Pose3d::between(&curr_frame.pose_world_to_cam, &tv.estimate.pose);
-        self.state.velocity = Some(motion_increment);
-        self.state.pose_world_to_cam = tv.estimate.pose;
-        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
+        let estimated_pose = two_view_estimate.estimate.pose;
+        self.state.velocity = Some(Pose3d::between(&curr_frame.pose_world_to_cam, &estimated_pose));
+        self.state.pose_world_to_cam = estimated_pose;
+        curr_frame.pose_world_to_cam = estimated_pose;
 
-        let curr_idx = curr_frame.idx;
+        // Promote to Keyframes
+        let reference_kf = Keyframe::from_frame(prev_bootstrap_frame);
+        let current_kf = Keyframe::from_frame(curr_frame);
+        let curr_idx = current_kf.frame.idx;
+
         self.build_initial_map(
-            prev_bootstrap_frame,
-            curr_frame,
-            &tv.estimate.matches,
-            &tv.points3d,
-            &tv.inlier_indices,
-            tv.median_depth,
+            reference_kf,
+            current_kf,
+            &two_view_estimate.estimate.matches,
+            &two_view_estimate.points3d,
+            &two_view_estimate.inlier_indices,
+            two_view_estimate.median_depth,
         );
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
@@ -132,17 +138,15 @@ impl Pipeline {
 
     fn build_initial_map(
         &mut self,
-        reference_frame: Frame,
-        current_frame: Frame,
+        mut reference_kf: Keyframe,
+        mut current_kf: Keyframe,
         matches: &[(usize, usize)],
         points3d: &[Vec3F64],
         inlier_indices: &[usize],
         median_depth: Option<f64>,
     ) -> usize {
-        let mut reference_kf = Keyframe::from_frame(reference_frame);
-        let mut current_kf = Keyframe::from_frame(current_frame);
         let depth_scale = median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
-        let reference_pose_inv = reference_kf.frame.pose_world_to_cam.inverse();
+        let cam_to_world_transform = reference_kf.frame.pose_world_to_cam.inverse();
         let mut added = 0usize;
 
         for (p_cam, &match_idx) in points3d.iter().zip(inlier_indices.iter()) {
@@ -173,7 +177,7 @@ impl Pipeline {
                 continue;
             };
 
-            let p_world = reference_pose_inv.transform_point(&(*p_cam / depth_scale));
+            let p_world = cam_to_world_transform.transform_point(&(*p_cam / depth_scale));
             let mp_idx =
                 self.map
                     .push_map_point(MapPoint::new(p_world, descriptor, reference_kf.frame.idx));
@@ -218,7 +222,7 @@ impl Pipeline {
         if status == TrackingStatus::Tracked {
             let visible =
                 self.map
-                    .map_points_in_frustum(self.estimator.camera(), &candidate_pose, image_size);
+                    .map_points_in_frustum(&self.camera, &candidate_pose, image_size);
             self.map.update_observation_counts(&visible, &matches);
 
             if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {
@@ -306,7 +310,7 @@ impl Pipeline {
         self.state.last_keyframe_idx = Some(frame.idx);
 
         if enable_local_ba {
-            self.map.optimize(self.estimator.camera());
+            self.map.optimize(&self.camera);
             if let Some(newest_kf) = self.map.keyframes().last() {
                 self.state.pose_world_to_cam = newest_kf.frame.pose_world_to_cam;
             }
@@ -330,7 +334,7 @@ impl Pipeline {
         const MIN_GROWTH_MATCHES: usize = 20;
         const MIN_GROWTH_INLIERS: usize = 15;
 
-        let camera = self.estimator.camera();
+        let camera = &self.camera;
         let triangulation_config = &two_view_config.triangulation;
         let matches = match_orb_descriptors(
             &prev_kf.frame.features.orientations,
