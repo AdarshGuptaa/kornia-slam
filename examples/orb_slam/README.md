@@ -29,8 +29,10 @@ The example reads EuRoC `cam0` calibration from `sensor.yaml`. Running on anothe
 
 ## Run
 
+The [Machine Hall sequences](https://www.research-collection.ethz.ch/entities/researchdata/bcaf173e-5dac-484b-bc37-faf97a594f1f) (MH_01–MH_05) are recommended for initial testing.
+
 ```bash
-cargo run --manifest-path examples/orb_slam/Cargo.toml -- --data /path/to/V1_01_easy
+cargo run --release --manifest-path examples/orb_slam/Cargo.toml -- --data /path/to/MH_01_easy
 ```
 
 Useful options:
