@@ -5765,11 +5765,12 @@ dependencies = [
 [[package]]
 name = "kornia-3d"
 version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#b58152ed3d6045667a958ade768479dccbd7c0de"
 dependencies = [
  "bincode 2.0.1",
  "faer",
  "kiddo",
- "kornia-algebra",
+ "kornia-algebra 0.1.14",
  "kornia-image",
  "kornia-imgproc",
  "log",
@@ -5804,7 +5805,7 @@ dependencies = [
 name = "kornia-imgproc"
 version = "0.1.14"
 dependencies = [
- "kornia-algebra",
+ "kornia-algebra 0.1.14",
  "kornia-image",
  "kornia-tensor",
  "num-traits",
@@ -5834,7 +5835,7 @@ name = "kornia-sensors"
 version = "0.1.0"
 dependencies = [
  "glam 0.30.10",
- "kornia-algebra",
+ "kornia-algebra 0.1.11",
 ]
 
 [[package]]
@@ -5842,7 +5843,7 @@ name = "kornia-slam"
 version = "0.1.0"
 dependencies = [
  "kornia-3d",
- "kornia-algebra",
+ "kornia-algebra 0.1.14",
  "kornia-image",
  "kornia-imgproc",
 ]
@@ -7631,7 +7632,7 @@ dependencies = [
  "crossterm 0.28.1",
  "depthai",
  "kornia-3d",
- "kornia-algebra",
+ "kornia-algebra 0.1.14",
  "kornia-image",
  "kornia-imgproc",
  "kornia-io",
