@@ -7,9 +7,9 @@
 //! cargo run --manifest-path examples/orb_slam/Cargo.toml -- --data /path/to/euroc/V1_01_easy
 //! ```
 
+mod config;
 #[path = "../../common/datasets/mod.rs"]
 mod datasets;
-mod config;
 mod pipeline;
 mod utils;
 
@@ -108,8 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image_size,
                 0.0f32,
                 kornia_tensor::CpuAllocator,
-            )
-            ?;
+            )?;
             gray_u8
                 .as_slice()
                 .iter()

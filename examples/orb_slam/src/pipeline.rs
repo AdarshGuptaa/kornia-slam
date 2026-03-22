@@ -8,18 +8,16 @@ use std::collections::HashSet;
 use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{
-    TwoViewConfig, TwoViewModel, triangulate_matched_points, two_view_estimate,
-};
+use kornia_3d::pose::{TwoViewConfig, TwoViewModel, triangulate_matched_points, two_view_estimate};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
+use kornia_slam::Frame;
 use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::map::{Keyframe, Map, MapPoint};
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
 };
-use kornia_slam::Frame;
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
@@ -111,7 +109,10 @@ impl Pipeline {
         };
 
         let estimated_pose = two_view_estimate.estimate.pose;
-        self.state.velocity = Some(Pose3d::between(&curr_frame.pose_world_to_cam, &estimated_pose));
+        self.state.velocity = Some(Pose3d::between(
+            &curr_frame.pose_world_to_cam,
+            &estimated_pose,
+        ));
         self.state.pose_world_to_cam = estimated_pose;
         curr_frame.pose_world_to_cam = estimated_pose;
 
@@ -221,8 +222,7 @@ impl Pipeline {
 
         let (mut status, matches, tracked_inliers) = match result {
             Ok(estimate) => {
-                self.state.velocity =
-                    Some(Pose3d::between(&pose_before_tracking, &estimate.pose));
+                self.state.velocity = Some(Pose3d::between(&pose_before_tracking, &estimate.pose));
                 self.state.pose_world_to_cam = estimate.pose;
                 (TrackingStatus::Tracked, estimate.matches, estimate.inliers)
             }
@@ -230,9 +230,9 @@ impl Pipeline {
         };
 
         if status == TrackingStatus::Tracked {
-            let visible =
-                self.map
-                    .map_points_in_frustum(&self.camera, &candidate_pose, image_size);
+            let visible = self
+                .map
+                .map_points_in_frustum(&self.camera, &candidate_pose, image_size);
             self.map.update_observation_counts(&visible, &matches);
 
             if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {
@@ -301,7 +301,12 @@ impl Pipeline {
         let enable_local_ba = self.enable_local_ba;
         let match_config = self.two_view_init_config.match_config;
         let estimation_config = self.two_view_init_config.estimation_config.clone();
-        self.grow_map_points_from_keyframe_pair(&prev_kf, &mut curr_kf, match_config, &estimation_config);
+        self.grow_map_points_from_keyframe_pair(
+            &prev_kf,
+            &mut curr_kf,
+            match_config,
+            &estimation_config,
+        );
 
         self.map.upsert_keyframe(curr_kf);
         self.state.current_keyframe_idx = Some(frame.idx);

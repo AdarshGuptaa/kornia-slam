@@ -393,9 +393,7 @@ impl MapProjectionEstimator {
             }
 
             let p_cam = pose_world_to_cam.transform_point(&mp.position);
-            let Ok(pixel) = camera
-                .project_to_image(&p_cam, config.min_depth, image_size)
-            else {
+            let Ok(pixel) = camera.project_to_image(&p_cam, config.min_depth, image_size) else {
                 continue;
             };
             let u = pixel.x as f32;
