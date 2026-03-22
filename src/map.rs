@@ -81,6 +81,9 @@ impl Keyframe {
     }
 }
 
+/// A triangulated point ready for map insertion: (position, descriptor, color, prev_desc_idx, curr_desc_idx).
+pub type TriangulatedPoint = (Vec3F64, [u8; 32], [u8; 3], usize, usize);
+
 /// A persistent 3D landmark in the map.
 #[derive(Debug, Clone)]
 pub struct MapPoint {
@@ -191,7 +194,7 @@ impl Map {
         &mut self,
         prev_kf: Option<&mut Keyframe>,
         curr_kf: &mut Keyframe,
-        points: &[(Vec3F64, [u8; 32], [u8; 3], usize, usize)], // (position, descriptor, color, prev_desc_idx, curr_desc_idx)
+        points: &[TriangulatedPoint],
         keyframe_idx: usize,
     ) -> usize {
         let first_mp_idx = self.map_points.len();
@@ -582,10 +585,18 @@ mod tests {
     fn push_map_point_returns_sequential_index() {
         let mut map = Map::new();
 
-        let first_idx =
-            map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], [0; 3], 0));
-        let second_idx =
-            map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 1.0), [1u8; 32], [0; 3], 0));
+        let first_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 1.0),
+            [0u8; 32],
+            [0; 3],
+            0,
+        ));
+        let second_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(1.0, 0.0, 1.0),
+            [1u8; 32],
+            [0; 3],
+            0,
+        ));
 
         assert_eq!(first_idx, 0);
         assert_eq!(second_idx, 1);
@@ -596,10 +607,18 @@ mod tests {
     fn cull_map_points_removes_low_ratio() {
         let mut map = Map::new();
 
-        let first_idx =
-            map.push_map_point(MapPoint::new(Vec3F64::new(0.0, 0.0, 5.0), [0u8; 32], [0; 3], 0));
-        let second_idx =
-            map.push_map_point(MapPoint::new(Vec3F64::new(1.0, 0.0, 5.0), [1u8; 32], [0; 3], 0));
+        let first_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            [0; 3],
+            0,
+        ));
+        let second_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(1.0, 0.0, 5.0),
+            [1u8; 32],
+            [0; 3],
+            0,
+        ));
         map.map_points_mut()[first_idx].n_visible = 10;
         map.map_points_mut()[first_idx].n_found = 1;
         map.map_points_mut()[second_idx].n_visible = 10;

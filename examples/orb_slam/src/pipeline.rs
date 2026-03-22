@@ -99,7 +99,7 @@ impl Pipeline {
             &self.two_view_init_config,
         );
 
-        let tv = match result {
+        let two_view_estimate = match result {
             Err(_) => {
                 self.state.bootstrap_frame = Some(prev_bootstrap_frame);
                 return TrackingResult {
@@ -110,20 +110,23 @@ impl Pipeline {
             Ok(tv) => tv,
         };
 
-        let motion_increment =
-            Pose3d::between(&curr_frame.pose_world_to_cam, &tv.estimate.pose);
-        self.state.velocity = Some(motion_increment);
-        self.state.pose_world_to_cam = tv.estimate.pose;
-        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
+        let estimated_pose = two_view_estimate.estimate.pose;
+        self.state.velocity = Some(Pose3d::between(&curr_frame.pose_world_to_cam, &estimated_pose));
+        self.state.pose_world_to_cam = estimated_pose;
+        curr_frame.pose_world_to_cam = estimated_pose;
 
-        let curr_idx = curr_frame.idx;
+        // Promote to Keyframes
+        let reference_kf = Keyframe::from_frame(prev_bootstrap_frame);
+        let current_kf = Keyframe::from_frame(curr_frame);
+        let curr_idx = current_kf.frame.idx;
+
         self.build_initial_map(
-            prev_bootstrap_frame,
-            curr_frame,
-            &tv.estimate.matches,
-            &tv.points3d,
-            &tv.inlier_indices,
-            tv.median_depth,
+            reference_kf,
+            current_kf,
+            &two_view_estimate.estimate.matches,
+            &two_view_estimate.points3d,
+            &two_view_estimate.inlier_indices,
+            two_view_estimate.median_depth,
         );
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
@@ -137,15 +140,13 @@ impl Pipeline {
 
     fn build_initial_map(
         &mut self,
-        reference_frame: Frame,
-        current_frame: Frame,
+        mut reference_kf: Keyframe,
+        mut current_kf: Keyframe,
         matches: &[(usize, usize)],
         points3d: &[Vec3F64],
         inlier_indices: &[usize],
         median_depth: Option<f64>,
     ) -> usize {
-        let mut reference_kf = Keyframe::from_frame(reference_frame);
-        let mut current_kf = Keyframe::from_frame(current_frame);
         let depth_scale = median_depth.filter(|&d| d > 1e-6).unwrap_or(1.0);
         let reference_pose_inv = reference_kf.frame.pose_world_to_cam.inverse();
 
