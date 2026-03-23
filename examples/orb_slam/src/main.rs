@@ -365,13 +365,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(gt_pose) = associate_gt(sample.timestamp_sec, ground_truth) {
 
-            est_positions.push(Vector3::new(
+            est_positions.push(Vec3F64::new(
                 p_est[0] as f64,
                 p_est[1] as f64,
                 p_est[2] as f64
             ));
 
-            gt_positions.push(Vector3::new(
+            gt_positions.push(Vec3F64::new(
                 gt_pose.tx,
                 gt_pose.ty,
                 gt_pose.tz
