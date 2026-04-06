@@ -30,17 +30,6 @@ pub struct DatasetSample {
     pub image_path: PathBuf,
 }
 
-/// One IMU sample from `mav0/imu0/data.csv`.
-#[derive(Debug, Clone, Copy)]
-pub struct ImuSample {
-    /// Timestamp in seconds.
-    pub timestamp_sec: f64,
-    /// Gyroscope reading [x, y, z] in rad/s.
-    pub gyro: [f64; 3],
-    /// Accelerometer reading [x, y, z] in m/s².
-    pub accel: [f64; 3],
-}
-
 /// One ground-truth pose from `state_groundtruth_estimate0/data.csv`.
 #[derive(Debug, Clone, Copy)]
 pub struct GroundTruthPose {
@@ -131,8 +120,6 @@ pub struct EurocDataset {
     /// Ground-truth poses (empty if GT file not present).
     #[allow(dead_code)]
     pub ground_truth: Vec<GroundTruthPose>,
-    /// IMU samples (empty if imu0 data not present).
-    pub imu0_samples: Vec<ImuSample>,
 }
 
 impl EurocDataset {
@@ -180,14 +167,12 @@ impl EurocDataset {
         }
 
         let ground_truth = Self::load_ground_truth(&root);
-        let imu0_samples = Self::load_imu0(&root);
 
         Ok(Self {
             root,
             cam0_samples: samples,
             cam0_calibration,
             ground_truth,
-            imu0_samples,
         })
     }
 
@@ -205,11 +190,6 @@ impl EurocDataset {
     #[allow(dead_code)]
     pub fn ground_truth(&self) -> &[GroundTruthPose] {
         &self.ground_truth
-    }
-
-    /// Returns IMU samples (possibly empty).
-    pub fn imu_samples(&self) -> &[ImuSample] {
-        &self.imu0_samples
     }
 
     /// Loads ground-truth poses from `mav0/state_groundtruth_estimate0/data.csv`.
@@ -262,49 +242,6 @@ impl EurocDataset {
             });
         }
         poses
-    }
-
-    /// Loads IMU samples from `mav0/imu0/data.csv`.
-    /// Returns an empty Vec if the file does not exist.
-    fn load_imu0(root: &Path) -> Vec<ImuSample> {
-        let csv = root.join("mav0").join("imu0").join("data.csv");
-        let file = match File::open(&csv) {
-            Ok(f) => f,
-            Err(_) => return Vec::new(),
-        };
-        let reader = BufReader::new(file);
-        let mut samples = Vec::new();
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            if line.starts_with('#') || line.trim().is_empty() {
-                continue;
-            }
-            // Columns: timestamp_ns, wx, wy, wz, ax, ay, az
-            let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() < 7 {
-                continue;
-            }
-            let Ok(ts_ns) = cols[0].trim().parse::<u64>() else {
-                continue;
-            };
-            let f = |i: usize| cols[i].trim().parse::<f64>();
-            let (Ok(wx), Ok(wy), Ok(wz), Ok(ax), Ok(ay), Ok(az)) =
-                (f(1), f(2), f(3), f(4), f(5), f(6))
-            else {
-                continue;
-            };
-
-            samples.push(ImuSample {
-                timestamp_sec: ts_ns as f64 * 1e-9,
-                gyro: [wx, wy, wz],
-                accel: [ax, ay, az],
-            });
-        }
-        samples
     }
 
     fn load_cam0_calibration(root: &Path) -> Result<EurocCameraCalibration, DatasetError> {
