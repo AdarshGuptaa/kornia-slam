@@ -11,6 +11,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TwoViewConfig, TwoViewModel, triangulate_matched_points, two_view_estimate};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
+use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
 use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
@@ -35,11 +36,17 @@ pub struct Pipeline {
     map: Map,
     // System state
     state: SystemState,
+    // IMU preintegration
+    preintegration: PreintegratedImu,
+    // Gravity vector in world frame
+    gravity: Vec3F64,
+    // Linear velocity estimate in world frame
+    linear_velocity: Vec3F64,
 }
 
 impl Pipeline {
     /// Creates a new pipeline with identity pose.
-    pub fn new(camera: PinholeCamera, config: PipelineConfig) -> Self {
+    pub fn new(camera: PinholeCamera, config: PipelineConfig, imu_calib: ImuCalib) -> Self {
         Self {
             camera,
             estimator: MapProjectionEstimator::new(config.map_projection),
@@ -48,7 +55,15 @@ impl Pipeline {
             enable_local_ba: config.enable_local_ba,
             map: Map::new(),
             state: SystemState::new(),
+            preintegration: PreintegratedImu::new(ImuBias::default(), imu_calib),
+            gravity: Vec3F64::new(0.0, 0.0, -9.81),
+            linear_velocity: Vec3F64::ZERO,
         }
+    }
+
+    /// Feed IMU measurements between camera frames.
+    pub fn feed_imu(&mut self, measurements: &[ImuMeasurement]) {
+        self.preintegration.integrate_batch(measurements);
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
@@ -205,11 +220,31 @@ impl Pipeline {
         let pose_before_tracking = self.state.pose_world_to_cam;
         let image_size = frame.image_size;
 
-        let candidate_pose = if let Some(vel) = self.state.velocity {
+        // Use IMU prediction if available, otherwise fall back to constant-velocity.
+        let candidate_pose = if self.preintegration.dt > 0.0 {
+            // predict() works in world frame, so invert world-to-cam to get (R_wc, p_wc).
+            let cam_to_world = self.state.pose_world_to_cam.inverse();
+
+            let (r_k1, v_k1, p_k1) = self.preintegration.predict(
+                &cam_to_world.rotation,
+                &self.linear_velocity,
+                &cam_to_world.translation,
+                &self.gravity,
+            );
+
+            self.linear_velocity = v_k1;
+
+            // Convert back to world-to-cam.
+            Pose3d::new(r_k1, p_k1).inverse()
+        } else if let Some(vel) = self.state.velocity {
             vel.compose(&self.state.pose_world_to_cam)
         } else {
             self.state.pose_world_to_cam
         };
+
+        // Reset preintegration for next camera window.
+        self.preintegration =
+            PreintegratedImu::new(self.preintegration.bias, self.preintegration.calib);
 
         let result = self.estimator.estimate_pose(
             &frame,

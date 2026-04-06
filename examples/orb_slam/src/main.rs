@@ -15,7 +15,9 @@ mod utils;
 
 use config::PipelineConfig;
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
 use kornia_io::png::read_image_png_mono8;
+use kornia_sensors::imu::{ImuCalib, ImuMeasurement};
 use kornia_slam::Frame;
 
 use pipeline::Pipeline;
@@ -67,6 +69,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.start_frame + n_frames
     );
 
+    // ── IMU samples ────────────────────────────────────────────────────────
+    let imu_samples = dataset.imu_samples();
+    eprintln!("IMU samples: {}", imu_samples.len());
+
+    // ── IMU calibration (EuRoC V1 sensor.yaml) ──────────────────────────
+    let imu_calib = ImuCalib {
+        gyro_noise: 1.6968e-4,
+        accel_noise: 2.0e-3,
+        gyro_bias_noise: 1.9393e-5,
+        accel_bias_noise: 3.0e-3,
+    };
+
     // ── Camera (from EuRoC cam0 sensor.yaml) ───────────────────────────────
     let camera = dataset.camera();
 
@@ -77,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ── SLAM config & system ───────────────────────────────────────────────
-    let mut system = Pipeline::new(camera.clone(), PipelineConfig::default());
+    let mut system = Pipeline::new(camera.clone(), PipelineConfig::default(), imu_calib);
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     let rec = if args.rerun_stream {
@@ -91,6 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::with_capacity(n_frames);
+    let mut prev_timestamp: Option<f64> = None;
+    let mut imu_cursor: usize = 0;
 
     for (i, sample) in samples
         .iter()
@@ -99,6 +115,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enumerate()
     {
         let idx = args.start_frame + i;
+
+        // Feed IMU measurements between the previous and current frame timestamps.
+        if let Some(t_prev) = prev_timestamp {
+            let t_curr = sample.timestamp_sec;
+            let mut imu_batch = Vec::new();
+            while imu_cursor < imu_samples.len() && imu_samples[imu_cursor].timestamp_sec <= t_curr
+            {
+                let s = &imu_samples[imu_cursor];
+                if s.timestamp_sec > t_prev {
+                    imu_batch.push(ImuMeasurement {
+                        timestamp: s.timestamp_sec,
+                        gyro: Vec3F64::new(s.gyro[0], s.gyro[1], s.gyro[2]),
+                        accel: Vec3F64::new(s.accel[0], s.accel[1], s.accel[2]),
+                    });
+                }
+                imu_cursor += 1;
+            }
+            if !imu_batch.is_empty() {
+                system.feed_imu(&imu_batch);
+            }
+        }
+        prev_timestamp = Some(sample.timestamp_sec);
 
         // Load grayscale image and convert u8 → f32.
         let gray_u8 = read_image_png_mono8(&sample.image_path)?;
