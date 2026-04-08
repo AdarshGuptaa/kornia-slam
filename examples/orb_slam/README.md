@@ -2,8 +2,6 @@
 
 This package is the current runnable slice of `kornia-slam`: a monocular ORB-based SLAM pipeline over EuRoC MAV image sequences with optional Rerun visualization.
 
-Temporary dependency note: until [kornia-rs PR #803](https://github.com/kornia/kornia-rs/pull/803) is merged and released, this package depends on unpublished `kornia-rs` crates from the `feat/slam-utils` branch. Cargo fetches them automatically on first build.
-
 ## Dataset setup
 
 Download the EuRoC MAV dataset from the OpenVINS dataset guide:

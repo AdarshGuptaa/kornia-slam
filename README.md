@@ -70,8 +70,6 @@ Beyond serving spatial state to external agents, kornia-slam is exploring the id
 
 The current runnable package is the standalone ORB-SLAM example in [examples/orb_slam/README.md](examples/orb_slam/README.md).
 
-Temporary dependency note: until [kornia-rs PR #803](https://github.com/kornia/kornia-rs/pull/803) is merged and released, this repository depends on unpublished `kornia-rs` crates from the `feat/slam-utils` branch. Cargo fetches them automatically on first build.
-
 ### Local checks
 
 The current baseline checks for this repository are:
