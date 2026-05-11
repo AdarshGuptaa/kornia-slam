@@ -129,6 +129,24 @@ impl Pipeline {
             two_view_estimate.median_depth,
         );
 
+        // Post-BA sanity gate (mirrors ORB-SLAM3's reset criteria in
+        // CreateInitialMapMonocular). Discard the bootstrap if the resulting
+        // map has too few valid points or a degenerate scale.
+        const MIN_VALID_POINTS: usize = 50;
+        let health = self.map.initial_map_health();
+        if health.valid_in_both < MIN_VALID_POINTS || health.median_depth_older_kf <= 0.0 {
+            eprintln!(
+                "[init_gate] reject: valid_in_both={} median_depth={:.3} (need >= {} and > 0)",
+                health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
+            );
+            self.map.clear_active();
+            self.state.reset();
+            return TrackingResult {
+                pose_world_to_cam: self.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
         // BA inside build_initial_map may have refined KF1's pose; sync state
         // and recompute velocity from the post-BA pose.
         if let Some(kf) = self.map.get_keyframe(curr_idx) {

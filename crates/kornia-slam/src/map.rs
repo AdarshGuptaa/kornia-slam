@@ -137,6 +137,19 @@ impl MapPoint {
     }
 }
 
+/// Quality metrics for a freshly-bootstrapped 2-keyframe map.
+///
+/// Used as the gate for accepting a bootstrap result. Mirrors
+/// ORB-SLAM3's reset criteria in `CreateInitialMapMonocular`:
+/// `medianDepth < 0 || TrackedMapPoints(1) < 50`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InitialMapHealth {
+    /// Number of map points with positive depth in both bootstrap KFs.
+    pub valid_in_both: usize,
+    /// Median depth of valid points in the older KF's frame.
+    pub median_depth_older_kf: f64,
+}
+
 /// In-memory map storage for keyframes and persistent map points.
 #[derive(Debug, Clone, Default)]
 pub struct Map {
@@ -163,6 +176,70 @@ impl Map {
     /// Returns the number of persistent map points.
     pub fn num_map_points(&self) -> usize {
         self.map_points.len()
+    }
+
+    /// Wipes all keyframes and map points. Used to discard a failed bootstrap.
+    pub fn clear_active(&mut self) {
+        self.keyframes.clear();
+        self.map_points.clear();
+    }
+
+    /// Health metrics for the just-bootstrapped pair of keyframes.
+    ///
+    /// Inspects the last two keyframes in insertion order and reports how
+    /// many associated map points still have positive depth in both KFs,
+    /// plus the median depth in the older KF's frame. Used to decide whether
+    /// a freshly-bootstrapped map is safe to commit.
+    pub fn initial_map_health(&self) -> InitialMapHealth {
+        let n = self.keyframes.len();
+        if n < 2 {
+            return InitialMapHealth::default();
+        }
+        let kf_older = &self.keyframes[n - 2];
+        let kf_newer = &self.keyframes[n - 1];
+        let pose_older = kf_older.frame.pose_world_to_cam;
+        let pose_newer = kf_newer.frame.pose_world_to_cam;
+
+        // Collect MPs observed by either KF, dedup.
+        let mut seen: HashSet<usize> = HashSet::new();
+        for mp_idx in kf_older
+            .map_point_by_desc_idx
+            .iter()
+            .chain(kf_newer.map_point_by_desc_idx.iter())
+            .flatten()
+        {
+            seen.insert(*mp_idx);
+        }
+
+        let mut depths_older: Vec<f64> = Vec::with_capacity(seen.len());
+        let mut valid_in_both = 0usize;
+        for idx in seen {
+            let Some(mp) = self.map_points.get(idx) else {
+                continue;
+            };
+            if mp.culled {
+                continue;
+            }
+            let z_older = pose_older.transform_point(&mp.position).z;
+            let z_newer = pose_newer.transform_point(&mp.position).z;
+            if z_older > 0.0 && z_newer > 0.0 {
+                valid_in_both += 1;
+                depths_older.push(z_older);
+            }
+        }
+
+        let median_depth = if depths_older.is_empty() {
+            0.0
+        } else {
+            let mid = depths_older.len() / 2;
+            depths_older.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            depths_older[mid]
+        };
+
+        InitialMapHealth {
+            valid_in_both,
+            median_depth_older_kf: median_depth,
+        }
     }
 
     /// Returns the keyframe with frame index `idx`, if present.
