@@ -110,6 +110,13 @@ impl Pipeline {
             Ok(tv) => tv,
         };
 
+        eprintln!(
+            "[bootstrap] model={} triangulated={} inliers={}",
+            two_view_estimate.model_kind,
+            two_view_estimate.points3d.len(),
+            two_view_estimate.estimate.inliers,
+        );
+
         let estimated_pose = two_view_estimate.estimate.pose;
         let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
         self.state.pose_world_to_cam = estimated_pose;
