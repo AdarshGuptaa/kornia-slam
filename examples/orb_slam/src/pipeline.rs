@@ -8,7 +8,9 @@ use std::collections::HashSet;
 use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{TwoViewConfig, TwoViewModel, triangulate_matched_points, two_view_estimate};
+use kornia_3d::pose::{
+    TriangulationConfig, TwoViewEstimator, TwoViewModel, triangulate_matched_points,
+};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 use kornia_slam::Frame;
@@ -300,12 +302,12 @@ impl Pipeline {
 
         let enable_local_ba = self.enable_local_ba;
         let match_config = self.two_view_init_config.match_config;
-        let estimation_config = self.two_view_init_config.estimation_config.clone();
+        let triangulation_config = self.two_view_init_config.triangulation_config.clone();
         self.grow_map_points_from_keyframe_pair(
             &prev_kf,
             &mut curr_kf,
             match_config,
-            &estimation_config,
+            &triangulation_config,
         );
 
         self.map.upsert_keyframe(curr_kf);
@@ -328,13 +330,12 @@ impl Pipeline {
         prev_kf: &Keyframe,
         curr_kf: &mut Keyframe,
         match_config: OrbMatchConfig,
-        two_view_config: &TwoViewConfig,
+        triangulation_config: &TriangulationConfig,
     ) -> usize {
         const MIN_GROWTH_MATCHES: usize = 20;
         const MIN_GROWTH_INLIERS: usize = 15;
 
         let camera = &self.camera;
-        let triangulation_config = &two_view_config.triangulation;
         let matches = match_orb_descriptors(
             &prev_kf.frame.features.orientations,
             &prev_kf.frame.features.descriptors,
@@ -372,7 +373,10 @@ impl Pipeline {
         }
 
         let k = camera.intrinsic_matrix();
-        let two_view = match two_view_estimate(&prev_pts, &curr_pts, &k, &k, two_view_config) {
+        let estimator = TwoViewEstimator::builder()
+            .triangulation(triangulation_config.clone())
+            .build();
+        let two_view = match estimator.estimate(&prev_pts, &curr_pts, &k, &k) {
             Ok(tv) if matches!(tv.model, TwoViewModel::Fundamental(_)) => tv,
             _ => return 0,
         };

@@ -14,7 +14,7 @@
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{TwoViewConfig, TwoViewModel, two_view_estimate};
+use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptors};
 
@@ -36,8 +36,8 @@ pub struct TwoViewAcceptanceConfig {
 pub struct TwoViewInitConfig {
     /// ORB descriptor matcher settings.
     pub match_config: OrbMatchConfig,
-    /// Two-view model estimation settings.
-    pub estimation_config: TwoViewConfig,
+    /// Triangulation thresholds applied during two-view estimation.
+    pub triangulation_config: TriangulationConfig,
     /// Acceptance thresholds applied on top of the estimator result.
     pub acceptance_config: TwoViewAcceptanceConfig,
 }
@@ -51,7 +51,7 @@ impl Default for TwoViewInitConfig {
                 check_orientation: true,
                 histo_length: 30,
             },
-            estimation_config: TwoViewConfig::default(),
+            triangulation_config: TriangulationConfig::default(),
             acceptance_config: TwoViewAcceptanceConfig {
                 min_matches: 100,
                 min_inliers: 30,
@@ -119,14 +119,12 @@ pub fn try_initialize_two_view(
     );
 
     let k = camera.intrinsic_matrix();
-    let result = two_view_estimate(
-        &reference_pts,
-        &current_pts,
-        &k,
-        &k,
-        &config.estimation_config,
-    )
-    .map_err(|_| TwoViewRejectReason::EstimationFailed)?;
+    let estimator = TwoViewEstimator::builder()
+        .triangulation(config.triangulation_config.clone())
+        .build();
+    let result = estimator
+        .estimate(&reference_pts, &current_pts, &k, &k)
+        .map_err(|_| TwoViewRejectReason::EstimationFailed)?;
 
     if !matches!(result.model, TwoViewModel::Fundamental(_)) {
         return Err(TwoViewRejectReason::WrongModel);
@@ -141,7 +139,7 @@ pub fn try_initialize_two_view(
     }
 
     let median_parallax_deg = result.median_parallax_deg(&reference_pts, &current_pts, camera);
-    if median_parallax_deg < config.estimation_config.triangulation.min_parallax_deg {
+    if median_parallax_deg < config.triangulation_config.min_parallax_deg {
         return Err(TwoViewRejectReason::LowParallax);
     }
 
