@@ -347,6 +347,7 @@ impl Pipeline {
         });
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
+            self.map.register_observation(mp_idx, &curr_kf, curr_idx);
         }
 
         let enable_local_ba = self.enable_local_ba;

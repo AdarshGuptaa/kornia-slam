@@ -33,6 +33,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
+use kornia_imgproc::features::hamming_distance;
 
 use crate::frame::Frame;
 
@@ -90,8 +91,14 @@ pub type TriangulatedPoint = (Vec3F64, [u8; 32], [u8; 3], usize, usize);
 pub struct MapPoint {
     /// 3D position in world frame.
     pub position: Vec3F64,
-    /// ORB descriptor used for projection-guided matching.
+    /// Representative ORB descriptor used for projection-guided matching.
+    /// Recomputed as the descriptor with minimum median Hamming distance to
+    /// all observations whenever a new observation is added (mirrors
+    /// ORB-SLAM3's `MapPoint::ComputeDistinctiveDescriptors`).
     pub descriptor: [u8; 32],
+    /// All descriptors of this point across observing keyframes. Used to
+    /// recompute `descriptor` (the representative) as viewpoint changes.
+    pub observed_descriptors: Vec<[u8; 32]>,
     /// Pixel color sampled at the keypoint that created this point.
     pub color: [u8; 3],
     /// Index of the keyframe that first observed this point.
@@ -105,7 +112,7 @@ pub struct MapPoint {
 }
 
 impl MapPoint {
-    /// Creates a fresh active map point.
+    /// Creates a fresh active map point with one observed descriptor.
     pub fn new(
         position: Vec3F64,
         descriptor: [u8; 32],
@@ -115,6 +122,7 @@ impl MapPoint {
         Self {
             position,
             descriptor,
+            observed_descriptors: vec![descriptor],
             color,
             keyframe_idx,
             n_visible: 1,
@@ -134,6 +142,47 @@ impl MapPoint {
             return 0.0;
         }
         self.n_found as f64 / self.n_visible as f64
+    }
+
+    /// Records a new observed descriptor and refreshes the representative.
+    ///
+    /// The representative is the observed descriptor with minimum median
+    /// Hamming distance to all others (ORB-SLAM3's
+    /// `ComputeDistinctiveDescriptors`). With <=2 observations the choice is
+    /// trivial; with >=3 we run the O(n^2) pairwise distance scan.
+    pub fn add_observation_descriptor(&mut self, descriptor: [u8; 32]) {
+        self.observed_descriptors.push(descriptor);
+        self.recompute_representative_descriptor();
+    }
+
+    fn recompute_representative_descriptor(&mut self) {
+        let n = self.observed_descriptors.len();
+        match n {
+            0 => {}
+            1 => self.descriptor = self.observed_descriptors[0],
+            2 => self.descriptor = self.observed_descriptors[0],
+            _ => {
+                let mut dist_buf = vec![0u32; n];
+                let mut best_idx = 0usize;
+                let mut best_median = u32::MAX;
+                for i in 0..n {
+                    for j in 0..n {
+                        dist_buf[j] = hamming_distance(
+                            &self.observed_descriptors[i],
+                            &self.observed_descriptors[j],
+                        );
+                    }
+                    let mid = n / 2;
+                    dist_buf.select_nth_unstable(mid);
+                    let median = dist_buf[mid];
+                    if median < best_median {
+                        best_median = median;
+                        best_idx = i;
+                    }
+                }
+                self.descriptor = self.observed_descriptors[best_idx];
+            }
+        }
     }
 }
 
@@ -283,9 +332,28 @@ impl Map {
         if let Some(prev) = prev_kf {
             for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().enumerate() {
                 prev.associate_map_point(prev_desc_idx, first_mp_idx + i);
+                // Feed the prev KF's descriptor as a second observation so the
+                // representative descriptor is computed from both viewpoints.
+                if let Some(&prev_desc) = prev.frame.features.descriptors.get(prev_desc_idx)
+                    && let Some(mp) = self.map_points.get_mut(first_mp_idx + i)
+                {
+                    mp.add_observation_descriptor(prev_desc);
+                }
             }
         }
         points.len()
+    }
+
+    /// Records that an existing map point was observed at `desc_idx` in
+    /// `keyframe`, pushing the descriptor into the map point's observation
+    /// list and refreshing the representative.
+    pub fn register_observation(&mut self, mp_idx: usize, keyframe: &Keyframe, desc_idx: usize) {
+        let Some(&descriptor) = keyframe.frame.features.descriptors.get(desc_idx) else {
+            return;
+        };
+        if let Some(mp) = self.map_points.get_mut(mp_idx) {
+            mp.add_observation_descriptor(descriptor);
+        }
     }
 
     /// Appends a map point and returns its index.
@@ -756,6 +824,7 @@ mod tests {
                 keypoints_xy: (0..n).map(|i| [i as f32, i as f32]).collect(),
                 orientations: vec![0.0; n],
                 descriptors,
+                octaves: vec![0; n],
             },
             pose_world_to_cam: Pose3d::IDENTITY,
             image_size: ImageSize {
