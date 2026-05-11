@@ -111,10 +111,7 @@ impl Pipeline {
         };
 
         let estimated_pose = two_view_estimate.estimate.pose;
-        self.state.velocity = Some(Pose3d::between(
-            &curr_frame.pose_world_to_cam,
-            &estimated_pose,
-        ));
+        let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
         self.state.pose_world_to_cam = estimated_pose;
         curr_frame.pose_world_to_cam = estimated_pose;
 
@@ -131,6 +128,17 @@ impl Pipeline {
             &two_view_estimate.inlier_indices,
             two_view_estimate.median_depth,
         );
+
+        // BA inside build_initial_map may have refined KF1's pose; sync state
+        // and recompute velocity from the post-BA pose.
+        if let Some(kf) = self.map.get_keyframe(curr_idx) {
+            self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
+        }
+        self.state.velocity = Some(Pose3d::between(
+            &prev_pose_world_to_cam,
+            &self.state.pose_world_to_cam,
+        ));
+
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
         self.state.mode = SystemMode::Tracking;
@@ -200,6 +208,9 @@ impl Pipeline {
 
         self.map.upsert_keyframe(reference_kf);
         self.map.upsert_keyframe(current_kf);
+
+        self.map.run_initial_ba(&self.camera);
+
         added
     }
 

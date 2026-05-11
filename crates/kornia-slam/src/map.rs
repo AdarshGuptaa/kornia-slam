@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use kornia_3d::ba::{self, BaObservation, BaParams};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 
@@ -387,6 +388,140 @@ impl Map {
         }
     }
 
+    /// Run a 2-keyframe bundle adjustment over the bootstrap pair.
+    ///
+    /// Operates on the two most recently inserted keyframes (the bootstrap
+    /// pair). Optimizes the newer KF's pose and all map points observed by
+    /// either KF; the older KF is held fixed as the gauge anchor. Mirrors
+    /// ORB-SLAM3's `GlobalBundleAdjustemnt(map, 20)` in
+    /// `CreateInitialMapMonocular`.
+    ///
+    /// Returns `true` if BA ran and wrote back optimized values; `false` if
+    /// there were too few observations or the optimizer errored (map left
+    /// untouched in that case).
+    pub fn run_initial_ba(&mut self, camera: &PinholeCamera) -> bool {
+        const MAX_ITERS: usize = 5;
+        const HUBER_SCALE_SQ: f32 = 5.991;
+        const MIN_OBSERVATIONS: usize = 8;
+
+        let n = self.keyframes.len();
+        if n < 2 {
+            return false;
+        }
+
+        // Last two keyframes; older is gauge-fixed.
+        let kf_indices = [n - 2, n - 1];
+
+        let mut mp_set: HashSet<usize> = HashSet::new();
+        for &kf_idx in &kf_indices {
+            for mp_idx in self.keyframes[kf_idx].map_point_by_desc_idx.iter().flatten() {
+                if let Some(mp) = self.map_points.get(*mp_idx)
+                    && !mp.culled
+                {
+                    mp_set.insert(*mp_idx);
+                }
+            }
+        }
+        if mp_set.is_empty() {
+            return false;
+        }
+
+        let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
+        mp_global_indices.sort_unstable();
+
+        let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| (global, local))
+            .collect();
+
+        let points: Vec<Vec3F64> = mp_global_indices
+            .iter()
+            .map(|&idx| self.map_points[idx].position)
+            .collect();
+
+        let poses: Vec<Pose3d> = kf_indices
+            .iter()
+            .map(|&i| self.keyframes[i].frame.pose_world_to_cam)
+            .collect();
+
+        let mut observations = Vec::new();
+        for (pose_idx, &kf_idx) in kf_indices.iter().enumerate() {
+            let is_fixed = pose_idx == 0;
+            let kf = &self.keyframes[kf_idx];
+            for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
+                if let Some(mp_idx) = mp_opt {
+                    let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
+                        continue;
+                    };
+                    if let Some(kp) = kf.frame.features.keypoints_xy.get(desc_idx) {
+                        let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                        observations.push(BaObservation {
+                            pose_idx,
+                            point_idx,
+                            pixel: [p.x as f32, p.y as f32],
+                            fixed_pose: is_fixed,
+                        });
+                    }
+                }
+            }
+        }
+
+        if observations.len() < MIN_OBSERVATIONS {
+            return false;
+        }
+
+        let (sq_err_before, depth_before, kf1_t_before) =
+            initial_ba_diagnostics(&poses, &points, &observations, camera);
+
+        let params = BaParams {
+            max_iterations: MAX_ITERS,
+            // Two-view monocular BA has a 1-DOF scale gauge (only KF0 is
+            // fixed). Bump LM damping so the augmented normal equations stay
+            // well-conditioned even though H is rank-deficient.
+            initial_lambda: 1.0,
+            robust: RobustKernelKind::Huber,
+            robust_scale_sq: HUBER_SCALE_SQ,
+            ..BaParams::default()
+        };
+
+        let ba_result = match ba::bundle_adjust(&poses, &points, &observations, camera, &params) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[init_ba] bundle_adjust failed: {e}");
+                return false;
+            }
+        };
+
+        let (sq_err_after, depth_after, kf1_t_after) =
+            initial_ba_diagnostics(&ba_result.poses, &ba_result.points, &observations, camera);
+
+        eprintln!(
+            "[init_ba] before: reproj_rms={:.3}px median_depth={:.3} kf1_t_norm={:.3} obs={}",
+            sq_err_before.sqrt(),
+            depth_before,
+            kf1_t_before,
+            observations.len()
+        );
+        eprintln!(
+            "[init_ba] after:  reproj_rms={:.3}px median_depth={:.3} kf1_t_norm={:.3} iters={} converged={}",
+            sq_err_after.sqrt(),
+            depth_after,
+            kf1_t_after,
+            ba_result.iterations,
+            ba_result.converged
+        );
+
+        self.keyframes[kf_indices[1]].frame.pose_world_to_cam = ba_result.poses[1];
+        for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
+            if let Some(mp) = self.map_points.get_mut(global_idx) {
+                mp.position = ba_result.points[local_idx];
+            }
+        }
+
+        true
+    }
+
     /// Run local bundle adjustment over recent keyframes and their observed map points.
     ///
     /// Collects the last N active keyframes, gathers observations (undistorting keypoints
@@ -480,6 +615,53 @@ impl Map {
             }
         }
     }
+}
+
+/// Returns (mean_sq_reproj_error, median_depth_in_kf0_frame, kf1_translation_norm).
+fn initial_ba_diagnostics(
+    poses: &[Pose3d],
+    points: &[Vec3F64],
+    observations: &[BaObservation],
+    camera: &PinholeCamera,
+) -> (f64, f64, f64) {
+    let mut sum_sq = 0.0;
+    let mut count = 0usize;
+    for obs in observations {
+        if let (Some(pose), Some(pt)) = (poses.get(obs.pose_idx), points.get(obs.point_idx))
+            && let Some(err_sq) = camera.reprojection_error_sq_world(
+                pose,
+                pt,
+                obs.pixel[0] as f64,
+                obs.pixel[1] as f64,
+            )
+        {
+            sum_sq += err_sq;
+            count += 1;
+        }
+    }
+    let mean_sq = if count > 0 { sum_sq / count as f64 } else { 0.0 };
+
+    let median_depth = match poses.first() {
+        Some(kf0) => {
+            let mut depths: Vec<f64> = points
+                .iter()
+                .map(|p| kf0.transform_point(p).z)
+                .filter(|&z| z > 0.0)
+                .collect();
+            if depths.is_empty() {
+                0.0
+            } else {
+                let mid = depths.len() / 2;
+                depths.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+                depths[mid]
+            }
+        }
+        None => 0.0,
+    };
+
+    let kf1_t_norm = poses.get(1).map(|p| p.translation.length()).unwrap_or(0.0);
+
+    (mean_sq, median_depth, kf1_t_norm)
 }
 
 #[cfg(test)]
