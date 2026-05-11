@@ -83,6 +83,19 @@ impl Pipeline {
         // the new map in the existing coordinate frame.
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
 
+        // Staleness guard (mirrors ORB-SLAM3's MonocularInitialization):
+        // a frame with too few keypoints is neither a viable reference nor
+        // a viable current frame. If we already had a reference, drop it
+        // and wait for a feature-rich frame to start over.
+        const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
+        if curr_frame.features.keypoints_xy.len() <= MIN_KEYPOINTS_FOR_BOOTSTRAP {
+            self.state.bootstrap_frame = None;
+            return TrackingResult {
+                pose_world_to_cam: self.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
         let Some(prev_bootstrap_frame) = self.state.bootstrap_frame.take() else {
             self.state.bootstrap_frame = Some(curr_frame);
             return TrackingResult {
