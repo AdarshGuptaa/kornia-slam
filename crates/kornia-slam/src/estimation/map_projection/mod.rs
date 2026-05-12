@@ -471,16 +471,13 @@ mod matching_tests {
         let camera = test_camera();
 
         let desc_a = [0u8; 32];
-        let map_points = vec![MapPoint {
-            position: Vec3F64::new(0.0, 0.0, 5.0),
-            descriptor: desc_a,
-            observed_descriptors: vec![desc_a],
-            color: [0; 3],
-            keyframe_idx: 0,
-            n_visible: 0,
-            n_found: 0,
-            culled: false,
-        }];
+        let map_points = vec![MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            desc_a,
+            0,
+            [0; 3],
+            0,
+        )];
 
         let keypoints_xy = vec![[320.0f32, 240.0], [100.0, 100.0]];
         let descriptors = vec![desc_a, [0xFF; 32]];
@@ -515,16 +512,13 @@ mod matching_tests {
         let estimator = make_test_estimator();
         let camera = test_camera();
 
-        let map_points = vec![MapPoint {
-            position: Vec3F64::new(0.0, 0.0, -5.0),
-            descriptor: [0u8; 32],
-            observed_descriptors: vec![[0u8; 32]],
-            color: [0; 3],
-            keyframe_idx: 0,
-            n_visible: 0,
-            n_found: 0,
-            culled: false,
-        }];
+        let map_points = vec![MapPoint::new(
+            Vec3F64::new(0.0, 0.0, -5.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        )];
 
         let keypoints_xy = vec![[320.0f32, 240.0]];
         let descriptors = vec![[0u8; 32]];
@@ -556,16 +550,13 @@ mod matching_tests {
         let estimator = make_test_estimator();
         let camera = test_camera();
 
-        let map_points = vec![MapPoint {
-            position: Vec3F64::new(0.0, 0.0, 5.0),
-            descriptor: [0u8; 32],
-            observed_descriptors: vec![[0u8; 32]],
-            color: [0; 3],
-            keyframe_idx: 0,
-            n_visible: 0,
-            n_found: 0,
-            culled: false,
-        }];
+        let map_points = vec![MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        )];
 
         let keypoints_xy = vec![[320.0f32, 240.0]];
         let descriptors = vec![[0xFF; 32]];
