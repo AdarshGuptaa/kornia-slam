@@ -51,7 +51,12 @@ impl Default for TwoViewInitConfig {
                 check_orientation: true,
                 histo_length: 30,
             },
-            triangulation_config: TriangulationConfig::default(),
+            // Match ORB-SLAM3's `secondBestGood < 0.75 * bestGood` cheirality
+            // ambiguity threshold (default in kornia-3d is 0.70).
+            triangulation_config: TriangulationConfig {
+                cheirality_ambiguity_max: 0.75,
+                ..TriangulationConfig::default()
+            },
             acceptance_config: TwoViewAcceptanceConfig {
                 min_matches: 100,
                 min_inliers: 30,
@@ -68,8 +73,6 @@ pub enum TwoViewRejectReason {
     LowMatches,
     /// Two-view estimation failed.
     EstimationFailed,
-    /// Homography was selected instead of fundamental model.
-    WrongModel,
     /// Too few triangulated points.
     LowTriangulated,
     /// Too few inliers in estimated model.
@@ -89,6 +92,9 @@ pub struct TwoViewEstimate {
     pub inlier_indices: Vec<usize>,
     /// Median positive depth in the two-view triangulation (if available).
     pub median_depth: Option<f64>,
+    /// Which model the estimator committed to: `'F'` (fundamental/essential)
+    /// or `'H'` (homography). Useful for diagnostics on planar scenes.
+    pub model_kind: char,
 }
 
 /// Attempt two-view initialization between a reference frame and the current frame.
@@ -126,9 +132,10 @@ pub fn try_initialize_two_view(
         .estimate(&reference_pts, &current_pts, &k, &k)
         .map_err(|_| TwoViewRejectReason::EstimationFailed)?;
 
-    if !matches!(result.model, TwoViewModel::Fundamental(_)) {
-        return Err(TwoViewRejectReason::WrongModel);
-    }
+    let model_kind = match result.model {
+        TwoViewModel::Homography(_) => 'H',
+        _ => 'F',
+    };
 
     if result.points3d.len() < acceptance.min_triangulated {
         return Err(TwoViewRejectReason::LowTriangulated);
@@ -170,6 +177,7 @@ pub fn try_initialize_two_view(
         points3d: result.points3d,
         inlier_indices: result.inlier_indices,
         median_depth,
+        model_kind,
     })
 }
 

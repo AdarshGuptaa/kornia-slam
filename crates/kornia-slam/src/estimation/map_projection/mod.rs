@@ -474,6 +474,7 @@ mod matching_tests {
         let map_points = vec![MapPoint {
             position: Vec3F64::new(0.0, 0.0, 5.0),
             descriptor: desc_a,
+            observed_descriptors: vec![desc_a],
             color: [0; 3],
             keyframe_idx: 0,
             n_visible: 0,
@@ -517,6 +518,7 @@ mod matching_tests {
         let map_points = vec![MapPoint {
             position: Vec3F64::new(0.0, 0.0, -5.0),
             descriptor: [0u8; 32],
+            observed_descriptors: vec![[0u8; 32]],
             color: [0; 3],
             keyframe_idx: 0,
             n_visible: 0,
@@ -557,6 +559,7 @@ mod matching_tests {
         let map_points = vec![MapPoint {
             position: Vec3F64::new(0.0, 0.0, 5.0),
             descriptor: [0u8; 32],
+            observed_descriptors: vec![[0u8; 32]],
             color: [0; 3],
             keyframe_idx: 0,
             n_visible: 0,

@@ -83,6 +83,19 @@ impl Pipeline {
         // the new map in the existing coordinate frame.
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
 
+        // Staleness guard (mirrors ORB-SLAM3's MonocularInitialization):
+        // a frame with too few keypoints is neither a viable reference nor
+        // a viable current frame. If we already had a reference, drop it
+        // and wait for a feature-rich frame to start over.
+        const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
+        if curr_frame.features.keypoints_xy.len() <= MIN_KEYPOINTS_FOR_BOOTSTRAP {
+            self.state.bootstrap_frame = None;
+            return TrackingResult {
+                pose_world_to_cam: self.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
         let Some(prev_bootstrap_frame) = self.state.bootstrap_frame.take() else {
             self.state.bootstrap_frame = Some(curr_frame);
             return TrackingResult {
@@ -110,11 +123,15 @@ impl Pipeline {
             Ok(tv) => tv,
         };
 
+        eprintln!(
+            "[bootstrap] model={} triangulated={} inliers={}",
+            two_view_estimate.model_kind,
+            two_view_estimate.points3d.len(),
+            two_view_estimate.estimate.inliers,
+        );
+
         let estimated_pose = two_view_estimate.estimate.pose;
-        self.state.velocity = Some(Pose3d::between(
-            &curr_frame.pose_world_to_cam,
-            &estimated_pose,
-        ));
+        let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
         self.state.pose_world_to_cam = estimated_pose;
         curr_frame.pose_world_to_cam = estimated_pose;
 
@@ -131,6 +148,35 @@ impl Pipeline {
             &two_view_estimate.inlier_indices,
             two_view_estimate.median_depth,
         );
+
+        // Post-BA sanity gate (mirrors ORB-SLAM3's reset criteria in
+        // CreateInitialMapMonocular). Discard the bootstrap if the resulting
+        // map has too few valid points or a degenerate scale.
+        const MIN_VALID_POINTS: usize = 50;
+        let health = self.map.initial_map_health();
+        if health.valid_in_both < MIN_VALID_POINTS || health.median_depth_older_kf <= 0.0 {
+            eprintln!(
+                "[init_gate] reject: valid_in_both={} median_depth={:.3} (need >= {} and > 0)",
+                health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
+            );
+            self.map.clear_active();
+            self.state.reset();
+            return TrackingResult {
+                pose_world_to_cam: self.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
+        // BA inside build_initial_map may have refined KF1's pose; sync state
+        // and recompute velocity from the post-BA pose.
+        if let Some(kf) = self.map.get_keyframe(curr_idx) {
+            self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
+        }
+        self.state.velocity = Some(Pose3d::between(
+            &prev_pose_world_to_cam,
+            &self.state.pose_world_to_cam,
+        ));
+
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
         self.state.mode = SystemMode::Tracking;
@@ -200,6 +246,9 @@ impl Pipeline {
 
         self.map.upsert_keyframe(reference_kf);
         self.map.upsert_keyframe(current_kf);
+
+        self.map.run_initial_ba(&self.camera);
+
         added
     }
 
@@ -298,6 +347,7 @@ impl Pipeline {
         });
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
+            self.map.register_observation(mp_idx, &curr_kf, curr_idx);
         }
 
         let enable_local_ba = self.enable_local_ba;
