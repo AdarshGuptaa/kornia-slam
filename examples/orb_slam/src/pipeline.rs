@@ -275,6 +275,13 @@ impl Pipeline {
             }
             Err(_) => (TrackingStatus::Skipped, Vec::new(), 0),
         };
+        eprintln!(
+            "[track] frame={} status={:?} matches={} inliers={}",
+            frame.idx,
+            status,
+            matches.len(),
+            tracked_inliers,
+        );
 
         if status == TrackingStatus::Tracked {
             let visible = self

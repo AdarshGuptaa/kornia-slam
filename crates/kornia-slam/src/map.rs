@@ -974,6 +974,10 @@ mod tests {
     use kornia_imgproc::features::OrbFeatures;
 
     fn test_frame(idx: usize, descriptors: Vec<[u8; 32]>) -> Frame {
+        test_frame_with_pose(idx, descriptors, Pose3d::IDENTITY)
+    }
+
+    fn test_frame_with_pose(idx: usize, descriptors: Vec<[u8; 32]>, pose: Pose3d) -> Frame {
         let n = descriptors.len();
         Frame {
             idx,
@@ -983,7 +987,7 @@ mod tests {
                 descriptors,
                 octaves: vec![0; n],
             },
-            pose_world_to_cam: Pose3d::IDENTITY,
+            pose_world_to_cam: pose,
             image_size: ImageSize {
                 width: 640,
                 height: 480,
@@ -1117,5 +1121,120 @@ mod tests {
 
         assert!(map.map_points()[first_idx].culled);
         assert!(!map.map_points()[second_idx].culled);
+    }
+
+    // ── Scale-invariance state (T1: deterministic, cross-checked vs ORB-SLAM3
+    //    formulas; ORB-SLAM3 itself not needed since these are closed-form). ──
+
+    /// T1a: `predict_scale` matches ORB-SLAM3's
+    /// `nScale = clamp(ceil(log(maxDist/dist) / log(scaleFactor)), 0, nLevels-1)`.
+    #[test]
+    fn predict_scale_matches_orbslam3_closed_form() {
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
+        mp.max_distance = 10.0;
+        let sf = ORB_SCALE_FACTOR;
+        let n = ORB_N_LEVELS;
+
+        for &dist in &[40.0_f64, 12.0, 10.0, 8.0, 3.7, 0.9, 0.01] {
+            let want = {
+                let ratio = mp.max_distance / dist;
+                let lvl = (ratio.ln() / sf.ln()).ceil();
+                if lvl.is_nan() || lvl < 0.0 {
+                    0
+                } else {
+                    (lvl as usize).min(n - 1)
+                }
+            };
+            assert_eq!(mp.predict_scale(dist, sf, n), want, "dist={dist}");
+        }
+
+        // Degenerate inputs return level 0.
+        assert_eq!(mp.predict_scale(0.0, sf, n), 0);
+        let mut unset = MapPoint::new(Vec3F64::ZERO, [0u8; 32], 0, [0; 3], 0);
+        unset.max_distance = 0.0;
+        assert_eq!(unset.predict_scale(5.0, sf, n), 0);
+    }
+
+    /// T1b: after `update_map_point_geometry`,
+    ///   max_distance == dist_to_ref_kf * scaleFactor^reference_octave
+    ///   max_distance / min_distance == scaleFactor^(n_levels - 1)
+    #[test]
+    fn scale_geometry_distance_invariants() {
+        let mut map = Map::new();
+        // Reference keyframe 0 at the world origin (identity pose => camera
+        // center at origin).
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
+
+        // Point referenced to KF 0, keypoint detected at octave 2, world (0,0,5).
+        let mp_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            2,
+            [0; 3],
+            0,
+        ));
+        map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+
+        let mp = &map.map_points()[mp_idx];
+        let expected_max = 5.0 * ORB_SCALE_FACTOR.powi(2);
+        assert!((mp.max_distance - expected_max).abs() < 1e-9);
+        assert!(
+            (mp.max_distance / mp.min_distance - ORB_SCALE_FACTOR.powi(ORB_N_LEVELS as i32 - 1))
+                .abs()
+                < 1e-9
+        );
+        // Margined bounds carry the 0.8 / 1.2 factors.
+        assert!((mp.min_distance_invariance() - 0.8 * mp.min_distance).abs() < 1e-12);
+        assert!((mp.max_distance_invariance() - 1.2 * mp.max_distance).abs() < 1e-12);
+    }
+
+    /// T1c: mean viewing direction is the average of unit (point - cam_center)
+    /// over observing keyframes; ‖normal‖ <= 1, and for a single forward-facing
+    /// observation it's exactly (point - cam_center) normalized.
+    #[test]
+    fn mean_viewing_direction_averages_observations() {
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
+
+        let mp_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        ));
+        map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+
+        // Single observation from the origin looking at (0,0,5): normal = +z.
+        let n0 = map.map_points()[mp_idx].mean_viewing_direction;
+        assert!(n0.x.abs() < 1e-9 && n0.y.abs() < 1e-9 && (n0.z - 1.0).abs() < 1e-9);
+
+        // Add a second keyframe translated along +x by 1 (world->cam pose has
+        // translation -1 along x, so camera center is at (1,0,0)).
+        let kf1 = Keyframe::from_frame(test_frame_with_pose(
+            1,
+            vec![[0u8; 32]],
+            Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                Vec3F64::new(-1.0, 0.0, 0.0),
+            ),
+        ));
+        map.register_observation(mp_idx, &kf1, 0);
+        map.upsert_keyframe(kf1);
+        map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+
+        let n = map.map_points()[mp_idx].mean_viewing_direction;
+        // Average of (0,0,1) and (point-(1,0,0)) normalized = (-1,0,5)/sqrt(26).
+        let d2 = Vec3F64::new(-1.0, 0.0, 5.0);
+        let d2n = d2 / d2.length();
+        let expected = Vec3F64::new(
+            (n0.x + d2n.x) / 2.0,
+            (n0.y + d2n.y) / 2.0,
+            (n0.z + d2n.z) / 2.0,
+        );
+        assert!((n.x - expected.x).abs() < 1e-9);
+        assert!((n.y - expected.y).abs() < 1e-9);
+        assert!((n.z - expected.z).abs() < 1e-9);
+        assert!(n.length() <= 1.0 + 1e-12);
     }
 }
