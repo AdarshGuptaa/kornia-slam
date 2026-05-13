@@ -283,6 +283,11 @@ impl Map {
         self.map_points.len()
     }
 
+    /// Returns the number of non-culled (active) map points.
+    pub fn num_active_map_points(&self) -> usize {
+        self.map_points.iter().filter(|mp| !mp.culled).count()
+    }
+
     /// Wipes all keyframes and map points. Used to discard a failed bootstrap.
     pub fn clear_active(&mut self) {
         self.keyframes.clear();
@@ -350,6 +355,13 @@ impl Map {
     /// Returns the keyframe with frame index `idx`, if present.
     pub fn get_keyframe(&self, idx: usize) -> Option<&Keyframe> {
         self.keyframes.iter().find(|kf| kf.frame.idx == idx)
+    }
+
+    /// Mutable version of [`Map::get_keyframe`]. Needed when a triangulation
+    /// or fusion pass produces a new observation that must be recorded on the
+    /// live keyframe in the map (not a clone).
+    pub fn get_keyframe_mut(&mut self, idx: usize) -> Option<&mut Keyframe> {
+        self.keyframes.iter_mut().find(|kf| kf.frame.idx == idx)
     }
 
     /// Inserts or replaces a keyframe by frame index.
