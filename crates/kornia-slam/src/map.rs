@@ -86,6 +86,12 @@ impl Keyframe {
 /// A triangulated point ready for map insertion: (position, descriptor, color, prev_desc_idx, curr_desc_idx).
 pub type TriangulatedPoint = (Vec3F64, [u8; 32], [u8; 3], usize, usize);
 
+/// ORB pyramid scale factor between adjacent levels (matches the kornia-imgproc
+/// ORB extractor default `downscale = 1.2`, which equals ORB-SLAM3's default).
+pub const ORB_SCALE_FACTOR: f64 = 1.2;
+/// Number of ORB pyramid levels (matches `OrbDetector` default `n_scales = 8`).
+pub const ORB_N_LEVELS: usize = 8;
+
 /// A persistent 3D landmark in the map.
 #[derive(Debug, Clone)]
 pub struct MapPoint {
@@ -96,12 +102,27 @@ pub struct MapPoint {
     /// all observations whenever a new observation is added (mirrors
     /// ORB-SLAM3's `MapPoint::ComputeDistinctiveDescriptors`).
     pub descriptor: [u8; 32],
-    /// All descriptors of this point across observing keyframes. Used to
-    /// recompute `descriptor` (the representative) as viewpoint changes.
+    /// All descriptors of this point across observing keyframes. Parallel to
+    /// `observation_kf_indices`. Used to recompute `descriptor`.
     pub observed_descriptors: Vec<[u8; 32]>,
+    /// Frame indices (`Keyframe::frame.idx`) of the keyframes observing this
+    /// point, parallel to `observed_descriptors`. Used to recompute the
+    /// viewing direction.
+    pub observation_kf_indices: Vec<usize>,
+    /// Pyramid octave of this point's keypoint in the reference keyframe
+    /// (`keyframe_idx`). Drives the scale-invariance distance bounds.
+    pub reference_octave: u8,
+    /// Mean unit viewing direction (world -> point), averaged over observing
+    /// keyframes (ORB-SLAM3's `mNormalVector`). Zero until computed.
+    pub mean_viewing_direction: Vec3F64,
+    /// Minimum / maximum camera-to-point distance at which the point is
+    /// expected to be matchable (ORB-SLAM3's `mfMinDistance` / `mfMaxDistance`,
+    /// the raw values before the 0.8 / 1.2 query margins). Zero until computed.
+    pub min_distance: f64,
+    pub max_distance: f64,
     /// Pixel color sampled at the keypoint that created this point.
     pub color: [u8; 3],
-    /// Index of the keyframe that first observed this point.
+    /// Frame index of the reference keyframe for this point's scale geometry.
     pub keyframe_idx: usize,
     /// Number of frames where this point was in the camera frustum.
     pub n_visible: u32,
@@ -112,10 +133,12 @@ pub struct MapPoint {
 }
 
 impl MapPoint {
-    /// Creates a fresh active map point with one observed descriptor.
+    /// Creates a fresh active map point with one observed descriptor from
+    /// keyframe `keyframe_idx`, detected at pyramid octave `octave`.
     pub fn new(
         position: Vec3F64,
         descriptor: [u8; 32],
+        octave: u8,
         color: [u8; 3],
         keyframe_idx: usize,
     ) -> Self {
@@ -123,6 +146,11 @@ impl MapPoint {
             position,
             descriptor,
             observed_descriptors: vec![descriptor],
+            observation_kf_indices: vec![keyframe_idx],
+            reference_octave: octave,
+            mean_viewing_direction: Vec3F64::ZERO,
+            min_distance: 0.0,
+            max_distance: 0.0,
             color,
             keyframe_idx,
             n_visible: 1,
@@ -144,14 +172,16 @@ impl MapPoint {
         self.n_found as f64 / self.n_visible as f64
     }
 
-    /// Records a new observed descriptor and refreshes the representative.
+    /// Records a new observed descriptor from keyframe `kf_idx` and refreshes
+    /// the representative.
     ///
     /// The representative is the observed descriptor with minimum median
     /// Hamming distance to all others (ORB-SLAM3's
     /// `ComputeDistinctiveDescriptors`). With <=2 observations the choice is
     /// trivial; with >=3 we run the O(n^2) pairwise distance scan.
-    pub fn add_observation_descriptor(&mut self, descriptor: [u8; 32]) {
+    pub fn add_observation_descriptor(&mut self, kf_idx: usize, descriptor: [u8; 32]) {
         self.observed_descriptors.push(descriptor);
+        self.observation_kf_indices.push(kf_idx);
         self.recompute_representative_descriptor();
     }
 
@@ -183,6 +213,32 @@ impl MapPoint {
                 self.descriptor = self.observed_descriptors[best_idx];
             }
         }
+    }
+
+    /// Predicts the ORB pyramid level the point is expected to be observable
+    /// at given the current camera-to-point distance (ORB-SLAM3's
+    /// `MapPoint::PredictScale`). Returns 0 when the scale geometry is unset.
+    pub fn predict_scale(&self, distance: f64, scale_factor: f64, n_levels: usize) -> usize {
+        if distance <= 0.0 || self.max_distance <= 0.0 || n_levels == 0 {
+            return 0;
+        }
+        let ratio = self.max_distance / distance;
+        let level = (ratio.ln() / scale_factor.ln()).ceil();
+        if level.is_nan() || level < 0.0 {
+            0
+        } else {
+            (level as usize).min(n_levels - 1)
+        }
+    }
+
+    /// Lower bound of the matchable distance range, with ORB-SLAM3's 0.8 margin.
+    pub fn min_distance_invariance(&self) -> f64 {
+        0.8 * self.min_distance
+    }
+
+    /// Upper bound of the matchable distance range, with ORB-SLAM3's 1.2 margin.
+    pub fn max_distance_invariance(&self) -> f64 {
+        1.2 * self.max_distance
     }
 }
 
@@ -309,27 +365,42 @@ impl Map {
         }
     }
 
-    /// Inserts triangulated 3D points as map points and associates them to keyframes.
+    /// Inserts triangulated 3D points as map points and associates them to
+    /// keyframes.
     ///
-    /// For each entry, creates a `MapPoint` and associates it with `curr_kf`.
-    /// If `prev_kf` is provided, associates it there too.
-    /// Inserts triangulated 3D points as map points and associates them to keyframes.
-    ///
-    /// For each entry, creates a `MapPoint` and associates it with `curr_kf`.
-    /// If `prev_kf` is provided, associates it there too.
+    /// `curr_kf` becomes the reference keyframe for each new point's scale
+    /// geometry (matches ORB-SLAM3, which creates points referenced to the
+    /// newer keyframe). If `prev_kf` is provided, its observation is also
+    /// recorded. Mean viewing direction and scale-invariance bounds are
+    /// computed for every new point.
     pub fn add_triangulated_points(
         &mut self,
         prev_kf: Option<&mut Keyframe>,
         curr_kf: &mut Keyframe,
         points: &[TriangulatedPoint],
-        keyframe_idx: usize,
     ) -> usize {
         let first_mp_idx = self.map_points.len();
+        let curr_kf_idx = curr_kf.frame.idx;
         for (i, &(position, descriptor, color, _, curr_desc_idx)) in points.iter().enumerate() {
-            self.push_map_point(MapPoint::new(position, descriptor, color, keyframe_idx));
+            let octave = curr_kf
+                .frame
+                .features
+                .octaves
+                .get(curr_desc_idx)
+                .copied()
+                .unwrap_or(0);
+            let desc = curr_kf
+                .frame
+                .features
+                .descriptors
+                .get(curr_desc_idx)
+                .copied()
+                .unwrap_or(descriptor);
+            self.push_map_point(MapPoint::new(position, desc, octave, color, curr_kf_idx));
             curr_kf.associate_map_point(curr_desc_idx, first_mp_idx + i);
         }
         if let Some(prev) = prev_kf {
+            let prev_kf_idx = prev.frame.idx;
             for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().enumerate() {
                 prev.associate_map_point(prev_desc_idx, first_mp_idx + i);
                 // Feed the prev KF's descriptor as a second observation so the
@@ -337,22 +408,89 @@ impl Map {
                 if let Some(&prev_desc) = prev.frame.features.descriptors.get(prev_desc_idx)
                     && let Some(mp) = self.map_points.get_mut(first_mp_idx + i)
                 {
-                    mp.add_observation_descriptor(prev_desc);
+                    mp.add_observation_descriptor(prev_kf_idx, prev_desc);
                 }
             }
+        }
+        for i in 0..points.len() {
+            self.update_map_point_geometry(first_mp_idx + i, ORB_SCALE_FACTOR, ORB_N_LEVELS);
         }
         points.len()
     }
 
     /// Records that an existing map point was observed at `desc_idx` in
     /// `keyframe`, pushing the descriptor into the map point's observation
-    /// list and refreshing the representative.
+    /// list, refreshing the representative descriptor, and recomputing the
+    /// scale geometry.
     pub fn register_observation(&mut self, mp_idx: usize, keyframe: &Keyframe, desc_idx: usize) {
         let Some(&descriptor) = keyframe.frame.features.descriptors.get(desc_idx) else {
             return;
         };
+        let kf_idx = keyframe.frame.idx;
         if let Some(mp) = self.map_points.get_mut(mp_idx) {
-            mp.add_observation_descriptor(descriptor);
+            mp.add_observation_descriptor(kf_idx, descriptor);
+        }
+        self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    }
+
+    /// Recomputes the mean viewing direction and scale-invariance distance
+    /// bounds for one map point from its observing keyframes (ORB-SLAM3's
+    /// `MapPoint::UpdateNormalAndDepth`). No-op if the point is culled or its
+    /// reference keyframe is missing.
+    pub fn update_map_point_geometry(
+        &mut self,
+        mp_idx: usize,
+        scale_factor: f64,
+        n_levels: usize,
+    ) {
+        let (position, kf_indices, ref_kf_idx, ref_octave) = {
+            let Some(mp) = self.map_points.get(mp_idx) else {
+                return;
+            };
+            if mp.culled {
+                return;
+            }
+            (
+                mp.position,
+                mp.observation_kf_indices.clone(),
+                mp.keyframe_idx,
+                mp.reference_octave,
+            )
+        };
+
+        let mut normal = Vec3F64::ZERO;
+        let mut n = 0usize;
+        for kf_idx in &kf_indices {
+            if let Some(kf) = self.get_keyframe(*kf_idx) {
+                let cam_center = kf.frame.pose_world_to_cam.inverse().translation;
+                let dir = position - cam_center;
+                let len = dir.length();
+                if len > 1e-9 {
+                    normal = normal + dir / len;
+                    n += 1;
+                }
+            }
+        }
+
+        let Some(ref_kf) = self.get_keyframe(ref_kf_idx) else {
+            return;
+        };
+        let ref_center = ref_kf.frame.pose_world_to_cam.inverse().translation;
+        let dist = (position - ref_center).length();
+        let level_scale = scale_factor.powi(ref_octave as i32);
+        let max_dist = dist * level_scale;
+        let min_dist = if n_levels > 0 {
+            max_dist / scale_factor.powi(n_levels as i32 - 1)
+        } else {
+            max_dist
+        };
+
+        if let Some(mp) = self.map_points.get_mut(mp_idx) {
+            if n > 0 {
+                mp.mean_viewing_direction = normal / n as f64;
+            }
+            mp.max_distance = max_dist;
+            mp.min_distance = min_dist;
         }
     }
 
@@ -663,6 +801,22 @@ impl Map {
                 mp.position = ba_result.points[local_idx];
             }
         }
+        // Positions (and KF1's pose) moved: refresh scale geometry.
+        for &global_idx in &mp_global_indices {
+            self.update_map_point_geometry(global_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        }
+
+        // Diagnostics: sample one point's scale state for a sanity check.
+        if let Some(&sample) = mp_global_indices.first()
+            && let Some(mp) = self.map_points.get(sample)
+        {
+            let normal_len = mp.mean_viewing_direction.length();
+            let predicted = mp.predict_scale(depth_after.max(1e-6), ORB_SCALE_FACTOR, ORB_N_LEVELS);
+            eprintln!(
+                "[init_ba] scale_state[mp{sample}]: min_dist={:.3} max_dist={:.3} normal_len={:.3} predict_scale@median={predicted}",
+                mp.min_distance, mp.max_distance, normal_len,
+            );
+        }
 
         true
     }
@@ -759,6 +913,9 @@ impl Map {
                 mp.position = ba_result.points[local_idx];
             }
         }
+        for &global_idx in &mp_global_indices {
+            self.update_map_point_geometry(global_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        }
     }
 }
 
@@ -817,6 +974,10 @@ mod tests {
     use kornia_imgproc::features::OrbFeatures;
 
     fn test_frame(idx: usize, descriptors: Vec<[u8; 32]>) -> Frame {
+        test_frame_with_pose(idx, descriptors, Pose3d::IDENTITY)
+    }
+
+    fn test_frame_with_pose(idx: usize, descriptors: Vec<[u8; 32]>, pose: Pose3d) -> Frame {
         let n = descriptors.len();
         Frame {
             idx,
@@ -826,7 +987,7 @@ mod tests {
                 descriptors,
                 octaves: vec![0; n],
             },
-            pose_world_to_cam: Pose3d::IDENTITY,
+            pose_world_to_cam: pose,
             image_size: ImageSize {
                 width: 640,
                 height: 480,
@@ -864,7 +1025,7 @@ mod tests {
 
     #[test]
     fn map_point_new_sets_active_defaults() {
-        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], [0; 3], 5);
+        let mp = MapPoint::new(Vec3F64::new(1.0, 2.0, 3.0), [9u8; 32], 0, [0; 3], 5);
 
         assert_eq!(mp.position, Vec3F64::new(1.0, 2.0, 3.0));
         assert_eq!(mp.descriptor, [9u8; 32]);
@@ -876,7 +1037,7 @@ mod tests {
 
     #[test]
     fn map_point_tracking_helpers_work() {
-        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], [0; 3], 0);
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
         mp.n_visible = 10;
         mp.n_found = 4;
 
@@ -916,12 +1077,14 @@ mod tests {
         let first_idx = map.push_map_point(MapPoint::new(
             Vec3F64::new(0.0, 0.0, 1.0),
             [0u8; 32],
+            0,
             [0; 3],
             0,
         ));
         let second_idx = map.push_map_point(MapPoint::new(
             Vec3F64::new(1.0, 0.0, 1.0),
             [1u8; 32],
+            0,
             [0; 3],
             0,
         ));
@@ -938,12 +1101,14 @@ mod tests {
         let first_idx = map.push_map_point(MapPoint::new(
             Vec3F64::new(0.0, 0.0, 5.0),
             [0u8; 32],
+            0,
             [0; 3],
             0,
         ));
         let second_idx = map.push_map_point(MapPoint::new(
             Vec3F64::new(1.0, 0.0, 5.0),
             [1u8; 32],
+            0,
             [0; 3],
             0,
         ));
@@ -956,5 +1121,120 @@ mod tests {
 
         assert!(map.map_points()[first_idx].culled);
         assert!(!map.map_points()[second_idx].culled);
+    }
+
+    // ── Scale-invariance state (T1: deterministic, cross-checked vs ORB-SLAM3
+    //    formulas; ORB-SLAM3 itself not needed since these are closed-form). ──
+
+    /// T1a: `predict_scale` matches ORB-SLAM3's
+    /// `nScale = clamp(ceil(log(maxDist/dist) / log(scaleFactor)), 0, nLevels-1)`.
+    #[test]
+    fn predict_scale_matches_orbslam3_closed_form() {
+        let mut mp = MapPoint::new(Vec3F64::new(0.0, 0.0, 1.0), [0u8; 32], 0, [0; 3], 0);
+        mp.max_distance = 10.0;
+        let sf = ORB_SCALE_FACTOR;
+        let n = ORB_N_LEVELS;
+
+        for &dist in &[40.0_f64, 12.0, 10.0, 8.0, 3.7, 0.9, 0.01] {
+            let want = {
+                let ratio = mp.max_distance / dist;
+                let lvl = (ratio.ln() / sf.ln()).ceil();
+                if lvl.is_nan() || lvl < 0.0 {
+                    0
+                } else {
+                    (lvl as usize).min(n - 1)
+                }
+            };
+            assert_eq!(mp.predict_scale(dist, sf, n), want, "dist={dist}");
+        }
+
+        // Degenerate inputs return level 0.
+        assert_eq!(mp.predict_scale(0.0, sf, n), 0);
+        let mut unset = MapPoint::new(Vec3F64::ZERO, [0u8; 32], 0, [0; 3], 0);
+        unset.max_distance = 0.0;
+        assert_eq!(unset.predict_scale(5.0, sf, n), 0);
+    }
+
+    /// T1b: after `update_map_point_geometry`,
+    ///   max_distance == dist_to_ref_kf * scaleFactor^reference_octave
+    ///   max_distance / min_distance == scaleFactor^(n_levels - 1)
+    #[test]
+    fn scale_geometry_distance_invariants() {
+        let mut map = Map::new();
+        // Reference keyframe 0 at the world origin (identity pose => camera
+        // center at origin).
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
+
+        // Point referenced to KF 0, keypoint detected at octave 2, world (0,0,5).
+        let mp_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            2,
+            [0; 3],
+            0,
+        ));
+        map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+
+        let mp = &map.map_points()[mp_idx];
+        let expected_max = 5.0 * ORB_SCALE_FACTOR.powi(2);
+        assert!((mp.max_distance - expected_max).abs() < 1e-9);
+        assert!(
+            (mp.max_distance / mp.min_distance - ORB_SCALE_FACTOR.powi(ORB_N_LEVELS as i32 - 1))
+                .abs()
+                < 1e-9
+        );
+        // Margined bounds carry the 0.8 / 1.2 factors.
+        assert!((mp.min_distance_invariance() - 0.8 * mp.min_distance).abs() < 1e-12);
+        assert!((mp.max_distance_invariance() - 1.2 * mp.max_distance).abs() < 1e-12);
+    }
+
+    /// T1c: mean viewing direction is the average of unit (point - cam_center)
+    /// over observing keyframes; ‖normal‖ <= 1, and for a single forward-facing
+    /// observation it's exactly (point - cam_center) normalized.
+    #[test]
+    fn mean_viewing_direction_averages_observations() {
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
+
+        let mp_idx = map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        ));
+        map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+
+        // Single observation from the origin looking at (0,0,5): normal = +z.
+        let n0 = map.map_points()[mp_idx].mean_viewing_direction;
+        assert!(n0.x.abs() < 1e-9 && n0.y.abs() < 1e-9 && (n0.z - 1.0).abs() < 1e-9);
+
+        // Add a second keyframe translated along +x by 1 (world->cam pose has
+        // translation -1 along x, so camera center is at (1,0,0)).
+        let kf1 = Keyframe::from_frame(test_frame_with_pose(
+            1,
+            vec![[0u8; 32]],
+            Pose3d::new(
+                kornia_algebra::Mat3F64::IDENTITY,
+                Vec3F64::new(-1.0, 0.0, 0.0),
+            ),
+        ));
+        map.register_observation(mp_idx, &kf1, 0);
+        map.upsert_keyframe(kf1);
+        map.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+
+        let n = map.map_points()[mp_idx].mean_viewing_direction;
+        // Average of (0,0,1) and (point-(1,0,0)) normalized = (-1,0,5)/sqrt(26).
+        let d2 = Vec3F64::new(-1.0, 0.0, 5.0);
+        let d2n = d2 / d2.length();
+        let expected = Vec3F64::new(
+            (n0.x + d2n.x) / 2.0,
+            (n0.y + d2n.y) / 2.0,
+            (n0.z + d2n.z) / 2.0,
+        );
+        assert!((n.x - expected.x).abs() < 1e-9);
+        assert!((n.y - expected.y).abs() < 1e-9);
+        assert!((n.z - expected.z).abs() < 1e-9);
+        assert!(n.length() <= 1.0 + 1e-12);
     }
 }

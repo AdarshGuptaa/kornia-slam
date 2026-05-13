@@ -32,10 +32,15 @@ use super::pnp::{self, PnpConfig};
 use kornia_imgproc::features::{OrbMatchConfig, match_orb_descriptors};
 
 use crate::frame::Frame;
-use crate::map::{Map, MapPoint};
+use crate::map::{Map, MapPoint, ORB_N_LEVELS, ORB_SCALE_FACTOR};
 
 use super::Estimate;
 use keypoint_grid::KeypointGrid;
+
+/// Half-width of the pyramid-octave window for projection matching. ORB-SLAM3
+/// uses `[predicted-1, predicted]` (effectively half-width ~1, biased down);
+/// our ORB extractor's octave assignments are noisier, so we widen it.
+const OCTAVE_WINDOW_HALF_WIDTH: usize = 2;
 
 /// Tunable parameters for projection-guided matching.
 #[derive(Debug, Clone, Copy)]
@@ -161,6 +166,7 @@ impl MapProjectionEstimator {
                 &matches,
                 &curr_keypoints_undist,
                 &frame.features.descriptors,
+                &frame.features.octaves,
                 &grid,
                 frame.image_size,
                 camera,
@@ -232,6 +238,7 @@ impl MapProjectionEstimator {
         tracked_matches: &[(usize, usize)],
         curr_keypoints_undist: &[[f32; 2]],
         curr_descriptors: &[[u8; 32]],
+        curr_octaves: &[u8],
         grid: &KeypointGrid,
         image_size: ImageSize,
         camera: &PinholeCamera,
@@ -249,6 +256,7 @@ impl MapProjectionEstimator {
             &local_map_points,
             curr_keypoints_undist,
             curr_descriptors,
+            curr_octaves,
             grid,
             camera,
             pose_init,
@@ -346,6 +354,7 @@ impl MapProjectionEstimator {
             map_points,
             &keypoints_undist,
             &frame.features.descriptors,
+            &frame.features.octaves,
             &grid,
             camera,
             pose,
@@ -358,6 +367,7 @@ impl MapProjectionEstimator {
                 map_points,
                 &keypoints_undist,
                 &frame.features.descriptors,
+                &frame.features.octaves,
                 &grid,
                 camera,
                 pose,
@@ -378,6 +388,7 @@ impl MapProjectionEstimator {
         map_points: &[MapPoint],
         keypoints_xy: &[[f32; 2]],
         descriptors: &[[u8; 32]],
+        octaves: &[u8],
         grid: &KeypointGrid,
         camera: &PinholeCamera,
         pose_world_to_cam: &Pose3d,
@@ -386,6 +397,7 @@ impl MapProjectionEstimator {
     ) -> Vec<(usize, usize)> {
         let mut matched_kp = vec![false; keypoints_xy.len()];
         let mut matches = Vec::new();
+        let camera_center = pose_world_to_cam.inverse().translation;
 
         for (mp_idx, mp) in map_points.iter().enumerate() {
             if mp.culled {
@@ -399,6 +411,24 @@ impl MapProjectionEstimator {
             let u = pixel.x as f32;
             let v = pixel.y as f32;
 
+            // Scale-invariance gates (ORB-SLAM3, relaxed):
+            //  - distance gate: only match within [0.8*min, 1.2*max]
+            //  - octave gate: candidates must be near the predicted level
+            // Active once the point's scale geometry has been computed.
+            let octave_window = if mp.max_distance > 0.0 {
+                let dist = (mp.position - camera_center).length();
+                if dist < mp.min_distance_invariance() || dist > mp.max_distance_invariance() {
+                    continue;
+                }
+                let level = mp.predict_scale(dist, ORB_SCALE_FACTOR, ORB_N_LEVELS) as i32;
+                let half = OCTAVE_WINDOW_HALF_WIDTH as i32;
+                let lo = (level - half).max(0) as u8;
+                let hi = (level + half).min(ORB_N_LEVELS as i32 - 1) as u8;
+                Some((lo, hi))
+            } else {
+                None
+            };
+
             let candidates = grid.query_radius(u, v, config.search_radius, keypoints_xy);
             let mut best_dist = u32::MAX;
             let mut best_kp = usize::MAX;
@@ -406,6 +436,12 @@ impl MapProjectionEstimator {
             for kp_idx in candidates {
                 if matched_kp[kp_idx] {
                     continue;
+                }
+                if let Some((lo, hi)) = octave_window {
+                    let kp_octave = octaves.get(kp_idx).copied().unwrap_or(0);
+                    if kp_octave < lo || kp_octave > hi {
+                        continue;
+                    }
                 }
                 let dist = hamming_distance(&mp.descriptor, &descriptors[kp_idx]);
                 if dist < best_dist {
@@ -471,19 +507,17 @@ mod matching_tests {
         let camera = test_camera();
 
         let desc_a = [0u8; 32];
-        let map_points = vec![MapPoint {
-            position: Vec3F64::new(0.0, 0.0, 5.0),
-            descriptor: desc_a,
-            observed_descriptors: vec![desc_a],
-            color: [0; 3],
-            keyframe_idx: 0,
-            n_visible: 0,
-            n_found: 0,
-            culled: false,
-        }];
+        let map_points = vec![MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            desc_a,
+            0,
+            [0; 3],
+            0,
+        )];
 
         let keypoints_xy = vec![[320.0f32, 240.0], [100.0, 100.0]];
         let descriptors = vec![desc_a, [0xFF; 32]];
+        let octaves = vec![0u8, 0u8];
 
         let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);
         let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO);
@@ -492,6 +526,7 @@ mod matching_tests {
             &map_points,
             &keypoints_xy,
             &descriptors,
+            &octaves,
             &grid,
             &camera,
             &pose,
@@ -515,25 +550,24 @@ mod matching_tests {
         let estimator = make_test_estimator();
         let camera = test_camera();
 
-        let map_points = vec![MapPoint {
-            position: Vec3F64::new(0.0, 0.0, -5.0),
-            descriptor: [0u8; 32],
-            observed_descriptors: vec![[0u8; 32]],
-            color: [0; 3],
-            keyframe_idx: 0,
-            n_visible: 0,
-            n_found: 0,
-            culled: false,
-        }];
+        let map_points = vec![MapPoint::new(
+            Vec3F64::new(0.0, 0.0, -5.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        )];
 
         let keypoints_xy = vec![[320.0f32, 240.0]];
         let descriptors = vec![[0u8; 32]];
+        let octaves = vec![0u8];
         let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);
 
         let matches = estimator.match_by_projection(
             &map_points,
             &keypoints_xy,
             &descriptors,
+            &octaves,
             &grid,
             &camera,
             &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),
@@ -556,25 +590,24 @@ mod matching_tests {
         let estimator = make_test_estimator();
         let camera = test_camera();
 
-        let map_points = vec![MapPoint {
-            position: Vec3F64::new(0.0, 0.0, 5.0),
-            descriptor: [0u8; 32],
-            observed_descriptors: vec![[0u8; 32]],
-            color: [0; 3],
-            keyframe_idx: 0,
-            n_visible: 0,
-            n_found: 0,
-            culled: false,
-        }];
+        let map_points = vec![MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        )];
 
         let keypoints_xy = vec![[320.0f32, 240.0]];
         let descriptors = vec![[0xFF; 32]];
+        let octaves = vec![0u8];
         let grid = KeypointGrid::new(&keypoints_xy, 640.0, 480.0, 64.0);
 
         let matches = estimator.match_by_projection(
             &map_points,
             &keypoints_xy,
             &descriptors,
+            &octaves,
             &grid,
             &camera,
             &Pose3d::new(Mat3F64::IDENTITY, Vec3F64::ZERO),

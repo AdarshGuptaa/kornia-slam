@@ -236,13 +236,9 @@ impl Pipeline {
             triangulated.push((p_world, descriptor, color, ref_desc_idx, curr_desc_idx));
         }
 
-        let ref_idx = reference_kf.frame.idx;
-        let added = self.map.add_triangulated_points(
-            Some(&mut reference_kf),
-            &mut current_kf,
-            &triangulated,
-            ref_idx,
-        );
+        let added =
+            self.map
+                .add_triangulated_points(Some(&mut reference_kf), &mut current_kf, &triangulated);
 
         self.map.upsert_keyframe(reference_kf);
         self.map.upsert_keyframe(current_kf);
@@ -279,6 +275,13 @@ impl Pipeline {
             }
             Err(_) => (TrackingStatus::Skipped, Vec::new(), 0),
         };
+        eprintln!(
+            "[track] frame={} status={:?} matches={} inliers={}",
+            frame.idx,
+            status,
+            matches.len(),
+            tracked_inliers,
+        );
 
         if status == TrackingStatus::Tracked {
             let visible = self
@@ -483,8 +486,6 @@ impl Pipeline {
             ));
         }
 
-        let kf_idx = curr_kf.frame.idx;
-        self.map
-            .add_triangulated_points(None, curr_kf, &points, kf_idx)
+        self.map.add_triangulated_points(None, curr_kf, &points)
     }
 }
