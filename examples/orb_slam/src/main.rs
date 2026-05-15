@@ -147,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let result = system.process_frame(frame);
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
-        let map_point_count = system.num_map_points();
+        let map_point_count = system.num_active_map_points();
 
         // Status line.
         let status_line = format!(
@@ -167,7 +167,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let final_line = format!("Done. Final map: {} points", system.map_points().len());
-    eprintln!("{final_line}");
+    let total_pts = system.map_points().len();
+    let active_pts = system.map_points().iter().filter(|mp| !mp.culled).count();
+    let mut obs_total: usize = 0;
+    let mut obs_max: usize = 0;
+    for mp in system.map_points().iter().filter(|mp| !mp.culled) {
+        let n = mp.observation_kf_indices.len();
+        obs_total += n;
+        if n > obs_max { obs_max = n; }
+    }
+    let obs_mean = if active_pts > 0 { obs_total as f64 / active_pts as f64 } else { 0.0 };
+    eprintln!(
+        "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
+    );
     Ok(())
 }
