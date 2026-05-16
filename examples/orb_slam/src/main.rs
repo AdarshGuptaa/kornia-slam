@@ -100,25 +100,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let idx = args.start_frame + i;
 
-        // Load grayscale image and convert u8 → f32.
+        // Load grayscale image.
         let gray_u8 = read_image_png_mono8(&sample.image_path)?;
         let image_size = gray_u8.size();
-        let gray_f32 = {
-            let mut dst = kornia_image::Image::from_size_val(
-                image_size,
-                0.0f32,
-                kornia_tensor::CpuAllocator,
-            )?;
-            gray_u8
-                .as_slice()
-                .iter()
-                .zip(dst.as_slice_mut())
-                .for_each(|(&s, d)| *d = s as f32 / 255.0);
-            dst
-        };
 
         // Extract ORB features.
-        let features = detector.detect_and_extract(&gray_f32)?;
+        let features = detector.detect_and_extract_u8(&gray_u8)?;
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &gray_u8, &features.keypoints_xy);
         }
