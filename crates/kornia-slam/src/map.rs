@@ -756,6 +756,7 @@ impl Map {
                             point_idx,
                             pixel: [p.x as f32, p.y as f32],
                             fixed_pose: is_fixed,
+                            fixed_point: false,
                         });
                     }
                 }
@@ -898,6 +899,7 @@ impl Map {
                             point_idx,
                             pixel: [p.x as f32, p.y as f32],
                             fixed_pose: is_fixed,
+                            fixed_point: false,
                         });
                     }
                 }
