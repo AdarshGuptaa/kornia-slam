@@ -27,7 +27,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kornia_3d::ba::{self, BaObservation, BaParams};
+use kornia_3d::ba::{BaObservation, BaParams};
+use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
@@ -781,7 +782,7 @@ impl Map {
             ..BaParams::default()
         };
 
-        let ba_result = match ba::bundle_adjust(&poses, &points, &observations, camera, &params) {
+        let ba_result = match bundle_adjust_schur(&poses, &points, &observations, camera, &params) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[init_ba] bundle_adjust failed: {e}");
@@ -911,7 +912,7 @@ impl Map {
         }
 
         let ba_result =
-            match ba::bundle_adjust(&poses, &points, &observations, camera, &BaParams::default()) {
+            match bundle_adjust_schur(&poses, &points, &observations, camera, &BaParams::default()) {
                 Ok(r) => r,
                 Err(_) => return,
             };
