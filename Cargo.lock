@@ -4807,7 +4807,6 @@ dependencies = [
  "kornia-algebra",
  "kornia-image",
  "kornia-imgproc",
- "thiserror 2.0.18",
 ]
 
 [[package]]
