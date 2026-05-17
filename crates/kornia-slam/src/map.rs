@@ -519,11 +519,6 @@ impl Map {
         &mut self.map_points
     }
 
-    /// Returns a mutable reference to all keyframes.
-    pub fn keyframes_mut(&mut self) -> &mut Vec<Keyframe> {
-        &mut self.keyframes
-    }
-
     /// Returns indices of non-culled map points that project inside the image frustum.
     pub fn map_points_in_frustum(
         &self,

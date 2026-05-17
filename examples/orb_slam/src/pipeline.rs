@@ -73,11 +73,6 @@ impl Pipeline {
             .and_then(|ki| self.map.get_keyframe(ki).map(|kf| kf.frame.idx))
     }
 
-    /// Returns the total number of persistent map points (including culled).
-    pub fn num_map_points(&self) -> usize {
-        self.map.map_points().len()
-    }
-
     /// Returns the number of active (non-culled) map points.
     pub fn num_active_map_points(&self) -> usize {
         self.map.num_active_map_points()
