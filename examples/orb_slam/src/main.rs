@@ -11,6 +11,8 @@ mod config;
 #[path = "../../common/datasets/mod.rs"]
 mod datasets;
 mod pipeline;
+#[cfg(feature = "tui")]
+mod tui;
 mod utils;
 
 use config::PipelineConfig;
@@ -22,10 +24,11 @@ use pipeline::Pipeline;
 
 use datasets::EurocDataset;
 
+#[cfg(feature = "viz")]
 use utils::{
     log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
-    trajectory_point_from_pose,
 };
+use utils::trajectory_point_from_pose;
 
 /// CLI arguments.
 #[derive(argh::FromArgs)]
@@ -39,9 +42,15 @@ struct Args {
     #[argh(option, default = "0")]
     max_frames: usize,
 
-    /// spawn a Rerun viewer and stream to it
+    /// spawn a Rerun viewer and stream to it (requires `--features viz`)
     #[argh(switch)]
+    #[cfg(feature = "viz")]
     rerun_stream: bool,
+
+    /// render a terminal UI with a live BEV view (requires `--features tui`)
+    #[argh(switch)]
+    #[cfg(feature = "tui")]
+    tui: bool,
 
     /// skip this many initial frames
     #[argh(option, default = "0")]
@@ -50,6 +59,17 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
+
+    #[cfg(all(feature = "tui", feature = "viz"))]
+    if args.tui && args.rerun_stream {
+        eprintln!("--tui and --rerun-stream are mutually exclusive");
+        std::process::exit(2);
+    }
+
+    #[cfg(feature = "tui")]
+    let tui_active = args.tui;
+    #[cfg(not(feature = "tui"))]
+    let tui_active = false;
 
     // ── Dataset ────────────────────────────────────────────────────────────
     let dataset = EurocDataset::open(&args.data)?;
@@ -60,12 +80,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         samples.len() - args.start_frame
     };
-    eprintln!(
-        "Dataset: {} frames (processing {}..{})",
-        samples.len(),
-        args.start_frame,
-        args.start_frame + n_frames
-    );
+    if !tui_active {
+        eprintln!(
+            "Dataset: {} frames (processing {}..{})",
+            samples.len(),
+            args.start_frame,
+            args.start_frame + n_frames
+        );
+    }
 
     // ── Camera (from EuRoC cam0 sensor.yaml) ───────────────────────────────
     let camera = dataset.camera();
@@ -80,11 +102,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut system = Pipeline::new(camera.clone(), PipelineConfig::default());
 
     // ── Rerun ──────────────────────────────────────────────────────────────
+    #[cfg(feature = "viz")]
     let rec = if args.rerun_stream {
         let r = rerun::RecordingStreamBuilder::new("orb_slam").spawn()?;
         r.log("/", &rerun::ViewCoordinates::RIGHT_HAND_Y_DOWN())?;
         r.log("world/camera", &rerun::ViewCoordinates::RDF())?;
         Some(r)
+    } else {
+        None
+    };
+
+    // ── TUI ────────────────────────────────────────────────────────────────
+    #[cfg(feature = "tui")]
+    let mut tui_state = if args.tui {
+        let (term, guard) =
+            tui::setup_terminal(std::path::Path::new("tui_stderr.log"))?;
+        let app = tui::TuiApp::new(n_frames);
+        Some((term, app, guard))
     } else {
         None
     };
@@ -106,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Extract ORB features.
         let features = detector.detect_and_extract_u8(&gray_u8)?;
+        #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &gray_u8, &features.keypoints_xy);
         }
@@ -137,21 +172,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let map_point_count = system.num_active_map_points();
 
         // Status line.
-        let status_line = format!(
-            "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms",
-            result.status, keyframe_idx, map_point_count,
-        );
-        eprintln!("{status_line}");
+        if !tui_active {
+            let status_line = format!(
+                "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms",
+                result.status, keyframe_idx, map_point_count,
+            );
+            eprintln!("{status_line}");
+        }
 
         // Collect trajectory.
         trajectory.push(trajectory_point_from_pose(&result.pose_world_to_cam));
 
         // Rerun logging.
+        #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_trajectory_to_rerun(rec, &trajectory);
             log_camera_to_rerun(rec, &result.pose_world_to_cam, &camera, image_size);
             log_map_points_to_rerun(rec, system.map_points());
         }
+
+        // TUI render.
+        #[cfg(feature = "tui")]
+        if let Some((term, app, _guard)) = tui_state.as_mut() {
+            app.frame_idx = idx;
+            app.n_frames = n_frames;
+            app.frame_ms = frame_ms;
+            app.status = match result.status {
+                kornia_slam::TrackingStatus::Tracked => tui::TuiStatus::Tracked,
+                kornia_slam::TrackingStatus::KeyframeAccepted => {
+                    tui::TuiStatus::KeyframeAccepted
+                }
+                kornia_slam::TrackingStatus::Skipped => tui::TuiStatus::Skipped,
+            };
+            app.kf_idx = keyframe_idx;
+            app.n_active_mp = map_point_count;
+            let n_so_far = (i + 1) as f64;
+            app.mean_ms = app.mean_ms + (frame_ms - app.mean_ms) / n_so_far;
+            app.update_pose(&result.pose_world_to_cam);
+            app.draw(term)?;
+            if tui::poll_quit()? {
+                break;
+            }
+        }
+    }
+
+    // Restore terminal before printing the final summary.
+    // The StderrGuard's Drop restores stderr after the alternate screen leaves.
+    #[cfg(feature = "tui")]
+    if let Some((mut term, _, _guard)) = tui_state.take() {
+        tui::restore_terminal(&mut term)?;
     }
 
     let total_pts = system.map_points().len();
