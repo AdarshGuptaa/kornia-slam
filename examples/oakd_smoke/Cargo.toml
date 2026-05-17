@@ -1,0 +1,9 @@
+[package]
+name = "oakd_smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Smoke test: open an OAK-D, pull one mono frame, print dimensions."
+
+[dependencies]
+depthai = "0.1"
