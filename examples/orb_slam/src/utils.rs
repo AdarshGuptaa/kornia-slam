@@ -1,14 +1,21 @@
 //! Minimal Rerun visualization helpers for the ORB-SLAM example.
 
-use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+#[cfg(feature = "viz")]
+use kornia_3d::camera::PinholeCamera;
+#[cfg(feature = "viz")]
 use kornia_algebra::Mat3F64;
+#[cfg(feature = "viz")]
 use kornia_image::{Image, ImageSize};
+#[cfg(feature = "viz")]
 use kornia_slam::map::MapPoint;
+#[cfg(feature = "viz")]
 use kornia_tensor::CpuAllocator;
 
+#[cfg(feature = "viz")]
 const CAMERA_IMAGE_PLANE_DISTANCE: f32 = 0.15;
 
+#[cfg(feature = "viz")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CameraVisualizationSpec {
     translation: [f32; 3],
@@ -19,6 +26,7 @@ struct CameraVisualizationSpec {
     image_plane_distance: f32,
 }
 
+#[cfg(feature = "viz")]
 pub fn log_frame_to_rerun(
     rec: &rerun::RecordingStream,
     image: &Image<u8, 1, CpuAllocator>,
@@ -37,11 +45,13 @@ pub fn log_frame_to_rerun(
 }
 
 /// Convert feature keypoints to the point format expected by Rerun.
+#[cfg(feature = "viz")]
 pub fn keypoints_xy_to_rerun_points(keypoints_xy: &[[f32; 2]]) -> Vec<[f32; 2]> {
     keypoints_xy.to_vec()
 }
 
 /// Log the estimated trajectory as a growing 3D line strip.
+#[cfg(feature = "viz")]
 pub fn log_trajectory_to_rerun(rec: &rerun::RecordingStream, trajectory: &[[f32; 3]]) {
     if trajectory.len() >= 2 {
         rec.log("world/trajectory", &rerun::LineStrips3D::new([trajectory]))
@@ -50,6 +60,7 @@ pub fn log_trajectory_to_rerun(rec: &rerun::RecordingStream, trajectory: &[[f32;
 }
 
 /// Log the current camera frustum in world coordinates.
+#[cfg(feature = "viz")]
 pub fn log_camera_to_rerun(
     rec: &rerun::RecordingStream,
     pose_world_to_cam: &Pose3d,
@@ -76,6 +87,7 @@ pub fn log_camera_to_rerun(
 }
 
 /// Log active map points as a 3D point cloud.
+#[cfg(feature = "viz")]
 pub fn log_map_points_to_rerun(rec: &rerun::RecordingStream, map_points: &[MapPoint]) {
     let (positions, colors): (Vec<_>, Vec<_>) = map_points
         .iter()
@@ -112,6 +124,7 @@ pub fn trajectory_point_from_pose(pose_world_to_cam: &Pose3d) -> [f32; 3] {
     ]
 }
 
+#[cfg(feature = "viz")]
 fn camera_visualization_spec(
     pose_world_to_cam: &Pose3d,
     camera: &PinholeCamera,
@@ -131,6 +144,7 @@ fn camera_visualization_spec(
     }
 }
 
+#[cfg(feature = "viz")]
 fn quat_xyzw_from_matrix(r: &Mat3F64) -> (f64, f64, f64, f64) {
     let trace = r.x_axis.x + r.y_axis.y + r.z_axis.z;
 
@@ -168,8 +182,9 @@ fn quat_xyzw_from_matrix(r: &Mat3F64) -> (f64, f64, f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kornia_algebra::Vec3F64;
+    use kornia_algebra::{Mat3F64, Vec3F64};
 
+    #[cfg(feature = "viz")]
     #[test]
     fn keypoints_xy_to_rerun_points_preserves_xy_order() {
         let rerun_points = keypoints_xy_to_rerun_points(&[[10.0, 20.0], [30.5, 40.5]]);
@@ -185,6 +200,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "viz")]
     #[test]
     fn camera_visualization_spec_uses_camera_to_world_pose() {
         let pose_world_to_cam = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(1.0, -2.0, 3.0));
