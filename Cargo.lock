@@ -6777,28 +6777,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oakd_slam"
-version = "0.1.0"
-dependencies = [
- "argh",
- "depthai",
- "kornia-3d",
- "kornia-algebra",
- "kornia-image",
- "kornia-imgproc",
- "kornia-slam",
- "kornia-tensor",
- "rerun",
-]
-
-[[package]]
-name = "oakd_smoke"
-version = "0.1.0"
-dependencies = [
- "depthai",
-]
-
-[[package]]
 name = "objc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7343,6 +7321,7 @@ version = "0.1.0"
 dependencies = [
  "argh",
  "crossterm 0.28.1",
+ "depthai",
  "kornia-3d",
  "kornia-algebra",
  "kornia-image",
