@@ -30,6 +30,7 @@ mod pipeline;
 mod source;
 mod tui;
 mod utils;
+mod evaluation;
 
 use crate::datasets::euroc::GroundTruthPose;
 use config::PipelineConfig;
@@ -46,6 +47,7 @@ use utils::trajectory_point_from_pose;
 #[cfg(feature = "viz")]
 use utils::{
     log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
+    trajectory_point_from_pose,
 };
 
 /// CLI arguments.
@@ -362,16 +364,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Trajectory.
         trajectory.push(trajectory_point_from_pose(&result.pose_world_to_cam));
-        let p_est = trajectory_point_from_pose(&result.pose_world_to_cam);
 
-        if let Some(gt_pose) = associate_gt(sample.timestamp_sec, ground_truth) {
-            est_positions.push(Vec3F64::new(
-                p_est[0] as f64,
-                p_est[1] as f64,
-                p_est[2] as f64,
-            ));
-
-            gt_positions.push(Vec3F64::new(gt_pose.tx, gt_pose.ty, gt_pose.tz));
+        let est = trajectory_point_from_pose(&result.pose_world_to_cam);
+        let est_pos = Vec3F64::new(est[0] as f64, est[1] as f64, est[2] as f64);
+        est_positions.push(est_pos);
+        if let Some(gt) = associate_gt(sample.timestamp_sec, gt_slice) {
+            gt_positions.push(Vec3F64::new(gt.tx, gt.ty, gt.tz));
+        } else {
+            // No GT match — push a sentinel so lengths stay in sync.
+            // This shouldn't happen on a valid EuRoC sequence.
+            gt_positions.push(*est_positions.last().unwrap());
         }
 
         // Rerun logging.

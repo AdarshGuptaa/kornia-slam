@@ -5804,6 +5804,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "kornia-algebra"
+version = "0.1.12"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#2bb7680ec82ab624ddd22b68d8d51ed78cd8f00a"
+dependencies = [
+ "glam 0.30.10",
+ "nalgebra 0.32.6",
+ "rand 0.9.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "kornia-algebra"
+version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#b58152ed3d6045667a958ade768479dccbd7c0de"
+dependencies = [
+ "glam 0.30.10",
+ "nalgebra 0.32.6",
+ "rand 0.9.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kornia-image"
 version = "0.1.14"
 dependencies = [
