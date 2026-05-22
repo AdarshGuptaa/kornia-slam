@@ -1,46 +1,45 @@
-//! ORB-SLAM example with minimal Rerun visualization.
+//! Monocular ORB-SLAM example with a selectable frame source.
 //!
-//! Runs an ORB-based SLAM pipeline on EuRoC MAV images, extracting ORB features
-//! externally and feeding them to `process_frame`.
-//!
+//! Run on an offline EuRoC dataset:
 //! ```text
-//! cargo run --manifest-path examples/orb_slam/Cargo.toml -- --data /path/to/euroc/V1_01_easy
+//! cargo run --release -p orb_slam -- euroc --data /path/to/V1_01_easy
+//! ```
+//!
+//! Run live on an OAK-D camera (requires `--features oakd`):
+//! ```text
+//! cargo run --release -p orb_slam --features oakd -- oakd
 //! ```
 
 mod config;
 #[path = "../../common/datasets/mod.rs"]
 mod datasets;
 mod pipeline;
+#[path = "../../common/source/mod.rs"]
+mod source;
 #[cfg(feature = "tui")]
 mod tui;
 mod utils;
 
 use config::PipelineConfig;
 use kornia_3d::pose::Pose3d;
-use kornia_io::png::read_image_png_mono8;
 use kornia_slam::Frame;
-
 use pipeline::Pipeline;
-
-use datasets::EurocDataset;
+use source::{EurocSource, FrameItem, FrameSource};
+#[cfg(feature = "oakd")]
+use source::OakdSource;
+use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]
 use utils::{
     log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
 };
-use utils::trajectory_point_from_pose;
 
 /// CLI arguments.
 #[derive(argh::FromArgs)]
-#[argh(description = "Monocular visual odometry on EuRoC dataset")]
+#[argh(description = "Monocular ORB-SLAM (EuRoC dataset or live OAK-D)")]
 struct Args {
-    /// path to EuRoC dataset root (e.g. V1_01_easy/)
-    #[argh(option)]
-    data: String,
-
-    /// maximum number of frames to process (0 = all)
-    #[argh(option, default = "0")]
-    max_frames: usize,
+    #[argh(subcommand)]
+    source: SourceCmd,
 
     /// spawn a Rerun viewer and stream to it (requires `--features viz`)
     #[argh(switch)]
@@ -51,10 +50,53 @@ struct Args {
     #[argh(switch)]
     #[cfg(feature = "tui")]
     tui: bool,
+}
+
+#[derive(argh::FromArgs)]
+#[argh(subcommand)]
+enum SourceCmd {
+    Euroc(EurocCmd),
+    #[cfg(feature = "oakd")]
+    Oakd(OakdCmd),
+}
+
+/// Run on an EuRoC MAV dataset.
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "euroc")]
+struct EurocCmd {
+    /// path to EuRoC dataset root (e.g. V1_01_easy/)
+    #[argh(option)]
+    data: String,
+
+    /// maximum number of frames to process (0 = all)
+    #[argh(option, default = "0")]
+    max_frames: usize,
 
     /// skip this many initial frames
     #[argh(option, default = "0")]
     start_frame: usize,
+}
+
+/// Run live on an OAK-D camera (CamB mono).
+#[cfg(feature = "oakd")]
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "oakd")]
+struct OakdCmd {
+    /// maximum number of frames to process (0 = run forever, Ctrl-C to stop)
+    #[argh(option, default = "0")]
+    max_frames: usize,
+
+    /// frame width in pixels (depthai resizes the source to this)
+    #[argh(option, default = "640")]
+    width: u32,
+
+    /// frame height in pixels
+    #[argh(option, default = "400")]
+    height: u32,
+
+    /// camera FPS
+    #[argh(option, default = "30.0")]
+    fps: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -71,34 +113,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "tui"))]
     let tui_active = false;
 
-    // ── Dataset ────────────────────────────────────────────────────────────
-    let dataset = EurocDataset::open(&args.data)?;
-    let samples = dataset.samples();
-
-    let n_frames = if args.max_frames > 0 {
-        args.max_frames.min(samples.len() - args.start_frame)
-    } else {
-        samples.len() - args.start_frame
+    // ── Source ─────────────────────────────────────────────────────────────
+    let mut source: Box<dyn FrameSource> = match args.source {
+        SourceCmd::Euroc(e) => {
+            let src = EurocSource::open(&e.data, e.start_frame, e.max_frames)?;
+            if !tui_active {
+                let total = src.dataset_len();
+                let n = src.n_frames_hint().unwrap_or(0);
+                eprintln!(
+                    "Dataset: {total} frames (processing {}..{})",
+                    e.start_frame,
+                    e.start_frame + n,
+                );
+            }
+            Box::new(src)
+        }
+        #[cfg(feature = "oakd")]
+        SourceCmd::Oakd(o) => Box::new(OakdSource::open(o.width, o.height, o.fps, o.max_frames)?),
     };
-    if !tui_active {
-        eprintln!(
-            "Dataset: {} frames (processing {}..{})",
-            samples.len(),
-            args.start_frame,
-            args.start_frame + n_frames
-        );
-    }
 
-    // ── Camera (from EuRoC cam0 sensor.yaml) ───────────────────────────────
-    let camera = dataset.camera();
+    let camera = source.camera();
+    #[cfg(feature = "tui")]
+    let n_frames_hint = source.n_frames_hint();
 
-    // ── ORB detector (used externally before feeding Pipeline) ─────────────
+    // ── ORB detector ───────────────────────────────────────────────────────
     let detector = kornia_imgproc::features::OrbDetector {
         n_keypoints: 1000,
         ..Default::default()
     };
 
-    // ── SLAM config & system ───────────────────────────────────────────────
+    // ── SLAM system ────────────────────────────────────────────────────────
     let mut system = Pipeline::new(camera.clone(), PipelineConfig::default());
 
     // ── Rerun ──────────────────────────────────────────────────────────────
@@ -115,27 +159,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── TUI ────────────────────────────────────────────────────────────────
     #[cfg(feature = "tui")]
     let mut tui_state = if args.tui {
-        let (term, guard) =
-            tui::setup_terminal(std::path::Path::new("tui_stderr.log"))?;
-        let app = tui::TuiApp::new(n_frames);
+        let (term, guard) = tui::setup_terminal(std::path::Path::new("tui_stderr.log"))?;
+        let app = tui::TuiApp::new(n_frames_hint.unwrap_or(0));
         Some((term, app, guard))
     } else {
         None
     };
 
     // ── Main loop ──────────────────────────────────────────────────────────
-    let mut trajectory: Vec<[f32; 3]> = Vec::with_capacity(n_frames);
+    let mut trajectory: Vec<[f32; 3]> = Vec::new();
+    #[cfg(feature = "tui")]
+    let mut processed: usize = 0;
 
-    for (i, sample) in samples
-        .iter()
-        .skip(args.start_frame)
-        .take(n_frames)
-        .enumerate()
-    {
-        let idx = args.start_frame + i;
-
-        // Load grayscale image.
-        let gray_u8 = read_image_png_mono8(&sample.image_path)?;
+    while let Some(item) = source.next_frame()? {
+        let FrameItem {
+            idx,
+            timestamp_sec: _,
+            image: gray_u8,
+        } = item;
         let image_size = gray_u8.size();
 
         // Extract ORB features.
@@ -146,13 +187,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Sample pixel colors at each keypoint location.
+        let image_bytes = gray_u8.as_slice();
         let keypoint_colors: Vec<[u8; 3]> = features
             .keypoints_xy
             .iter()
             .map(|kp| {
                 let x = (kp[0] as usize).min(image_size.width.saturating_sub(1));
                 let y = (kp[1] as usize).min(image_size.height.saturating_sub(1));
-                let g = gray_u8.as_slice()[y * image_size.width + x];
+                let g = image_bytes[y * image_size.width + x];
                 [g, g, g]
             })
             .collect();
@@ -170,6 +212,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_active_map_points();
+        #[cfg(feature = "tui")]
+        {
+            processed += 1;
+        }
 
         // Status line.
         if !tui_active {
@@ -180,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("{status_line}");
         }
 
-        // Collect trajectory.
+        // Trajectory.
         trajectory.push(trajectory_point_from_pose(&result.pose_world_to_cam));
 
         // Rerun logging.
@@ -195,18 +241,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "tui")]
         if let Some((term, app, _guard)) = tui_state.as_mut() {
             app.frame_idx = idx;
-            app.n_frames = n_frames;
+            app.n_frames = n_frames_hint.unwrap_or(processed);
             app.frame_ms = frame_ms;
             app.status = match result.status {
                 kornia_slam::TrackingStatus::Tracked => tui::TuiStatus::Tracked,
-                kornia_slam::TrackingStatus::KeyframeAccepted => {
-                    tui::TuiStatus::KeyframeAccepted
-                }
+                kornia_slam::TrackingStatus::KeyframeAccepted => tui::TuiStatus::KeyframeAccepted,
                 kornia_slam::TrackingStatus::Skipped => tui::TuiStatus::Skipped,
             };
             app.kf_idx = keyframe_idx;
             app.n_active_mp = map_point_count;
-            let n_so_far = (i + 1) as f64;
+            let n_so_far = processed as f64;
             app.mean_ms = app.mean_ms + (frame_ms - app.mean_ms) / n_so_far;
             app.update_pose(&result.pose_world_to_cam);
             app.draw(term)?;
@@ -217,7 +261,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Restore terminal before printing the final summary.
-    // The StderrGuard's Drop restores stderr after the alternate screen leaves.
     #[cfg(feature = "tui")]
     if let Some((mut term, _, _guard)) = tui_state.take() {
         tui::restore_terminal(&mut term)?;
@@ -230,9 +273,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for mp in system.map_points().iter().filter(|mp| !mp.culled) {
         let n = mp.observation_kf_indices.len();
         obs_total += n;
-        if n > obs_max { obs_max = n; }
+        if n > obs_max {
+            obs_max = n;
+        }
     }
-    let obs_mean = if active_pts > 0 { obs_total as f64 / active_pts as f64 } else { 0.0 };
+    let obs_mean = if active_pts > 0 {
+        obs_total as f64 / active_pts as f64
+    } else {
+        0.0
+    };
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
