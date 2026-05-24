@@ -15,10 +15,11 @@ kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main" 
 kornia-io = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-tensor = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 rerun = { version = "0.29.2", optional = true }
-ratatui = { version = "0.29", optional = true, default-features = false, features = ["crossterm"] }
-crossterm = { version = "0.28", optional = true }
-libc = { version = "0.2", optional = true }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+libc = "0.2"
 depthai = { version = "0.1", optional = true }
+nokhwa = { version = "0.10", optional = true, default-features = false, features = ["input-native", "decoding"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
@@ -26,5 +27,5 @@ thiserror = "2"
 [features]
 default = ["viz"]
 viz = ["dep:rerun"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:libc"]
 oakd = ["dep:depthai"]
+webcam = ["dep:nokhwa"]

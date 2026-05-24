@@ -33,6 +33,11 @@ pub struct Pipeline {
     keyframe_policy: KeyframePolicy,
     // Enable local bundle adjustment after keyframe insertion
     enable_local_ba: bool,
+    // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
+    debug: bool,
+    // Buffered debug messages produced during the most recent process_frame call;
+    // drained by the caller (TUI panel or stderr).
+    debug_messages: Vec<String>,
     // Map object
     map: Map,
     // System state
@@ -48,6 +53,8 @@ impl Pipeline {
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
             enable_local_ba: config.enable_local_ba,
+            debug: config.debug,
+            debug_messages: Vec::new(),
             map: Map::new(),
             state: SystemState::new(),
         }
@@ -78,6 +85,25 @@ impl Pipeline {
         self.map.num_active_map_points()
     }
 
+    /// Drain any debug messages accumulated since the last call.
+    pub fn drain_debug_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.debug_messages)
+    }
+
+    /// Toggle whether the pipeline buffers per-frame debug messages.
+    pub fn set_debug(&mut self, on: bool) {
+        self.debug = on;
+        if !on {
+            self.debug_messages.clear();
+        }
+    }
+
+    fn dbg(&mut self, msg: String) {
+        if self.debug {
+            self.debug_messages.push(msg);
+        }
+    }
+
     fn bootstrap_step(&mut self, mut curr_frame: Frame) -> TrackingResult {
         // Stamp frames with current odometry pose so bootstrap builds
         // the new map in the existing coordinate frame.
@@ -89,6 +115,12 @@ impl Pipeline {
         // and wait for a feature-rich frame to start over.
         const MIN_KEYPOINTS_FOR_BOOTSTRAP: usize = 100;
         if curr_frame.features.keypoints_xy.len() <= MIN_KEYPOINTS_FOR_BOOTSTRAP {
+            self.dbg(format!(
+                "[bootstrap] frame={} skip: too few keypoints ({}, need > {})",
+                curr_frame.idx,
+                curr_frame.features.keypoints_xy.len(),
+                MIN_KEYPOINTS_FOR_BOOTSTRAP,
+            ));
             self.state.bootstrap_frame = None;
             return TrackingResult {
                 pose_world_to_cam: self.state.pose_world_to_cam,
@@ -97,6 +129,10 @@ impl Pipeline {
         }
 
         let Some(prev_bootstrap_frame) = self.state.bootstrap_frame.take() else {
+            self.dbg(format!(
+                "[bootstrap] frame={} stored as reference (awaiting second frame)",
+                curr_frame.idx,
+            ));
             self.state.bootstrap_frame = Some(curr_frame);
             return TrackingResult {
                 pose_world_to_cam: self.state.pose_world_to_cam,
@@ -113,7 +149,11 @@ impl Pipeline {
         );
 
         let two_view_estimate = match result {
-            Err(_) => {
+            Err(reason) => {
+                self.dbg(format!(
+                    "[bootstrap] frame={} (ref={}) reject: {:?}",
+                    curr_frame.idx, prev_bootstrap_frame.idx, reason,
+                ));
                 self.state.bootstrap_frame = Some(prev_bootstrap_frame);
                 return TrackingResult {
                     pose_world_to_cam: self.state.pose_world_to_cam,
@@ -123,12 +163,13 @@ impl Pipeline {
             Ok(tv) => tv,
         };
 
-        eprintln!(
-            "[bootstrap] model={} triangulated={} inliers={}",
+        self.dbg(format!(
+            "[bootstrap] frame={} accept: model={} triangulated={} inliers={}",
+            curr_frame.idx,
             two_view_estimate.model_kind,
             two_view_estimate.points3d.len(),
             two_view_estimate.estimate.inliers,
-        );
+        ));
 
         let estimated_pose = two_view_estimate.estimate.pose;
         let prev_pose_world_to_cam = curr_frame.pose_world_to_cam;
@@ -155,10 +196,10 @@ impl Pipeline {
         const MIN_VALID_POINTS: usize = 50;
         let health = self.map.initial_map_health();
         if health.valid_in_both < MIN_VALID_POINTS || health.median_depth_older_kf <= 0.0 {
-            eprintln!(
+            self.dbg(format!(
                 "[init_gate] reject: valid_in_both={} median_depth={:.3} (need >= {} and > 0)",
                 health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
-            );
+            ));
             self.map.clear_active();
             self.state.reset();
             return TrackingResult {
@@ -267,21 +308,31 @@ impl Pipeline {
             self.state.current_keyframe_idx,
         );
 
-        let (mut status, matches, tracked_inliers) = match result {
+        let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
                 self.state.velocity = Some(Pose3d::between(&pose_before_tracking, &estimate.pose));
                 self.state.pose_world_to_cam = estimate.pose;
-                (TrackingStatus::Tracked, estimate.matches, estimate.inliers)
+                (
+                    TrackingStatus::Tracked,
+                    estimate.matches,
+                    estimate.inliers,
+                    None,
+                )
             }
-            Err(_) => (TrackingStatus::Skipped, Vec::new(), 0),
+            Err(reason) => (TrackingStatus::Skipped, Vec::new(), 0, Some(reason)),
         };
-        eprintln!(
-            "[track] frame={} status={:?} matches={} inliers={}",
-            frame.idx,
-            status,
-            matches.len(),
-            tracked_inliers,
-        );
+        if self.debug {
+            let msg = match reject_reason {
+                Some(reason) => format!("[track] frame={} reject: {:?}", frame.idx, reason),
+                None => format!(
+                    "[track] frame={} ok: matches={} inliers={}",
+                    frame.idx,
+                    matches.len(),
+                    tracked_inliers,
+                ),
+            };
+            self.debug_messages.push(msg);
+        }
 
         if status == TrackingStatus::Tracked {
             let visible = self
@@ -383,12 +434,12 @@ impl Pipeline {
                 &triangulation_config,
             );
         }
-        eprintln!(
+        self.dbg(format!(
             "[kf] frame={} grown={} from {} neighbor kfs",
             frame.idx,
             total_grown,
             neighbor_kfs.len()
-        );
+        ));
 
         self.map.upsert_keyframe(curr_kf);
         self.state.current_keyframe_idx = Some(frame.idx);
@@ -400,7 +451,7 @@ impl Pipeline {
         let neighbor_kf_indices: Vec<usize> =
             neighbor_kfs.iter().map(|kf| kf.frame.idx).collect();
         let n_fused = self.fuse_into_neighbors(frame.idx, &neighbor_kf_indices);
-        eprintln!("[fuse] frame={} fused={}", frame.idx, n_fused);
+        self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
 
         if enable_local_ba {
             self.map.run_local_ba(&self.camera);
