@@ -8,6 +8,9 @@ pub struct PipelineConfig {
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
     pub enable_local_ba: bool,
+    /// Emit per-frame diagnostics: skip reasons in bootstrap, reject reasons
+    /// in tracking, keyframe-growth and fuse counters.
+    pub debug: bool,
 }
 
 impl Default for PipelineConfig {
@@ -21,6 +24,7 @@ impl Default for PipelineConfig {
             map_projection: MapProjectionConfig::default(),
             keyframe_policy: KeyframePolicy::default(),
             enable_local_ba: true,
+            debug: false,
         }
     }
 }

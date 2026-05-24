@@ -9,6 +9,13 @@
 //! ```text
 //! cargo run --release -p orb_slam --features oakd -- oakd
 //! ```
+//!
+//! Run live on a UVC camera (built-in webcam, USB cam, etc.; requires
+//! `--features uvc`):
+//! ```text
+//! cargo run --release -p orb_slam --features uvc -- uvc \
+//!     --fx 600 --fy 600 --cx 320 --cy 240
+//! ```
 
 mod config;
 #[path = "../../common/datasets/mod.rs"]
@@ -16,7 +23,6 @@ mod datasets;
 mod pipeline;
 #[path = "../../common/source/mod.rs"]
 mod source;
-#[cfg(feature = "tui")]
 mod tui;
 mod utils;
 
@@ -27,6 +33,8 @@ use pipeline::Pipeline;
 use source::{EurocSource, FrameItem, FrameSource};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
+#[cfg(feature = "uvc")]
+use source::UvcSource;
 use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]
@@ -46,10 +54,14 @@ struct Args {
     #[cfg(feature = "viz")]
     rerun_stream: bool,
 
-    /// render a terminal UI with a live BEV view (requires `--features tui`)
+    /// disable the terminal UI (status lines stream to stderr instead)
     #[argh(switch)]
-    #[cfg(feature = "tui")]
-    tui: bool,
+    no_tui: bool,
+
+    /// print per-frame diagnostics: bootstrap skip/reject reasons,
+    /// map-projection reject reasons, keyframe growth and fuse counters
+    #[argh(switch)]
+    debug: bool,
 }
 
 #[derive(argh::FromArgs)]
@@ -58,6 +70,8 @@ enum SourceCmd {
     Euroc(EurocCmd),
     #[cfg(feature = "oakd")]
     Oakd(OakdCmd),
+    #[cfg(feature = "uvc")]
+    Uvc(UvcCmd),
 }
 
 /// Run on an EuRoC MAV dataset.
@@ -99,19 +113,72 @@ struct OakdCmd {
     fps: f32,
 }
 
+/// Run live on a UVC camera (laptop webcam, USB cam, CSI-to-UVC adapter…),
+/// using V4L2 / AVFoundation / MSMF via nokhwa.
+///
+/// Intrinsics flags must match the resolution the device actually streams at
+/// — nokhwa may pick the closest supported mode if the exact one is missing.
+#[cfg(feature = "uvc")]
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "uvc")]
+struct UvcCmd {
+    /// camera device index (0 = first camera)
+    #[argh(option, default = "0")]
+    index: u32,
+
+    /// frame width in pixels
+    #[argh(option, default = "640")]
+    width: u32,
+
+    /// frame height in pixels
+    #[argh(option, default = "480")]
+    height: u32,
+
+    /// maximum number of frames to process (0 = run forever, Ctrl-C to stop)
+    #[argh(option, default = "0")]
+    max_frames: usize,
+
+    /// focal length x (pixels)
+    #[argh(option)]
+    fx: f64,
+
+    /// focal length y (pixels)
+    #[argh(option)]
+    fy: f64,
+
+    /// principal point x (pixels)
+    #[argh(option)]
+    cx: f64,
+
+    /// principal point y (pixels)
+    #[argh(option)]
+    cy: f64,
+
+    /// radial distortion k1
+    #[argh(option, default = "0.0")]
+    k1: f64,
+
+    /// radial distortion k2
+    #[argh(option, default = "0.0")]
+    k2: f64,
+
+    /// tangential distortion p1
+    #[argh(option, default = "0.0")]
+    p1: f64,
+
+    /// tangential distortion p2
+    #[argh(option, default = "0.0")]
+    p2: f64,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
-    #[cfg(all(feature = "tui", feature = "viz"))]
-    if args.tui && args.rerun_stream {
-        eprintln!("--tui and --rerun-stream are mutually exclusive");
-        std::process::exit(2);
-    }
-
-    #[cfg(feature = "tui")]
-    let tui_active = args.tui;
-    #[cfg(not(feature = "tui"))]
-    let tui_active = false;
+    // TUI is the default; --rerun-stream or --no-tui falls back to plain stderr.
+    #[cfg(feature = "viz")]
+    let tui_active = !args.no_tui && !args.rerun_stream;
+    #[cfg(not(feature = "viz"))]
+    let tui_active = !args.no_tui;
 
     // ── Source ─────────────────────────────────────────────────────────────
     let mut source: Box<dyn FrameSource> = match args.source {
@@ -130,10 +197,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(feature = "oakd")]
         SourceCmd::Oakd(o) => Box::new(OakdSource::open(o.width, o.height, o.fps, o.max_frames)?),
+        #[cfg(feature = "uvc")]
+        SourceCmd::Uvc(w) => {
+            let camera = kornia_3d::camera::PinholeCamera {
+                fx: w.fx,
+                fy: w.fy,
+                cx: w.cx,
+                cy: w.cy,
+                k1: w.k1,
+                k2: w.k2,
+                p1: w.p1,
+                p2: w.p2,
+            };
+            Box::new(UvcSource::open(
+                w.index,
+                w.width,
+                w.height,
+                camera,
+                w.max_frames,
+            )?)
+        }
     };
 
     let camera = source.camera();
-    #[cfg(feature = "tui")]
     let n_frames_hint = source.n_frames_hint();
 
     // ── ORB detector ───────────────────────────────────────────────────────
@@ -143,7 +229,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ── SLAM system ────────────────────────────────────────────────────────
-    let mut system = Pipeline::new(camera.clone(), PipelineConfig::default());
+    let pipeline_config = PipelineConfig {
+        debug: args.debug,
+        ..PipelineConfig::default()
+    };
+    let mut system = Pipeline::new(camera.clone(), pipeline_config);
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     #[cfg(feature = "viz")]
@@ -157,10 +247,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // ── TUI ────────────────────────────────────────────────────────────────
-    #[cfg(feature = "tui")]
-    let mut tui_state = if args.tui {
+    let mut tui_state = if tui_active {
         let (term, guard) = tui::setup_terminal(std::path::Path::new("tui_stderr.log"))?;
-        let app = tui::TuiApp::new(n_frames_hint.unwrap_or(0));
+        let mut app = tui::TuiApp::new(n_frames_hint.unwrap_or(0));
+        app.debug_enabled = args.debug;
         Some((term, app, guard))
     } else {
         None
@@ -168,7 +258,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
-    #[cfg(feature = "tui")]
     let mut processed: usize = 0;
 
     while let Some(item) = source.next_frame()? {
@@ -212,13 +301,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let keyframe_idx = system.current_keyframe_idx().unwrap_or(idx);
         let map_point_count = system.num_active_map_points();
-        #[cfg(feature = "tui")]
-        {
-            processed += 1;
-        }
+        let debug_msgs = system.drain_debug_messages();
+        processed += 1;
 
         // Status line.
         if !tui_active {
+            for line in &debug_msgs {
+                eprintln!("{line}");
+            }
             let status_line = format!(
                 "[{idx:>5}] {:?}  kf={:<4} pts={:<5} {frame_ms:>6.1}ms",
                 result.status, keyframe_idx, map_point_count,
@@ -238,8 +328,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // TUI render.
-        #[cfg(feature = "tui")]
         if let Some((term, app, _guard)) = tui_state.as_mut() {
+            for line in debug_msgs {
+                app.push_debug_line(line);
+            }
             app.frame_idx = idx;
             app.n_frames = n_frames_hint.unwrap_or(processed);
             app.frame_ms = frame_ms;
@@ -254,14 +346,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.mean_ms = app.mean_ms + (frame_ms - app.mean_ms) / n_so_far;
             app.update_pose(&result.pose_world_to_cam);
             app.draw(term)?;
-            if tui::poll_quit()? {
-                break;
+            match tui::poll_action()? {
+                tui::TuiAction::Quit => break,
+                tui::TuiAction::ToggleDebug => {
+                    app.debug_enabled = !app.debug_enabled;
+                    system.set_debug(app.debug_enabled);
+                }
+                tui::TuiAction::None => {}
             }
         }
     }
 
     // Restore terminal before printing the final summary.
-    #[cfg(feature = "tui")]
     if let Some((mut term, _, _guard)) = tui_state.take() {
         tui::restore_terminal(&mut term)?;
     }

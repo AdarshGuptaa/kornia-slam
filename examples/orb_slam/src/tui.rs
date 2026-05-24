@@ -6,6 +6,7 @@
 //!   * bird's-eye view of the trajectory + camera heading (X right, Z forward,
 //!     Y-down gravity dropped)
 
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -42,6 +43,9 @@ const C_KEYFRAME: Color = Color::Rgb(255, 110, 220);
 const C_SKIPPED: Color = Color::Rgb(220, 180, 60);
 const C_KEY: Color = Color::Rgb(255, 215, 60);
 const C_SYS: Color = Color::Rgb(200, 160, 240);
+const C_DEBUG: Color = Color::Rgb(170, 200, 170);
+
+const DEBUG_LOG_CAPACITY: usize = 200;
 
 /// Tracking status, mirrored from `kornia_slam::TrackingStatus` so the TUI
 /// module doesn't import library types in its widget code.
@@ -266,6 +270,10 @@ pub struct TuiApp {
     pub frame_ms: f64,
     pub mean_ms: f64,
     sys: SysStatsSampler,
+    /// When true, render the debug log panel.
+    pub debug_enabled: bool,
+    /// Rolling ring of recent debug messages from the SLAM pipeline.
+    debug_lines: VecDeque<String>,
 }
 
 impl TuiApp {
@@ -287,7 +295,16 @@ impl TuiApp {
             frame_ms: 0.0,
             mean_ms: 0.0,
             sys: SysStatsSampler::default(),
+            debug_enabled: false,
+            debug_lines: VecDeque::with_capacity(DEBUG_LOG_CAPACITY),
         }
+    }
+
+    pub fn push_debug_line(&mut self, line: String) {
+        if self.debug_lines.len() == DEBUG_LOG_CAPACITY {
+            self.debug_lines.pop_front();
+        }
+        self.debug_lines.push_back(line);
     }
 
     /// Update from the latest world-to-camera pose.
@@ -324,23 +341,53 @@ impl TuiApp {
 
     pub fn draw(&mut self, terminal: &mut Tui) -> io::Result<()> {
         let sys = self.sys.sample();
+        let debug_enabled = self.debug_enabled;
         terminal.draw(|frame| {
-            let chunks = Layout::vertical([
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
+            let mut constraints = vec![
+                Constraint::Length(3), // header
+                Constraint::Min(0),    // BEV
+                Constraint::Length(3), // camera
+                Constraint::Length(3), // system
+            ];
+            if debug_enabled {
+                constraints.push(Constraint::Length(10)); // debug log
+            }
+            constraints.push(Constraint::Length(1)); // hint
+            let chunks = Layout::vertical(constraints).split(frame.area());
 
             frame.render_widget(self.header(), chunks[0]);
             self.render_bev(frame, chunks[1]);
             frame.render_widget(self.camera_panel(), chunks[2]);
             frame.render_widget(sys_panel(sys), chunks[3]);
-            frame.render_widget(self.hint(), chunks[4]);
+            if debug_enabled {
+                frame.render_widget(self.debug_panel(), chunks[4]);
+                frame.render_widget(self.hint(), chunks[5]);
+            } else {
+                frame.render_widget(self.hint(), chunks[4]);
+            }
         })?;
         Ok(())
+    }
+
+    fn debug_panel(&self) -> Paragraph<'_> {
+        let style = Style::default().fg(C_DEBUG);
+        let lines: Vec<Line> = self
+            .debug_lines
+            .iter()
+            .rev()
+            .take(8)
+            .rev()
+            .map(|s| Line::from(Span::styled(s.as_str(), style)))
+            .collect();
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(C_BORDER))
+                .title(Span::styled(
+                    " debug ",
+                    Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
+                )),
+        )
     }
 
     fn header(&self) -> Paragraph<'_> {
@@ -485,7 +532,9 @@ impl TuiApp {
             Span::styled("Esc", key),
             Span::styled(" quit  ", lbl),
             Span::styled("Ctrl-C", key),
-            Span::styled(" quit", lbl),
+            Span::styled(" quit  ", lbl),
+            Span::styled("d", key),
+            Span::styled(" toggle debug", lbl),
         ]))
     }
 
@@ -582,17 +631,30 @@ fn sys_panel(s: SysStats) -> Paragraph<'static> {
     )
 }
 
-/// Non-blocking poll: returns true if the user pressed q / Esc / Ctrl-C.
-pub fn poll_quit() -> io::Result<bool> {
+#[derive(Clone, Copy)]
+pub enum TuiAction {
+    None,
+    Quit,
+    ToggleDebug,
+}
+
+/// Non-blocking poll for a single keypress.
+pub fn poll_action() -> io::Result<TuiAction> {
     if event::poll(Duration::from_millis(0))? {
         if let Event::Key(KeyEvent {
             code, modifiers, ..
         }) = event::read()?
         {
-            return Ok(matches!(code, KeyCode::Char('q') | KeyCode::Esc)
+            if matches!(code, KeyCode::Char('q') | KeyCode::Esc)
                 || (modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(code, KeyCode::Char('c'))));
+                    && matches!(code, KeyCode::Char('c')))
+            {
+                return Ok(TuiAction::Quit);
+            }
+            if matches!(code, KeyCode::Char('d')) {
+                return Ok(TuiAction::ToggleDebug);
+            }
         }
     }
-    Ok(false)
+    Ok(TuiAction::None)
 }

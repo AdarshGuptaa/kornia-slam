@@ -15,6 +15,7 @@
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel};
+pub use kornia_3d::pose::TwoViewError;
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptors};
 
@@ -67,12 +68,14 @@ impl Default for TwoViewInitConfig {
 }
 
 /// Two-view initialization rejection reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub enum TwoViewRejectReason {
     /// Not enough descriptor matches to run two-view estimation.
     LowMatches,
-    /// Two-view estimation failed.
-    EstimationFailed,
+    /// Two-view estimation failed; the wrapped error carries the specific
+    /// cause (RANSAC failure, ambiguous cheirality from pure rotation /
+    /// planar / low-parallax motion, solver error, …).
+    EstimationFailed(TwoViewError),
     /// Too few triangulated points.
     LowTriangulated,
     /// Too few inliers in estimated model.
@@ -130,7 +133,7 @@ pub fn try_initialize_two_view(
         .build();
     let result = estimator
         .estimate(&reference_pts, &current_pts, &k, &k)
-        .map_err(|_| TwoViewRejectReason::EstimationFailed)?;
+        .map_err(TwoViewRejectReason::EstimationFailed)?;
 
     let model_kind = match result.model {
         TwoViewModel::Homography(_) => 'H',

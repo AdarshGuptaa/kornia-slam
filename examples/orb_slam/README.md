@@ -1,6 +1,6 @@
 # ORB-SLAM Example
 
-This package is the current runnable slice of `kornia-slam`: a monocular ORB-based SLAM pipeline with two interchangeable frame sources — offline EuRoC MAV image sequences and a live OAK-D mono camera. Both feed the same `process_frame` orchestrator, and TUI / Rerun work for both.
+This package is the current runnable slice of `kornia-slam`: a monocular ORB-based SLAM pipeline with three interchangeable frame sources — offline EuRoC MAV image sequences, a live OAK-D mono camera, and any UVC-class camera (laptop webcams, USB cams, CSI-to-UVC adapters on a Pi…). All three feed the same `process_frame` orchestrator, and the TUI / Rerun visualizers work for any of them.
 
 ## Frame sources
 
@@ -9,9 +9,10 @@ Selectable via subcommand:
 ```text
 orb_slam euroc --data /path/to/V1_01_easy [--start-frame N] [--max-frames N]
 orb_slam oakd  [--width 640 --height 400 --fps 30] [--max-frames N]
+orb_slam uvc   --fx F --fy F --cx C --cy C [--index 0] [--width 640 --height 480] [--max-frames N]
 ```
 
-`oakd` requires `--features oakd`; the default build needs no extra system dependencies.
+`oakd` requires `--features oakd`; `uvc` requires `--features uvc`. The default build needs no extra system dependencies.
 
 ## EuRoC dataset
 
@@ -68,20 +69,31 @@ at cargo invocation time when building with both `viz` and `oakd`.
 ```bash
 # Live, with Rerun visualization:
 RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" \
-  cargo run --release -p orb_slam --features oakd -- oakd --rerun-stream
+  cargo run --release -p orb_slam --features oakd -- --rerun-stream oakd
 
 # Live, TUI only (no Rerun, no lz4 clash):
-cargo run --release -p orb_slam --no-default-features --features "oakd tui" -- oakd --tui
+cargo run --release -p orb_slam --no-default-features --features oakd -- oakd
 ```
 
 Intrinsics are placeholder (rough scale of the OAK-D Pro factory fx/fy at 1280×800); reading the on-device factory calibration is a TODO.
 
+## UVC camera
+
+Any UVC-class device works (built-in laptop webcam, USB camera, CSI-to-UVC adapter on a Raspberry Pi). Unlike EuRoC and OAK-D, there's no on-device calibration, so you must pass intrinsics on the command line — they have to match the resolution the device actually streams at (nokhwa picks the closest supported mode if the exact one is missing).
+
+```bash
+# /dev/video0 at 640x480, rough pinhole calibration:
+cargo run --release -p orb_slam --features uvc -- \
+    uvc --index 0 --fx 600 --fy 600 --cx 320 --cy 240
+```
+
 ## Visualizers
 
-Mutually exclusive flags (apply to either source):
+The TUI is the default — just run the example. Override with one of:
 
-- `--rerun-stream` — spawn a Rerun viewer and stream image / keypoints / trajectory / camera / map points (requires `--features viz`, default on).
-- `--tui` — render a terminal UI with live status + bird's-eye view (requires `--features tui`).
+- `--rerun-stream` — spawn a Rerun viewer and stream image / keypoints / trajectory / camera / map points (requires `--features viz`, default on). Disables the TUI.
+- `--no-tui` — fall back to plain stderr status lines (no TUI, no Rerun).
+- `--debug` — show the debug panel inside the TUI (or extra diagnostic lines on stderr in `--no-tui` mode). Toggle live with the `d` key while the TUI is running.
 
 ## Local checks
 
