@@ -1,11 +1,13 @@
-//! Live UVC/V4L2 webcam as a [`FrameSource`].
+//! Live UVC camera as a [`FrameSource`].
 //!
 //! Uses [`nokhwa`] for cross-platform capture (V4L2 on Linux, AVFoundation on
-//! macOS, MSMF on Windows). Frames are decoded to grayscale `Image<u8, 1>` and
-//! fed through the same `process_frame` orchestrator as the EuRoC dataset.
+//! macOS, MSMF on Windows). Any UVC-class device works — built-in laptop
+//! webcams, USB cameras, CSI-to-UVC adapters on a Raspberry Pi, etc. Frames
+//! are decoded to grayscale `Image<u8, 1>` and fed through the same
+//! `process_frame` orchestrator as the EuRoC dataset.
 //!
 //! Intrinsics are supplied by the caller (CLI flags). They must match the
-//! webcam's *resolution at capture time* — if you calibrated at 1280×720, ask
+//! device's *resolution at capture time* — if you calibrated at 1280×720, ask
 //! for that resolution here too.
 
 use std::time::Instant;
@@ -36,8 +38,8 @@ fn try_open(
 
 use super::{FrameItem, FrameSource, SourceError};
 
-/// Live webcam frame source.
-pub struct WebcamSource {
+/// Live UVC frame source.
+pub struct UvcSource {
     camera_dev: Camera,
     image_size: ImageSize,
     camera: PinholeCamera,
@@ -46,8 +48,8 @@ pub struct WebcamSource {
     start: Instant,
 }
 
-impl WebcamSource {
-    /// Open the webcam at `index` and request the closest format to
+impl UvcSource {
+    /// Open the UVC device at `index` and request the closest format to
     /// `width × height` (decoding will produce Y8 grayscale regardless of the
     /// device's native pixel format).
     ///
@@ -59,11 +61,11 @@ impl WebcamSource {
         camera: PinholeCamera,
         max_frames: usize,
     ) -> Result<Self, SourceError> {
-        eprintln!("[webcam] opening camera index {index}…");
+        eprintln!("[uvc] opening camera index {index}…");
 
         let mut camera_dev = try_open(index, width, height, FrameFormat::MJPEG).or_else(
             |first_err| {
-                eprintln!("[webcam] MJPEG open failed ({first_err}); trying YUYV…");
+                eprintln!("[uvc] MJPEG open failed ({first_err}); trying YUYV…");
                 try_open(index, width, height, FrameFormat::YUYV)
             },
         )?;
@@ -78,7 +80,7 @@ impl WebcamSource {
 
         if actual.width() != width || actual.height() != height {
             eprintln!(
-                "[webcam] requested {width}x{height}, device selected {}x{} — \
+                "[uvc] requested {width}x{height}, device selected {}x{} — \
                  intrinsics must match the selected resolution",
                 actual.width(),
                 actual.height(),
@@ -86,7 +88,7 @@ impl WebcamSource {
         }
 
         eprintln!(
-            "[webcam] streaming {}x{} @ ~{} fps  fx={:.2} fy={:.2} cx={:.2} cy={:.2}",
+            "[uvc] streaming {}x{} @ ~{} fps  fx={:.2} fy={:.2} cx={:.2} cy={:.2}",
             actual.width(),
             actual.height(),
             camera_dev.frame_rate(),
@@ -107,7 +109,7 @@ impl WebcamSource {
     }
 }
 
-impl FrameSource for WebcamSource {
+impl FrameSource for UvcSource {
     fn camera(&self) -> PinholeCamera {
         self.camera.clone()
     }
@@ -133,7 +135,7 @@ impl FrameSource for WebcamSource {
         let expected = self.image_size.width * self.image_size.height;
         if bytes.len() != expected {
             return Err(SourceError::other(format!(
-                "webcam decoded payload {} bytes (want {expected})",
+                "uvc decoded payload {} bytes (want {expected})",
                 bytes.len(),
             )));
         }

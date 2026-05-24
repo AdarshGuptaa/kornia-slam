@@ -7,8 +7,8 @@
 pub mod euroc;
 #[cfg(feature = "oakd")]
 pub mod oakd;
-#[cfg(feature = "webcam")]
-pub mod webcam;
+#[cfg(feature = "uvc")]
+pub mod uvc;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::Image;
@@ -17,8 +17,8 @@ use kornia_tensor::CpuAllocator;
 pub use euroc::EurocSource;
 #[cfg(feature = "oakd")]
 pub use oakd::OakdSource;
-#[cfg(feature = "webcam")]
-pub use webcam::WebcamSource;
+#[cfg(feature = "uvc")]
+pub use uvc::UvcSource;
 
 /// One frame yielded by a source.
 pub struct FrameItem {

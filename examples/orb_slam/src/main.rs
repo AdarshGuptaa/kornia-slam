@@ -10,9 +10,10 @@
 //! cargo run --release -p orb_slam --features oakd -- oakd
 //! ```
 //!
-//! Run live on a generic UVC webcam (requires `--features webcam`):
+//! Run live on a UVC camera (built-in webcam, USB cam, etc.; requires
+//! `--features uvc`):
 //! ```text
-//! cargo run --release -p orb_slam --features webcam -- webcam \
+//! cargo run --release -p orb_slam --features uvc -- uvc \
 //!     --fx 600 --fy 600 --cx 320 --cy 240
 //! ```
 
@@ -32,8 +33,8 @@ use pipeline::Pipeline;
 use source::{EurocSource, FrameItem, FrameSource};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
-#[cfg(feature = "webcam")]
-use source::WebcamSource;
+#[cfg(feature = "uvc")]
+use source::UvcSource;
 use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]
@@ -69,8 +70,8 @@ enum SourceCmd {
     Euroc(EurocCmd),
     #[cfg(feature = "oakd")]
     Oakd(OakdCmd),
-    #[cfg(feature = "webcam")]
-    Webcam(WebcamCmd),
+    #[cfg(feature = "uvc")]
+    Uvc(UvcCmd),
 }
 
 /// Run on an EuRoC MAV dataset.
@@ -112,14 +113,15 @@ struct OakdCmd {
     fps: f32,
 }
 
-/// Run live on a UVC webcam (V4L2/AVFoundation/MSMF via nokhwa).
+/// Run live on a UVC camera (laptop webcam, USB cam, CSI-to-UVC adapter…),
+/// using V4L2 / AVFoundation / MSMF via nokhwa.
 ///
 /// Intrinsics flags must match the resolution the device actually streams at
 /// — nokhwa may pick the closest supported mode if the exact one is missing.
-#[cfg(feature = "webcam")]
+#[cfg(feature = "uvc")]
 #[derive(argh::FromArgs)]
-#[argh(subcommand, name = "webcam")]
-struct WebcamCmd {
+#[argh(subcommand, name = "uvc")]
+struct UvcCmd {
     /// camera device index (0 = first camera)
     #[argh(option, default = "0")]
     index: u32,
@@ -195,8 +197,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(feature = "oakd")]
         SourceCmd::Oakd(o) => Box::new(OakdSource::open(o.width, o.height, o.fps, o.max_frames)?),
-        #[cfg(feature = "webcam")]
-        SourceCmd::Webcam(w) => {
+        #[cfg(feature = "uvc")]
+        SourceCmd::Uvc(w) => {
             let camera = kornia_3d::camera::PinholeCamera {
                 fx: w.fx,
                 fy: w.fy,
@@ -207,7 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 p1: w.p1,
                 p2: w.p2,
             };
-            Box::new(WebcamSource::open(
+            Box::new(UvcSource::open(
                 w.index,
                 w.width,
                 w.height,

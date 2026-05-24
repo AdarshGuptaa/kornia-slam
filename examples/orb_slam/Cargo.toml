@@ -28,4 +28,4 @@ thiserror = "2"
 default = ["viz"]
 viz = ["dep:rerun"]
 oakd = ["dep:depthai"]
-webcam = ["dep:nokhwa"]
+uvc = ["dep:nokhwa"]
