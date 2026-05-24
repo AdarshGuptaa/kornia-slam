@@ -49,7 +49,13 @@ use utils::{
     log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
     trajectory_point_from_pose,
 };
-
+use evaluation::{
+    associate_gt,
+    align_sim3,
+    compute_ate,
+    compute_rpe,
+    compute_drift,
+};
 /// CLI arguments.
 #[derive(argh::FromArgs)]
 #[argh(description = "Monocular ORB-SLAM (EuRoC dataset or live OAK-D)")]
