@@ -4,7 +4,7 @@ Spatial runtime for real-time pose estimation, mapping, and agent interaction.
 
 > **Work in progress**
 
-> **Early stage.** This README describes the long-term vision for kornia-slam, while the current implementation is a much narrower slice: monocular ORB-based odometry running end-to-end on EuRoC datasets. The current codebase is not yet a general SLAM framework: it is an ORB-specific monocular pipeline whose system orchestration still lives in the example layer rather than behind a stable library abstraction. The API, module layout, and internal abstractions are still taking shape, and broader multi-sensor SLAM, map serving, and agent integration remain roadmap work. Expect breaking changes. Contributions and feedback welcome.
+> **Early stage.** This README describes the long-term vision for kornia-slam, while the current implementation is a much narrower slice: monocular ORB-based odometry that runs end-to-end on EuRoC datasets, OAK-D mono cameras, and any UVC-class device (laptop webcam, USB cam, CSI-to-UVC adapter). The current codebase is not yet a general SLAM framework: it is an ORB-specific monocular pipeline whose system orchestration still lives in the example layer rather than behind a stable library abstraction. The API, module layout, and internal abstractions are still taking shape, and broader multi-sensor SLAM, map serving, and agent integration remain roadmap work. Expect breaking changes. Contributions and feedback welcome.
 
 kornia-slam is a modular SLAM framework that estimates poses in real time from cameras, IMU, LiDAR, and GNSS, builds a persistent map of the environment, and makes that spatial state available to agents through MCP.
 
@@ -68,7 +68,18 @@ Beyond serving spatial state to external agents, kornia-slam is exploring the id
 
 ## Setup
 
-The current runnable package is the standalone ORB-SLAM example in [examples/orb_slam/README.md](examples/orb_slam/README.md).
+The current runnable package is the standalone ORB-SLAM example in [examples/orb_slam/README.md](examples/orb_slam/README.md). Quick taste, with the default TUI:
+
+```bash
+# Offline (no extra deps):
+cargo run --release -p orb_slam -- euroc --data /path/to/V1_01_easy
+
+# Live UVC camera (laptop webcam, USB cam, …):
+cargo run --release -p orb_slam --features uvc -- \
+    uvc --index 0 --fx 600 --fy 600 --cx 320 --cy 240
+```
+
+Press `d` in the TUI to toggle the debug panel. Pass `--rerun-stream` for a Rerun viewer instead, or `--no-tui` for plain stderr.
 
 ### Local checks
 
@@ -89,6 +100,8 @@ cargo test
 - [x] Keyframe insertion and map point triangulation
 - [x] Local bundle adjustment
 - [x] Map point culling
+- [x] Live frame sources (EuRoC offline, OAK-D, UVC) behind a common `FrameSource` trait
+- [x] Default terminal UI with live BEV + togglable debug panel
 
 **Next — complete monocular SLAM ideas**
 - [ ] Rich keyframe and map-point observation model
