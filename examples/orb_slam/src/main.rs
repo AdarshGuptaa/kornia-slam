@@ -29,10 +29,12 @@ mod pipeline;
 #[path = "../../common/source/mod.rs"]
 mod source;
 mod tui;
+#[path = "../../common/source/mod.rs"]
+mod source;
+#[cfg(feature = "tui")]
+mod tui;
 mod utils;
 mod evaluation;
-
-use crate::datasets::euroc::GroundTruthPose;
 use config::PipelineConfig;
 use kornia_3d::pose::Pose3d;
 use kornia_slam::Frame;
@@ -43,11 +45,11 @@ use source::OakdSource;
 use source::UvcSource;
 use source::{EurocSource, FrameItem, FrameSource, McapSource};
 use utils::trajectory_point_from_pose;
-
+use evaluation::{associate_gt, align_sim3, compute_ate, compute_rpe, compute_drift};
+use kornia_algebra::Vec3F64;
 #[cfg(feature = "viz")]
 use utils::{
     log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
-    trajectory_point_from_pose,
 };
 use evaluation::{
     associate_gt,
@@ -315,7 +317,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(item) = source.next_frame()? {
         let FrameItem {
             idx,
-            timestamp_sec: _,
+            timestamp_sec,
             image: gray_u8,
         } = item;
         let image_size = gray_u8.size();
@@ -369,19 +371,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Trajectory.
-        trajectory.push(trajectory_point_from_pose(&result.pose_world_to_cam));
+        let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
+        trajectory.push(traj_pt);
 
-        let est = trajectory_point_from_pose(&result.pose_world_to_cam);
-        let est_pos = Vec3F64::new(est[0] as f64, est[1] as f64, est[2] as f64);
-        est_positions.push(est_pos);
-        if let Some(gt) = associate_gt(sample.timestamp_sec, gt_slice) {
-            gt_positions.push(Vec3F64::new(gt.tx, gt.ty, gt.tz));
-        } else {
-            // No GT match — push a sentinel so lengths stay in sync.
-            // This shouldn't happen on a valid EuRoC sequence.
-            gt_positions.push(*est_positions.last().unwrap());
+        // Evaluation collection (EuRoC only).
+        if euroc_samples_meta {
+            let est_pos = Vec3F64::new(traj_pt[0] as f64, traj_pt[1] as f64, traj_pt[2] as f64);
+            est_positions.push(est_pos);
+
+            // Associate nearest ground-truth pose by timestamp.
+            if let Some(gt) = source.ground_truth_at(timestamp_sec) {
+                gt_positions.push(Vec3F64::new(gt.tx, gt.ty, gt.tz));
+            } else {
+                // Keep lengths in sync; sentinel = last estimated position.
+                gt_positions.push(*est_positions.last().unwrap());
+            }
         }
-
         // Rerun logging.
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
@@ -444,5 +449,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    // ── Trajectory evaluation (EuRoC only) ─────────────────────────────────
+    if euroc_samples_meta && est_positions.len() >= 2 && gt_positions.len() == est_positions.len() {
+        // Save raw (unaligned, monocular scale) trajectory.
+        {
+            use std::io::Write;
+            let mut raw_file = std::fs::File::create("kornia_slam_raw.csv")?;
+            writeln!(raw_file, "timestamp_sec,x,y,z")?;
+            // We no longer have sample timestamps here; reconstruct index from source.
+            // Write position index as a proxy — replace with real timestamps if
+            // EurocSource exposes them via a `timestamps()` method.
+            for (i, pos) in est_positions.iter().enumerate() {
+                writeln!(raw_file, "{i},{:.9},{:.9},{:.9}", pos.x, pos.y, pos.z)?;
+            }
+            eprintln!("Saved kornia_slam_raw.csv");
+        }
+
+        let alignment = align_sim3(&est_positions, &gt_positions);
+
+        let aligned_est: Vec<Vec3F64> = est_positions
+            .iter()
+            .map(|p| alignment.translation + (alignment.rotation * *p) * alignment.scale)
+            .collect();
+
+        // Save aligned trajectory.
+        {
+            use std::io::Write;
+            let mut aligned_file = std::fs::File::create("kornia_slam_aligned.csv")?;
+            writeln!(aligned_file, "idx,x,y,z,gt_x,gt_y,gt_z")?;
+            for (i, (pos, gt)) in aligned_est.iter().zip(gt_positions.iter()).enumerate() {
+                writeln!(
+                    aligned_file,
+                    "{i},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9}",
+                    pos.x, pos.y, pos.z, gt.x, gt.y, gt.z
+                )?;
+            }
+            eprintln!("Saved kornia_slam_aligned.csv");
+        }
+
+        let ate   = compute_ate(&aligned_est, &gt_positions);
+        let rpe   = compute_rpe(&aligned_est, &gt_positions);
+        let drift = compute_drift(&aligned_est, &gt_positions);
+
+        eprintln!();
+        eprintln!("================ Trajectory Evaluation ================");
+        eprintln!("Frames evaluated : {}", aligned_est.len());
+        eprintln!("Scale            : {:.6}", alignment.scale);
+        eprintln!("ATE RMSE         : {:.4} m", ate);
+        eprintln!("RPE RMSE         : {:.4} m", rpe);
+        eprintln!("Final Drift      : {:.4} %", drift * 100.0);
+        eprintln!("=======================================================");
+    }
     Ok(())
 }
