@@ -43,6 +43,24 @@ impl EurocSource {
         })
     }
 
+    pub fn ground_truth_at(&self, query_sec: f64) -> Option<&GroundTruthPose> {
+        let gt = self.dataset.ground_truth();
+        if gt.is_empty() {
+            return None;
+        }
+        // Linear scan is fine; GT is ~200 Hz and sequences are short.
+        let best = gt.iter().min_by(|a, b| {
+            let da = (a.timestamp_sec - query_sec).abs();
+            let db = (b.timestamp_sec - query_sec).abs();
+            da.partial_cmp(&db).unwrap()
+        })?;
+        if (best.timestamp_sec - query_sec).abs() < 0.5 {
+            Some(best)
+        } else {
+            None
+        }
+    }
+    
     /// Total sample count in the dataset (ignoring start/max).
     pub fn dataset_len(&self) -> usize {
         self.dataset.samples().len()

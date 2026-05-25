@@ -29,10 +29,6 @@ mod pipeline;
 #[path = "../../common/source/mod.rs"]
 mod source;
 mod tui;
-#[path = "../../common/source/mod.rs"]
-mod source;
-#[cfg(feature = "tui")]
-mod tui;
 mod utils;
 mod evaluation;
 use config::PipelineConfig;
@@ -309,7 +305,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-
+    let (mut est_positions, mut gt_positions, euroc_samples_meta) = {
+        if let SourceCmd::Euroc(_) = &args.source {
+            (
+                Vec::<Vec3F64>::new(),
+                Vec::<Vec3F64>::new(),
+                true,
+            )
+        } else {
+            (Vec::new(), Vec::new(), false)
+        }
+    };
     // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
