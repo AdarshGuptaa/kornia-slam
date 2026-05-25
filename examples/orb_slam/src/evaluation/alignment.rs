@@ -1,6 +1,6 @@
-use kornia_algebra::{Mat3F64, Vec3F64};
-use kornia_algebra::linalg::svd::svd3_f64;
 use super::types::Sim3Alignment;
+use kornia_algebra::linalg::svd::svd3_f64;
+use kornia_algebra::{Mat3F64, Vec3F64};
 
 pub fn align_sim3(est: &[Vec3F64], gt: &[Vec3F64]) -> Sim3Alignment {
     let n = est.len() as f64;
@@ -43,12 +43,15 @@ pub fn align_sim3(est: &[Vec3F64], gt: &[Vec3F64]) -> Sim3Alignment {
 
     // Scale: trace(S_diag * diag_s) / var_est
     // S is diagonal, so only the diagonal elements matter
-    let trace = s.x_axis.x * diag_s.x_axis.x
-        + s.y_axis.y * diag_s.y_axis.y
-        + s.z_axis.z * diag_s.z_axis.z;
+    let trace =
+        s.x_axis.x * diag_s.x_axis.x + s.y_axis.y * diag_s.y_axis.y + s.z_axis.z * diag_s.z_axis.z;
     let scale = trace / var_est;
 
     let translation = mu_gt - (r * mu_est) * scale;
 
-    Sim3Alignment { scale, rotation: r, translation }
+    Sim3Alignment {
+        scale,
+        rotation: r,
+        translation,
+    }
 }

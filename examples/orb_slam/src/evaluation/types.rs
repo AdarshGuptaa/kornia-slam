@@ -1,4 +1,4 @@
-use kornia_algebra::{Vec3F64, Mat3F64};
+use kornia_algebra::{Mat3F64, Vec3F64};
 
 #[derive(Clone)]
 pub struct Trajectory {

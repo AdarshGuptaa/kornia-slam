@@ -25,14 +25,17 @@
 mod config;
 #[path = "../../common/datasets/mod.rs"]
 mod datasets;
+mod evaluation;
 mod pipeline;
 #[path = "../../common/source/mod.rs"]
 mod source;
 mod tui;
 mod utils;
-mod evaluation;
+use crate::datasets::euroc::GroundTruthPose;
 use config::PipelineConfig;
+use evaluation::{align_sim3, associate_gt, compute_ate, compute_drift, compute_rpe};
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Vec3F64;
 use kornia_slam::Frame;
 use pipeline::Pipeline;
 #[cfg(feature = "oakd")]
@@ -41,18 +44,9 @@ use source::OakdSource;
 use source::UvcSource;
 use source::{EurocSource, FrameItem, FrameSource, McapSource};
 use utils::trajectory_point_from_pose;
-use evaluation::{associate_gt, align_sim3, compute_ate, compute_rpe, compute_drift};
-use kornia_algebra::Vec3F64;
 #[cfg(feature = "viz")]
 use utils::{
     log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
-};
-use evaluation::{
-    associate_gt,
-    align_sim3,
-    compute_ate,
-    compute_rpe,
-    compute_drift,
 };
 /// CLI arguments.
 #[derive(argh::FromArgs)]
@@ -219,55 +213,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tui_active = !args.no_tui;
 
     // ── Source ─────────────────────────────────────────────────────────────
-    let mut source: Box<dyn FrameSource> = match args.source {
-        SourceCmd::Euroc(e) => {
-            let src = EurocSource::open(&e.data, e.start_frame, e.max_frames)?;
-            if !tui_active {
-                let total = src.dataset_len();
-                let n = src.n_frames_hint().unwrap_or(0);
-                eprintln!(
-                    "Dataset: {total} frames (processing {}..{})",
-                    e.start_frame,
-                    e.start_frame + n,
-                );
+    let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) =
+        match args.source {
+            SourceCmd::Euroc(e) => {
+                let src = EurocSource::open(&e.data, e.start_frame, e.max_frames)?;
+                if !tui_active {
+                    let total = src.dataset_len();
+                    let n = src.n_frames_hint().unwrap_or(0);
+                    eprintln!(
+                        "Dataset: {total} frames (processing {}..{})",
+                        e.start_frame,
+                        e.start_frame + n,
+                    );
+                }
+                // Clone the GT poses before the source is moved into the box.
+                let gt = src.ground_truth_poses_cloned();
+                (Box::new(src), Some(gt))
             }
-            Box::new(src)
-        }
-        SourceCmd::Mcap(m) => {
-            let src = McapSource::open(
-                std::path::Path::new(&m.path),
-                &m.channel,
-                m.start_frame,
-                m.max_frames,
-            )?;
-            if !tui_active && let Some(n) = src.n_frames_hint() {
-                eprintln!("MCAP: {n} frames from /{}", m.channel);
+            SourceCmd::Mcap(m) => {
+                let src = McapSource::open(
+                    std::path::Path::new(&m.path),
+                    &m.channel,
+                    m.start_frame,
+                    m.max_frames,
+                )?;
+                if !tui_active && let Some(n) = src.n_frames_hint() {
+                    eprintln!("MCAP: {n} frames from /{}", m.channel);
+                }
+                (Box::new(src), None)
             }
-            Box::new(src)
-        }
-        #[cfg(feature = "oakd")]
-        SourceCmd::Oakd(o) => Box::new(OakdSource::open(o.width, o.height, o.fps, o.max_frames)?),
-        #[cfg(feature = "uvc")]
-        SourceCmd::Uvc(w) => {
-            let camera = kornia_3d::camera::PinholeCamera {
-                fx: w.fx,
-                fy: w.fy,
-                cx: w.cx,
-                cy: w.cy,
-                k1: w.k1,
-                k2: w.k2,
-                p1: w.p1,
-                p2: w.p2,
-            };
-            Box::new(UvcSource::open(
-                w.index,
-                w.width,
-                w.height,
-                camera,
-                w.max_frames,
-            )?)
-        }
-    };
+            #[cfg(feature = "oakd")]
+            SourceCmd::Oakd(o) => (
+                Box::new(OakdSource::open(o.width, o.height, o.fps, o.max_frames)?),
+                None,
+            ),
+            #[cfg(feature = "uvc")]
+            SourceCmd::Uvc(w) => {
+                let camera = kornia_3d::camera::PinholeCamera {
+                    fx: w.fx,
+                    fy: w.fy,
+                    cx: w.cx,
+                    cy: w.cy,
+                    k1: w.k1,
+                    k2: w.k2,
+                    p1: w.p1,
+                    p2: w.p2,
+                };
+                (
+                    Box::new(UvcSource::open(
+                        w.index,
+                        w.width,
+                        w.height,
+                        camera,
+                        w.max_frames,
+                    )?),
+                    None,
+                )
+            }
+        };
 
     let camera = source.camera();
     let n_frames_hint = source.n_frames_hint();
@@ -305,17 +308,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let (mut est_positions, mut gt_positions, euroc_samples_meta) = {
-        if let SourceCmd::Euroc(_) = &args.source {
-            (
-                Vec::<Vec3F64>::new(),
-                Vec::<Vec3F64>::new(),
-                true,
-            )
-        } else {
-            (Vec::new(), Vec::new(), false)
-        }
-    };
+    let euroc_samples_meta = euroc_gt.is_some();
+    let (mut est_positions, mut gt_positions): (Vec<Vec3F64>, Vec<Vec3F64>) =
+        (Vec::new(), Vec::new());
     // ── Main loop ──────────────────────────────────────────────────────────
     let mut trajectory: Vec<[f32; 3]> = Vec::new();
     let mut processed: usize = 0;
@@ -386,12 +381,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             est_positions.push(est_pos);
 
             // Associate nearest ground-truth pose by timestamp.
-            if let Some(gt) = source.ground_truth_at(timestamp_sec) {
-                gt_positions.push(Vec3F64::new(gt.tx, gt.ty, gt.tz));
-            } else {
-                // Keep lengths in sync; sentinel = last estimated position.
-                gt_positions.push(*est_positions.last().unwrap());
-            }
+            let gt_pos = euroc_gt
+                .as_deref()
+                .and_then(|gt| associate_gt(timestamp_sec, gt))
+                .map(|gt| Vec3F64::new(gt.tx, gt.ty, gt.tz))
+                .unwrap_or_else(|| *est_positions.last().unwrap());
+            gt_positions.push(gt_pos);
         }
         // Rerun logging.
         #[cfg(feature = "viz")]
@@ -493,8 +488,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Saved kornia_slam_aligned.csv");
         }
 
-        let ate   = compute_ate(&aligned_est, &gt_positions);
-        let rpe   = compute_rpe(&aligned_est, &gt_positions);
+        let ate = compute_ate(&aligned_est, &gt_positions);
+        let rpe = compute_rpe(&aligned_est, &gt_positions);
         let drift = compute_drift(&aligned_est, &gt_positions);
 
         eprintln!();
