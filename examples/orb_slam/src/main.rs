@@ -30,11 +30,11 @@ use config::PipelineConfig;
 use kornia_3d::pose::Pose3d;
 use kornia_slam::Frame;
 use pipeline::Pipeline;
-use source::{EurocSource, FrameItem, FrameSource};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
 #[cfg(feature = "uvc")]
 use source::UvcSource;
+use source::{EurocSource, FrameItem, FrameSource};
 use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]

@@ -1,0 +1,41 @@
+name: Setup Rust Cache
+description: Cache the Cargo registry and optionally enable sccache for compile-output caching.
+inputs:
+  cache-prefix:
+    description: Prefix for the cache key
+    required: false
+    default: "cargo"
+  with-sccache:
+    description: Whether to install and configure sccache
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Cache Cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ inputs.cache-prefix }}-${{ runner.os }}-${{ runner.arch }}-
+    - name: Install sccache
+      if: inputs.with-sccache == 'true'
+      uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Configure sccache
+      if: inputs.with-sccache == 'true'
+      shell: bash
+      run: |
+        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+        echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+        echo "SCCACHE_CACHE_SIZE=6G" >> $GITHUB_ENV
+    - name: Start sccache server
+      if: inputs.with-sccache == 'true'
+      shell: bash
+      run: |
+        sccache --stop-server 2>/dev/null || true
+        sccache --start-server || true
+        sccache --show-stats || echo "::warning::sccache server may not be running"

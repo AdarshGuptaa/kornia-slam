@@ -3,41 +3,83 @@ name: Rust Test
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
-      - "src/**"
+      - "crates/**"
       - "examples/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust_test.yml"
+      - ".github/actions/setup-rust-cache/**"
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths:
-      - "src/**"
+      - "crates/**"
       - "examples/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust_test.yml"
+      - ".github/actions/setup-rust-cache/**"
 
 jobs:
   test:
+    name: Test (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Default workspace: runs the actual test suite and a CLI smoke run
+          # on the example with default features (viz + tui).
+          - name: workspace-default
+            apt: ""
+            test_cmd: cargo test --workspace
+            build_cmd: cargo run -p orb_slam -- --help
+
+          # Example with no default features — just confirms the non-viz build
+          # links and the CLI parses.
+          - name: example-no-default
+            apt: ""
+            test_cmd: ""
+            build_cmd: >-
+              cargo run
+              --manifest-path examples/orb_slam/Cargo.toml
+              --no-default-features
+              -- --help
+
+          # Example with the UVC source — build only (the runner has no camera,
+          # so we can't actually open the device).
+          - name: example-uvc
+            apt: "libv4l-dev"
+            test_cmd: ""
+            build_cmd: >-
+              cargo build
+              --manifest-path examples/orb_slam/Cargo.toml
+              --features uvc
 
     steps:
-      - name: Checkout kornia-slam
-        uses: actions/checkout@v4
-        with:
-          path: kornia-slam
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust-cache
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install apt deps
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
 
       - name: Run tests
-        working-directory: kornia-slam
-        run: cargo test
+        if: matrix.test_cmd != ''
+        run: ${{ matrix.test_cmd }}
 
-      - name: Build standalone example
-        working-directory: kornia-slam
-        run: cargo run --manifest-path examples/orb_slam/Cargo.toml -- --help
+      - name: Build / smoke-run
+        run: ${{ matrix.build_cmd }}
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats 2>&1 || echo "::warning::sccache stats unavailable"
