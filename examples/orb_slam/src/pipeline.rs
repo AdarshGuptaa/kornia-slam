@@ -277,9 +277,11 @@ impl Pipeline {
             triangulated.push((p_world, descriptor, color, ref_desc_idx, curr_desc_idx));
         }
 
-        let added =
-            self.map
-                .add_triangulated_points(Some(&mut reference_kf), &mut current_kf, &triangulated);
+        let added = self.map.add_triangulated_points(
+            Some(&mut reference_kf),
+            &mut current_kf,
+            &triangulated,
+        );
 
         self.map.upsert_keyframe(reference_kf);
         self.map.upsert_keyframe(current_kf);
@@ -448,8 +450,7 @@ impl Pipeline {
         // Forward SearchInNeighbors / Fuse: extend each curr_kf-observed map
         // point's observation list to neighbor KFs that don't yet observe it.
         // Run before local BA so BA sees the extra reprojection constraints.
-        let neighbor_kf_indices: Vec<usize> =
-            neighbor_kfs.iter().map(|kf| kf.frame.idx).collect();
+        let neighbor_kf_indices: Vec<usize> = neighbor_kfs.iter().map(|kf| kf.frame.idx).collect();
         let n_fused = self.fuse_into_neighbors(frame.idx, &neighbor_kf_indices);
         self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
 
@@ -617,7 +618,8 @@ impl Pipeline {
         // its desc slot pointed at the new map point.
         for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().take(added).enumerate() {
             let mp_idx = first_mp_idx + i;
-            self.map.register_observation(mp_idx, prev_kf, prev_desc_idx);
+            self.map
+                .register_observation(mp_idx, prev_kf, prev_desc_idx);
             if let Some(prev_live) = self.map.get_keyframe_mut(prev_kf_idx) {
                 prev_live.associate_map_point(prev_desc_idx, mp_idx);
             }
@@ -632,11 +634,7 @@ impl Pipeline {
     /// descriptor, register the observation. Mirrors a subset of ORB-SLAM3's
     /// `SearchInNeighbors` (forward direction only; we don't yet do duplicate
     /// merging or the second-hop covisible expansion).
-    fn fuse_into_neighbors(
-        &mut self,
-        curr_kf_idx: usize,
-        neighbor_kf_indices: &[usize],
-    ) -> usize {
+    fn fuse_into_neighbors(&mut self, curr_kf_idx: usize, neighbor_kf_indices: &[usize]) -> usize {
         const FUSE_SEARCH_RADIUS_PX: f32 = 7.0;
         const FUSE_MAX_HAMMING: u32 = 50;
 
@@ -699,11 +697,10 @@ impl Pipeline {
                 if p_cam.z <= 0.0 {
                     continue;
                 }
-                let Ok(pixel) = self.camera.project_to_image(
-                    &p_cam,
-                    0.0,
-                    nb_kf.frame.image_size,
-                ) else {
+                let Ok(pixel) = self
+                    .camera
+                    .project_to_image(&p_cam, 0.0, nb_kf.frame.image_size)
+                else {
                     continue;
                 };
                 let u = pixel.x as f32;
@@ -722,10 +719,8 @@ impl Pipeline {
                     if dx * dx + dy * dy > r2 {
                         continue;
                     }
-                    let dist = hamming_distance(
-                        &mp.descriptor,
-                        &nb_kf.frame.features.descriptors[kp_idx],
-                    );
+                    let dist =
+                        hamming_distance(&mp.descriptor, &nb_kf.frame.features.descriptors[kp_idx]);
                     if dist < best_dist {
                         best_dist = dist;
                         best_kp = kp_idx;

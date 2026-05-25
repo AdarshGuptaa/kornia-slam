@@ -154,28 +154,19 @@ pub struct SysStats {
 /// Reads `/proc/self/status` + `getrusage` and caches the result so we don't
 /// re-hit the kernel on every frame. CPU% is computed as the delta of
 /// utime+stime since the last full sample, over wall-clock delta.
+#[derive(Default)]
 pub struct SysStatsSampler {
     last_cpu_us: i64,
     last_wall: Option<Instant>,
     cached: Option<(Instant, SysStats)>,
 }
 
-impl Default for SysStatsSampler {
-    fn default() -> Self {
-        Self {
-            last_cpu_us: 0,
-            last_wall: None,
-            cached: None,
-        }
-    }
-}
-
 impl SysStatsSampler {
     pub fn sample(&mut self) -> SysStats {
-        if let Some((t, s)) = self.cached {
-            if t.elapsed() < Duration::from_millis(250) {
-                return s;
-            }
+        if let Some((t, s)) = self.cached
+            && t.elapsed() < Duration::from_millis(250)
+        {
+            return s;
         }
         let (rss_kb, peak_rss_kb, threads) = read_proc_status();
         let now_us = getrusage_total_us();
@@ -405,7 +396,10 @@ impl TuiApp {
         let label = Style::default().fg(C_LABEL);
         let line = Line::from(vec![
             Span::styled(" frame ", label),
-            Span::styled(format!("{:>4}/{:<4}", self.frame_idx, self.n_frames), bold_value),
+            Span::styled(
+                format!("{:>4}/{:<4}", self.frame_idx, self.n_frames),
+                bold_value,
+            ),
             Span::styled("  status: ", label),
             Span::styled(
                 format!("{:<16}", self.status.label()),
@@ -416,12 +410,18 @@ impl TuiApp {
             Span::styled("kf=", label),
             Span::styled(format!("{:<5}", self.kf_idx), Style::default().fg(C_VALUE)),
             Span::styled(" mp=", label),
-            Span::styled(format!("{:<5}", self.n_active_mp), Style::default().fg(C_VALUE)),
+            Span::styled(
+                format!("{:<5}", self.n_active_mp),
+                Style::default().fg(C_VALUE),
+            ),
             Span::styled("  ", label),
             Span::styled(format!("{:>5.1} ms", self.frame_ms), bold_value),
             Span::styled(format!(" ({:>5.1} fps)", instant_fps), label),
             Span::styled("  mean ", label),
-            Span::styled(format!("{:>5.1} ms", self.mean_ms), Style::default().fg(C_VALUE)),
+            Span::styled(
+                format!("{:>5.1} ms", self.mean_ms),
+                Style::default().fg(C_VALUE),
+            ),
             Span::styled(format!(" ({:>5.1} fps)", mean_fps), label),
         ]);
         Paragraph::new(line).block(
@@ -640,20 +640,18 @@ pub enum TuiAction {
 
 /// Non-blocking poll for a single keypress.
 pub fn poll_action() -> io::Result<TuiAction> {
-    if event::poll(Duration::from_millis(0))? {
-        if let Event::Key(KeyEvent {
+    if event::poll(Duration::from_millis(0))?
+        && let Event::Key(KeyEvent {
             code, modifiers, ..
         }) = event::read()?
+    {
+        if matches!(code, KeyCode::Char('q') | KeyCode::Esc)
+            || (modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')))
         {
-            if matches!(code, KeyCode::Char('q') | KeyCode::Esc)
-                || (modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(code, KeyCode::Char('c')))
-            {
-                return Ok(TuiAction::Quit);
-            }
-            if matches!(code, KeyCode::Char('d')) {
-                return Ok(TuiAction::ToggleDebug);
-            }
+            return Ok(TuiAction::Quit);
+        }
+        if matches!(code, KeyCode::Char('d')) {
+            return Ok(TuiAction::ToggleDebug);
         }
     }
     Ok(TuiAction::None)

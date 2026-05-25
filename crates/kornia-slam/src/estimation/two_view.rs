@@ -14,8 +14,8 @@
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel};
 pub use kornia_3d::pose::TwoViewError;
+use kornia_3d::pose::{TriangulationConfig, TwoViewEstimator, TwoViewModel};
 use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbFeatures, OrbMatchConfig, match_orb_descriptors};
 

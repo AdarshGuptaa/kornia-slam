@@ -1,8 +1,8 @@
 //! Minimal Rerun visualization helpers for the ORB-SLAM example.
 
-use kornia_3d::pose::Pose3d;
 #[cfg(feature = "viz")]
 use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
 #[cfg(feature = "viz")]
 use kornia_algebra::Mat3F64;
 #[cfg(feature = "viz")]

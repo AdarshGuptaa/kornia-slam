@@ -197,11 +197,8 @@ impl MapPoint {
                 let mut best_idx = 0usize;
                 let mut best_median = u32::MAX;
                 for i in 0..n {
-                    for j in 0..n {
-                        dist_buf[j] = hamming_distance(
-                            &self.observed_descriptors[i],
-                            &self.observed_descriptors[j],
-                        );
+                    for (slot, other) in dist_buf.iter_mut().zip(self.observed_descriptors.iter()) {
+                        *slot = hamming_distance(&self.observed_descriptors[i], other);
                     }
                     let mid = n / 2;
                     dist_buf.select_nth_unstable(mid);
@@ -450,12 +447,7 @@ impl Map {
     /// bounds for one map point from its observing keyframes (ORB-SLAM3's
     /// `MapPoint::UpdateNormalAndDepth`). No-op if the point is culled or its
     /// reference keyframe is missing.
-    pub fn update_map_point_geometry(
-        &mut self,
-        mp_idx: usize,
-        scale_factor: f64,
-        n_levels: usize,
-    ) {
+    pub fn update_map_point_geometry(&mut self, mp_idx: usize, scale_factor: f64, n_levels: usize) {
         let (position, kf_indices, ref_kf_idx, ref_octave) = {
             let Some(mp) = self.map_points.get(mp_idx) else {
                 return;
@@ -479,7 +471,7 @@ impl Map {
                 let dir = position - cam_center;
                 let len = dir.length();
                 if len > 1e-9 {
-                    normal = normal + dir / len;
+                    normal += dir / len;
                     n += 1;
                 }
             }
@@ -705,7 +697,11 @@ impl Map {
 
         let mut mp_set: HashSet<usize> = HashSet::new();
         for &kf_idx in &kf_indices {
-            for mp_idx in self.keyframes[kf_idx].map_point_by_desc_idx.iter().flatten() {
+            for mp_idx in self.keyframes[kf_idx]
+                .map_point_by_desc_idx
+                .iter()
+                .flatten()
+            {
                 if let Some(mp) = self.map_points.get(*mp_idx)
                     && !mp.culled
                 {
@@ -911,7 +907,8 @@ impl Map {
         }
 
         let ba_result =
-            match bundle_adjust_schur(&poses, &points, &observations, camera, &BaParams::default()) {
+            match bundle_adjust_schur(&poses, &points, &observations, camera, &BaParams::default())
+            {
                 Ok(r) => r,
                 Err(_) => return,
             };
@@ -955,7 +952,11 @@ fn initial_ba_diagnostics(
             count += 1;
         }
     }
-    let mean_sq = if count > 0 { sum_sq / count as f64 } else { 0.0 };
+    let mean_sq = if count > 0 {
+        sum_sq / count as f64
+    } else {
+        0.0
+    };
 
     let median_depth = match poses.first() {
         Some(kf0) => {

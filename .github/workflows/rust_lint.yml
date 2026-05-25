@@ -3,51 +3,98 @@ name: Rust Lint
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
-      - "src/**"
+      - "crates/**"
       - "examples/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust_lint.yml"
+      - ".github/actions/setup-rust-cache/**"
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths:
-      - "src/**"
+      - "crates/**"
       - "examples/**"
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust_lint.yml"
+      - ".github/actions/setup-rust-cache/**"
 
 jobs:
-  lint:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Rustfmt
-            command: cargo fmt -- --check
-          - name: Clippy
+          # Default workspace lint: covers the library and the example with
+          # its default feature set (viz).
+          - name: workspace-default
+            apt: ""
             command: cargo clippy --all-targets -- -D warnings
-          - name: Example Rustfmt
-            command: cargo fmt --manifest-path examples/orb_slam/Cargo.toml -- --check
-          - name: Example Clippy
-            command: cargo clippy --manifest-path examples/orb_slam/Cargo.toml --all-targets -- -D warnings
+
+          # Example with no default features — exercises the non-viz, non-rerun
+          # build path. TUI deps are now unconditional, so this also verifies
+          # the example still compiles without the rerun integration.
+          - name: example-no-default
+            apt: ""
+            command: >-
+              cargo clippy
+              --manifest-path examples/orb_slam/Cargo.toml
+              --no-default-features
+              --all-targets
+              -- -D warnings
+
+          # Example with the UVC source enabled. nokhwa's native Linux backend
+          # needs the V4L2 headers from libv4l-dev.
+          - name: example-uvc
+            apt: "libv4l-dev"
+            command: >-
+              cargo clippy
+              --manifest-path examples/orb_slam/Cargo.toml
+              --features uvc
+              --all-targets
+              -- -D warnings
+
+          # NOTE: the `oakd` feature is intentionally not in this matrix.
+          # depthai-sys builds depthai-core from source (~5–10 min wall, GBs
+          # of artefacts) and pins LIBCLANG_PATH to a system clang. The
+          # build is too expensive for the default CI loop — gate it behind
+          # a dedicated workflow if/when we want it covered.
 
     steps:
-      - name: Checkout kornia-slam
-        uses: actions/checkout@v4
-        with:
-          path: kornia-slam
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-rust-cache
 
-      - name: Run ${{ matrix.name }}
-        working-directory: kornia-slam
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install apt deps
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: ${{ matrix.command }}
         run: ${{ matrix.command }}
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats 2>&1 || echo "::warning::sccache stats unavailable"
