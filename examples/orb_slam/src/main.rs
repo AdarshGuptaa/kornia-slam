@@ -5,6 +5,11 @@
 //! cargo run --release -p orb_slam -- euroc --data /path/to/V1_01_easy
 //! ```
 //!
+//! Run on a bubbaloop MCAP recording (defaults to the mono_left channel):
+//! ```text
+//! cargo run --release -p orb_slam -- mcap --path /path/to/recording.mcap
+//! ```
+//!
 //! Run live on an OAK-D camera (requires `--features oakd`):
 //! ```text
 //! cargo run --release -p orb_slam --features oakd -- oakd
@@ -34,7 +39,7 @@ use pipeline::Pipeline;
 use source::OakdSource;
 #[cfg(feature = "uvc")]
 use source::UvcSource;
-use source::{EurocSource, FrameItem, FrameSource};
+use source::{EurocSource, FrameItem, FrameSource, McapSource};
 use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]
@@ -68,6 +73,7 @@ struct Args {
 #[argh(subcommand)]
 enum SourceCmd {
     Euroc(EurocCmd),
+    Mcap(McapCmd),
     #[cfg(feature = "oakd")]
     Oakd(OakdCmd),
     #[cfg(feature = "uvc")]
@@ -81,6 +87,31 @@ struct EurocCmd {
     /// path to EuRoC dataset root (e.g. V1_01_easy/)
     #[argh(option)]
     data: String,
+
+    /// maximum number of frames to process (0 = all)
+    #[argh(option, default = "0")]
+    max_frames: usize,
+
+    /// skip this many initial frames
+    #[argh(option, default = "0")]
+    start_frame: usize,
+}
+
+/// Run on a bubbaloop MCAP recording.
+///
+/// Defaults to the `mono_left` channel — 640×400 grayscale JPEGs, ready for
+/// the SLAM pipeline without color conversion. Pass `--channel mono_right`
+/// or `--channel compressed` to switch sources within the same file.
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "mcap")]
+struct McapCmd {
+    /// path to an MCAP file recorded by the bubbaloop mcap-recorder
+    #[argh(option)]
+    path: String,
+
+    /// channel suffix to read (e.g. mono_left, mono_right, compressed)
+    #[argh(option, default = "String::from(\"mono_left\")")]
+    channel: String,
 
     /// maximum number of frames to process (0 = all)
     #[argh(option, default = "0")]
@@ -192,6 +223,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     e.start_frame,
                     e.start_frame + n,
                 );
+            }
+            Box::new(src)
+        }
+        SourceCmd::Mcap(m) => {
+            let src = McapSource::open(
+                std::path::Path::new(&m.path),
+                &m.channel,
+                m.start_frame,
+                m.max_frames,
+            )?;
+            if !tui_active && let Some(n) = src.n_frames_hint() {
+                eprintln!("MCAP: {n} frames from /{}", m.channel);
             }
             Box::new(src)
         }
