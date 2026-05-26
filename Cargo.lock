@@ -5785,7 +5785,6 @@ dependencies = [
 name = "kornia-algebra"
 version = "0.1.11"
 source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fslam-utils#f11fcd45b8c8c2aeac2b41ebf1279073cfe693f9"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fslam-utils#f11fcd45b8c8c2aeac2b41ebf1279073cfe693f9"
 dependencies = [
  "glam 0.30.10",
  "nalgebra 0.32.6",
