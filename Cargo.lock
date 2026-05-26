@@ -7630,7 +7630,6 @@ dependencies = [
  "ciborium",
  "crossterm 0.28.1",
  "depthai",
- "image",
  "kornia-3d",
  "kornia-algebra",
  "kornia-image",

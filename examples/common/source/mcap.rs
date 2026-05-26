@@ -4,14 +4,19 @@
 //! one chosen channel. The default channel suffix is `mono_left` — already
 //! grayscale at 640×400, no color conversion needed. Each MCAP message is a
 //! CBOR-wrapped SDK envelope `{header, body:{width, height, encoding:"jpeg", data}}`;
-//! we strip the envelope, JPEG-decode `body.data`, and convert to luma8.
+//! we strip the envelope, JPEG-decode `body.data` via `kornia-io`, and (for
+//! the color `compressed` channel) convert to luma8 via `kornia-imgproc`.
 
 use std::fs;
 use std::path::Path;
 
 use ciborium::value::Value as CborValue;
 use kornia_3d::camera::PinholeCamera;
-use kornia_image::{Image, ImageSize};
+use kornia_image::Image;
+use kornia_imgproc::color::gray_from_rgb_u8;
+use kornia_io::jpeg::{
+    decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8,
+};
 use kornia_tensor::CpuAllocator;
 use mcap::McapError;
 
@@ -66,22 +71,15 @@ impl McapSource {
                     msg.channel.topic
                 ))
             })?;
-            let (width, height, jpeg_bytes) = extract_jpeg(body).ok_or_else(|| {
+            let jpeg_bytes = extract_jpeg(body).ok_or_else(|| {
                 SourceError::other(format!(
                     "MCAP message on {} has no JPEG payload (expected encoding=jpeg + data)",
                     msg.channel.topic
                 ))
             })?;
-            let img = image::load_from_memory_with_format(
-                jpeg_bytes,
-                image::ImageFormat::Jpeg,
-            )
-            .map_err(SourceError::other)?
-            .to_luma8();
-            let (got_w, got_h) = (img.width() as usize, img.height() as usize);
-            // Width/height in the body are metadata; trust the decoded image
-            // for the actual bytes (in case the encoder lied).
-            let _ = (width, height);
+
+            let image = decode_jpeg_to_luma(jpeg_bytes).map_err(SourceError::other)?;
+            let (got_w, got_h) = (image.width(), image.height());
             if let Some(prev) = first_size {
                 if prev != (got_w, got_h) {
                     return Err(SourceError::other(format!(
@@ -91,12 +89,6 @@ impl McapSource {
             } else {
                 first_size = Some((got_w, got_h));
             }
-            let image_size = ImageSize {
-                width: got_w,
-                height: got_h,
-            };
-            let image: Image<u8, 1, CpuAllocator> =
-                Image::new(image_size, img.into_raw(), CpuAllocator).map_err(SourceError::other)?;
             decoded.push(PreparedFrame {
                 timestamp_sec: msg.log_time as f64 / 1e9,
                 image,
@@ -181,6 +173,30 @@ impl FrameSource for McapSource {
     }
 }
 
+/// Decode a JPEG payload to a luma8 image. Mono JPEGs are decoded directly;
+/// RGB JPEGs (used by the `compressed` channel) are decoded then converted.
+fn decode_jpeg_to_luma(
+    jpeg_bytes: &[u8],
+) -> Result<Image<u8, 1, CpuAllocator>, Box<dyn std::error::Error + Send + Sync>> {
+    let layout = decode_image_jpeg_layout(jpeg_bytes)?;
+    let size = layout.image_size;
+    match layout.channels {
+        1 => {
+            let mut dst = Image::<u8, 1, _>::from_size_val(size, 0, CpuAllocator)?;
+            decode_image_jpeg_mono8(jpeg_bytes, &mut dst)?;
+            Ok(dst)
+        }
+        3 => {
+            let mut rgb = Image::<u8, 3, _>::from_size_val(size, 0, CpuAllocator)?;
+            decode_image_jpeg_rgb8(jpeg_bytes, &mut rgb)?;
+            let mut gray = Image::<u8, 1, _>::from_size_val(size, 0, CpuAllocator)?;
+            gray_from_rgb_u8(&rgb, &mut gray)?;
+            Ok(gray)
+        }
+        n => Err(format!("unsupported JPEG channel count: {n} (want 1 or 3)").into()),
+    }
+}
+
 /// `{header, body}` envelope → body. Returns None if the value isn't a map
 /// containing a `body` key.
 fn unwrap_body(value: &CborValue) -> Option<&CborValue> {
@@ -196,23 +212,19 @@ fn unwrap_body(value: &CborValue) -> Option<&CborValue> {
     None
 }
 
-/// Pull `(width, height, jpeg_bytes)` out of either a flat
-/// `{width, height, encoding:"jpeg", data}` mono body or the nested
-/// `{rgb:{encoding:"jpeg", data}}` from the `compressed` channel.
-fn extract_jpeg(body: &CborValue) -> Option<(u32, u32, &[u8])> {
+/// Pull JPEG bytes out of either a flat `{encoding:"jpeg", data}` body or
+/// the nested `{rgb:{encoding:"jpeg", data}}` shape from the `compressed`
+/// channel.
+fn extract_jpeg(body: &CborValue) -> Option<&[u8]> {
     let CborValue::Map(entries) = body else {
         return None;
     };
-    let mut width: Option<u32> = None;
-    let mut height: Option<u32> = None;
     let mut encoding: Option<&str> = None;
     let mut data: Option<&[u8]> = None;
     let mut rgb_sub: Option<&CborValue> = None;
     for (k, v) in entries {
         let CborValue::Text(key) = k else { continue };
         match key.as_str() {
-            "width" => width = cbor_u32(v),
-            "height" => height = cbor_u32(v),
             "encoding" => encoding = cbor_text(v),
             "data" => data = cbor_bytes(v),
             "rgb" => rgb_sub = Some(v),
@@ -221,23 +233,13 @@ fn extract_jpeg(body: &CborValue) -> Option<(u32, u32, &[u8])> {
     }
     if let (Some(enc), Some(d)) = (encoding, data) {
         if enc == "jpeg" {
-            return Some((width.unwrap_or(0), height.unwrap_or(0), d));
+            return Some(d);
         }
     }
     if let Some(rgb) = rgb_sub {
-        // Recurse into nested rgb plane; reuse same width/height from outer body.
-        if let Some((_, _, d)) = extract_jpeg(rgb) {
-            return Some((width.unwrap_or(0), height.unwrap_or(0), d));
-        }
+        return extract_jpeg(rgb);
     }
     None
-}
-
-fn cbor_u32(v: &CborValue) -> Option<u32> {
-    match v {
-        CborValue::Integer(i) => u32::try_from(i128::from(*i)).ok(),
-        _ => None,
-    }
 }
 
 fn cbor_text(v: &CborValue) -> Option<&str> {
