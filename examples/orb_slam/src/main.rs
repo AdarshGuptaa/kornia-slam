@@ -233,10 +233,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 m.start_frame,
                 m.max_frames,
             )?;
-            if !tui_active {
-                if let Some(n) = src.n_frames_hint() {
-                    eprintln!("MCAP: {n} frames from /{}", m.channel);
-                }
+            if !tui_active && let Some(n) = src.n_frames_hint() {
+                eprintln!("MCAP: {n} frames from /{}", m.channel);
             }
             Box::new(src)
         }

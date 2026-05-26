@@ -14,9 +14,7 @@ use ciborium::value::Value as CborValue;
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::Image;
 use kornia_imgproc::color::gray_from_rgb_u8;
-use kornia_io::jpeg::{
-    decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8,
-};
+use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
 use kornia_tensor::CpuAllocator;
 use mcap::McapError;
 
@@ -202,10 +200,10 @@ fn decode_jpeg_to_luma(
 fn unwrap_body(value: &CborValue) -> Option<&CborValue> {
     if let CborValue::Map(entries) = value {
         for (k, v) in entries {
-            if let CborValue::Text(s) = k {
-                if s == "body" {
-                    return Some(v);
-                }
+            if let CborValue::Text(s) = k
+                && s == "body"
+            {
+                return Some(v);
             }
         }
     }
@@ -231,10 +229,10 @@ fn extract_jpeg(body: &CborValue) -> Option<&[u8]> {
             _ => {}
         }
     }
-    if let (Some(enc), Some(d)) = (encoding, data) {
-        if enc == "jpeg" {
-            return Some(d);
-        }
+    if let (Some(enc), Some(d)) = (encoding, data)
+        && enc == "jpeg"
+    {
+        return Some(d);
     }
     if let Some(rgb) = rgb_sub {
         return extract_jpeg(rgb);
