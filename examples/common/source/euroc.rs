@@ -7,7 +7,7 @@ use kornia_io::png::read_image_png_mono8;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::EurocDataset;
-
+use crate::datasets::euroc::GroundTruthPose;
 /// Reads cam0 PNG frames from an EuRoC dataset in order.
 pub struct EurocSource {
     dataset: EurocDataset,
@@ -41,6 +41,10 @@ impl EurocSource {
             start,
             end,
         })
+    }
+
+    pub fn ground_truth_poses_cloned(&self) -> Vec<GroundTruthPose> {
+        self.dataset.ground_truth().to_vec()
     }
 
     /// Total sample count in the dataset (ignoring start/max).
