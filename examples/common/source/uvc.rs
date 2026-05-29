@@ -142,6 +142,7 @@ impl FrameSource for UvcSource {
             idx,
             timestamp_sec,
             image,
+            right_image: None,
         }))
     }
 }

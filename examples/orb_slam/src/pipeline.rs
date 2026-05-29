@@ -15,6 +15,7 @@ use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_slam::Frame;
 use kornia_slam::estimation::MapProjectionEstimator;
+use kornia_slam::estimation::stereo::unproject_stereo;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::map::{Keyframe, Map, MapPoint};
 use kornia_slam::system::{
@@ -33,6 +34,8 @@ pub struct Pipeline {
     keyframe_policy: KeyframePolicy,
     // Enable local bundle adjustment after keyframe insertion
     enable_local_ba: bool,
+    // mThDepth (metres): back-project close stereo points at each keyframe when set
+    stereo_close_depth: Option<f64>,
     // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
     debug: bool,
     // Buffered debug messages produced during the most recent process_frame call;
@@ -53,6 +56,7 @@ impl Pipeline {
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
             enable_local_ba: config.enable_local_ba,
+            stereo_close_depth: config.stereo_close_depth_m,
             debug: config.debug,
             debug_messages: Vec::new(),
             map: Map::new(),
@@ -104,7 +108,107 @@ impl Pipeline {
         }
     }
 
-    fn bootstrap_step(&mut self, mut curr_frame: Frame) -> TrackingResult {
+    fn bootstrap_step(&mut self, curr_frame: Frame) -> TrackingResult {
+        // Stereo frames carry metric per-keypoint depth, so we can build a
+        // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
+        // instead of waiting for two-view parallax.
+        if curr_frame.is_stereo() {
+            return self.bootstrap_stereo(curr_frame);
+        }
+        self.bootstrap_mono(curr_frame)
+    }
+
+    /// Single-frame metric initialization from stereo depth.
+    fn bootstrap_stereo(&mut self, mut curr_frame: Frame) -> TrackingResult {
+        // Build the new map in the current odometry frame (identity at start,
+        // or the recovery pose after a tracking loss).
+        curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
+
+        const MIN_STEREO_POINTS: usize = 50;
+        let cam_points = unproject_stereo(&curr_frame, &self.camera);
+        if cam_points.len() < MIN_STEREO_POINTS {
+            self.dbg(format!(
+                "[bootstrap_stereo] frame={} skip: only {} stereo points (need >= {})",
+                curr_frame.idx,
+                cam_points.len(),
+                MIN_STEREO_POINTS,
+            ));
+            return TrackingResult {
+                pose_world_to_cam: self.state.pose_world_to_cam,
+                status: TrackingStatus::Skipped,
+            };
+        }
+
+        let pose_inv = curr_frame.pose_world_to_cam.inverse();
+        let mut keyframe = Keyframe::from_frame(curr_frame);
+        let curr_idx = keyframe.frame.idx;
+
+        let mut points = Vec::with_capacity(cam_points.len());
+        for (desc_idx, p_cam) in &cam_points {
+            let p_world = pose_inv.transform_point(p_cam);
+            let descriptor = keyframe.frame.features.descriptors[*desc_idx];
+            let color = keyframe
+                .frame
+                .keypoint_colors
+                .get(*desc_idx)
+                .copied()
+                .unwrap_or([128; 3]);
+            points.push((p_world, descriptor, color, *desc_idx, *desc_idx));
+        }
+
+        let added = self.map.add_triangulated_points(None, &mut keyframe, &points);
+        self.map.upsert_keyframe(keyframe);
+
+        self.dbg(format!(
+            "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points",
+        ));
+
+        self.state.current_keyframe_idx = Some(curr_idx);
+        self.state.last_keyframe_idx = Some(curr_idx);
+        self.state.velocity = None;
+        self.state.mode = SystemMode::Tracking;
+
+        TrackingResult {
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            status: TrackingStatus::KeyframeAccepted,
+        }
+    }
+
+    /// Back-projects `curr_kf`'s unassociated close stereo keypoints
+    /// (`z < mthdepth`) into new metric map points, associating them to the
+    /// keyframe. Returns the number of points created.
+    fn add_close_stereo_points(&mut self, curr_kf: &mut Keyframe, mthdepth: f64) -> usize {
+        let cam_points = unproject_stereo(&curr_kf.frame, &self.camera);
+        if cam_points.is_empty() {
+            return 0;
+        }
+        let pose_inv = curr_kf.frame.pose_world_to_cam.inverse();
+
+        let mut points = Vec::new();
+        for (desc_idx, p_cam) in &cam_points {
+            // Far points: leave to multi-view triangulation.
+            if p_cam.z > mthdepth {
+                continue;
+            }
+            // Skip keypoints already tied to a map point (tracked this frame).
+            if curr_kf.map_point(*desc_idx).is_some() {
+                continue;
+            }
+            let p_world = pose_inv.transform_point(p_cam);
+            let descriptor = curr_kf.frame.features.descriptors[*desc_idx];
+            let color = curr_kf
+                .frame
+                .keypoint_colors
+                .get(*desc_idx)
+                .copied()
+                .unwrap_or([128; 3]);
+            points.push((p_world, descriptor, color, *desc_idx, *desc_idx));
+        }
+
+        self.map.add_triangulated_points(None, curr_kf, &points)
+    }
+
+    fn bootstrap_mono(&mut self, mut curr_frame: Frame) -> TrackingResult {
         // Stamp frames with current odometry pose so bootstrap builds
         // the new map in the existing coordinate frame.
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -401,10 +505,26 @@ impl Pipeline {
             pose_world_to_cam: self.state.pose_world_to_cam,
             image_size: frame.image_size,
             keypoint_colors: frame.keypoint_colors.clone(),
+            u_right: frame.u_right.clone(),
+            depth: frame.depth.clone(),
         });
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
             self.map.register_observation(mp_idx, &curr_kf, curr_idx);
+        }
+
+        // Stereo densification: back-project this keyframe's unassociated
+        // "close" stereo keypoints directly into metric map points. Mirrors
+        // ORB-SLAM3's CreateNewKeyFrame, which seeds close points from stereo
+        // and leaves far points to multi-view triangulation (the grow pass).
+        if let Some(mthdepth) = self.stereo_close_depth
+            && curr_kf.frame.is_stereo()
+        {
+            let n_close = self.add_close_stereo_points(&mut curr_kf, mthdepth);
+            self.dbg(format!(
+                "[kf_stereo] frame={} close_points={}",
+                frame.idx, n_close
+            ));
         }
 
         // Triangulate new map points against the last MAX_COVIS_KFS keyframes,

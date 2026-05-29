@@ -167,6 +167,7 @@ impl FrameSource for McapSource {
             idx,
             timestamp_sec: prepared.timestamp_sec,
             image: prepared.image,
+            right_image: None,
         }))
     }
 }

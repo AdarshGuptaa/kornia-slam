@@ -154,6 +154,7 @@ impl FrameSource for OakdSource {
                 idx,
                 timestamp_sec,
                 image,
+                right_image: None,
             }));
         }
     }

@@ -36,7 +36,11 @@ use config::PipelineConfig;
 use evaluation::{align_sim3, associate_gt, compute_ate, compute_drift, compute_rpe};
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
+use kornia_image::{Image, ImageSize, InterpolationMode};
+use kornia_imgproc::resize::resize_fast_mono;
 use kornia_slam::Frame;
+use kornia_slam::estimation::stereo::{StereoMatchConfig, compute_stereo_matches};
+use kornia_tensor::CpuAllocator;
 use pipeline::Pipeline;
 #[cfg(feature = "oakd")]
 use source::OakdSource;
@@ -96,6 +100,10 @@ struct EurocCmd {
     /// skip this many initial frames
     #[argh(option, default = "0")]
     start_frame: usize,
+
+    /// rectify cam0+cam1 and compute per-keypoint stereo depth
+    #[argh(switch)]
+    stereo: bool,
 }
 
 /// Run on a bubbaloop MCAP recording.
@@ -203,6 +211,30 @@ struct UvcCmd {
     p2: f64,
 }
 
+/// ORB pyramid scale factor (matches `OrbDetector` default `downscale`).
+const ORB_SCALE: f32 = 1.2;
+/// ORB pyramid level count (matches `OrbDetector` default `n_scales`).
+const ORB_LEVELS: usize = 8;
+
+/// Builds an ORB-consistent u8 image pyramid: level `o` is the full image
+/// downscaled by `ORB_SCALE^o`, so a full-resolution keypoint at octave `o`
+/// maps into level `o` by multiplying its coordinates by `ORB_SCALE^-o`.
+fn build_u8_pyramid(img: &Image<u8, 1, CpuAllocator>) -> Vec<Image<u8, 1, CpuAllocator>> {
+    let mut pyramid = Vec::with_capacity(ORB_LEVELS);
+    pyramid.push(img.clone());
+    let (w0, h0) = (img.width() as f32, img.height() as f32);
+    for level in 1..ORB_LEVELS {
+        let inv = 1.0 / ORB_SCALE.powi(level as i32);
+        let w = ((w0 * inv).round() as usize).max(1);
+        let h = ((h0 * inv).round() as usize).max(1);
+        let mut dst = Image::from_size_val(ImageSize { width: w, height: h }, 0u8, CpuAllocator)
+            .expect("pyramid level allocation");
+        resize_fast_mono(img, &mut dst, InterpolationMode::Bilinear).expect("pyramid resize");
+        pyramid.push(dst);
+    }
+    pyramid
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
@@ -216,7 +248,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) =
         match args.source {
             SourceCmd::Euroc(e) => {
-                let src = EurocSource::open(&e.data, e.start_frame, e.max_frames)?;
+                let src = if e.stereo {
+                    EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
+                } else {
+                    EurocSource::open(&e.data, e.start_frame, e.max_frames)?
+                };
                 if !tui_active {
                     let total = src.dataset_len();
                     let n = src.n_frames_hint().unwrap_or(0);
@@ -275,6 +311,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let camera = source.camera();
     let n_frames_hint = source.n_frames_hint();
 
+    // Stereo config (when the source yields rectified pairs).
+    let stereo_bf = source.stereo_bf();
+    // Near/far split: close points (z < baseline * TH_DEPTH) get direct stereo
+    // back-projection at each keyframe (ORB-SLAM3's ThDepth ~ 35 for EuRoC).
+    const TH_DEPTH: f64 = 35.0;
+    let stereo_close_depth_m = stereo_bf.map(|bf| (bf / camera.fx) * TH_DEPTH);
+    let stereo_config = stereo_bf.map(|bf| {
+        let baseline = bf / camera.fx;
+        if !tui_active {
+            eprintln!(
+                "Stereo: rectified fx={:.2} baseline={:.4}m bf={:.2} close_depth={:.2}m",
+                camera.fx,
+                baseline,
+                bf,
+                baseline * TH_DEPTH,
+            );
+        }
+        StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
+    });
+
     // ── ORB detector ───────────────────────────────────────────────────────
     let detector = kornia_imgproc::features::OrbDetector {
         n_keypoints: 1000,
@@ -284,6 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── SLAM system ────────────────────────────────────────────────────────
     let pipeline_config = PipelineConfig {
         debug: args.debug,
+        stereo_close_depth_m,
         ..PipelineConfig::default()
     };
     let mut system = Pipeline::new(camera.clone(), pipeline_config);
@@ -320,11 +377,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             idx,
             timestamp_sec,
             image: gray_u8,
+            right_image,
         } = item;
         let image_size = gray_u8.size();
 
         // Extract ORB features.
         let features = detector.detect_and_extract_u8(&gray_u8)?;
+
+        // Stereo: match the rectified right view to fill per-keypoint depth.
+        let (u_right, depth) = match (&stereo_config, &right_image) {
+            (Some(cfg), Some(right_img)) => {
+                let right_features = detector.detect_and_extract_u8(right_img)?;
+                let left_pyr = build_u8_pyramid(&gray_u8);
+                let right_pyr = build_u8_pyramid(right_img);
+                let matches =
+                    compute_stereo_matches(&left_pyr, &right_pyr, &features, &right_features, cfg);
+                if args.debug && !tui_active {
+                    let n = matches.num_matched();
+                    let mut ds: Vec<f32> =
+                        matches.depth.iter().copied().filter(|&d| d > 0.0).collect();
+                    let med = if ds.is_empty() {
+                        0.0
+                    } else {
+                        ds.sort_by(|a, b| a.total_cmp(b));
+                        ds[ds.len() / 2]
+                    };
+                    eprintln!("[stereo] frame={idx} matched={n} median_depth={med:.3}m");
+                }
+                (matches.u_right, matches.depth)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &gray_u8, &features.keypoints_xy);
@@ -350,6 +433,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pose_world_to_cam: Pose3d::IDENTITY,
             image_size,
             keypoint_colors,
+            u_right,
+            depth,
         };
         let t0 = std::time::Instant::now();
         let result = system.process_frame(frame);

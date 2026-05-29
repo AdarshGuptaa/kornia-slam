@@ -2,6 +2,7 @@
 
 pub mod map_projection;
 pub mod pnp;
+pub mod stereo;
 pub mod two_view;
 
 use kornia_3d::pose::Pose3d;
