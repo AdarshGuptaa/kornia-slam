@@ -127,9 +127,22 @@ struct McapCmd {
     #[argh(option)]
     path: String,
 
-    /// channel suffix to read (e.g. mono_left, mono_right, compressed)
+    /// channel suffix to read (e.g. mono_left, mono_right, compressed).
+    /// In stereo mode this is the left channel.
     #[argh(option, default = "String::from(\"mono_left\")")]
     channel: String,
+
+    /// rectify a stereo pair and compute per-keypoint depth; requires --calib
+    #[argh(switch)]
+    stereo: bool,
+
+    /// right stereo channel suffix (stereo mode)
+    #[argh(option, default = "String::from(\"mono_right\")")]
+    right_channel: String,
+
+    /// path to a stereo calibration YAML (required for --stereo)
+    #[argh(option)]
+    calib: Option<String>,
 
     /// maximum number of frames to process (0 = all)
     #[argh(option, default = "0")]
@@ -287,12 +300,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (Box::new(src), Some(gt))
             }
             SourceCmd::Mcap(m) => {
-                let src = McapSource::open(
-                    std::path::Path::new(&m.path),
-                    &m.channel,
-                    m.start_frame,
-                    m.max_frames,
-                )?;
+                let path = std::path::Path::new(&m.path);
+                let src = if m.stereo {
+                    let calib = m
+                        .calib
+                        .as_deref()
+                        .ok_or("mcap --stereo requires --calib <stereo calibration YAML>")?;
+                    McapSource::open_stereo(
+                        path,
+                        &m.channel,
+                        &m.right_channel,
+                        std::path::Path::new(calib),
+                        m.start_frame,
+                        m.max_frames,
+                    )?
+                } else {
+                    McapSource::open(path, &m.channel, m.start_frame, m.max_frames)?
+                };
                 if !tui_active && let Some(n) = src.n_frames_hint() {
                     eprintln!("MCAP: {n} frames from /{}", m.channel);
                 }

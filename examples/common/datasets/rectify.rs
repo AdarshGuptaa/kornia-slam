@@ -39,18 +39,78 @@ pub struct StereoRectifier {
     right_map: Vec<[f32; 2]>,
 }
 
-impl StereoRectifier {
-    /// Builds the rectifier from cam0 (left) and cam1 (right) calibrations.
-    pub fn new(cam0: &EurocCameraCalibration, cam1: &EurocCameraCalibration) -> Self {
-        let width = cam0.width;
-        let height = cam0.height;
+/// Per-camera calibration for rectification: intrinsics + Brown-Conrady
+/// (rational) distortion at a fixed resolution. Decouples the rectifier from
+/// any one dataset's calibration container.
+pub struct CameraCalib {
+    /// Image width in pixels.
+    pub width: usize,
+    /// Image height in pixels.
+    pub height: usize,
+    /// Focal length x (pixels).
+    pub fx: f64,
+    /// Focal length y (pixels).
+    pub fy: f64,
+    /// Principal point x (pixels).
+    pub cx: f64,
+    /// Principal point y (pixels).
+    pub cy: f64,
+    /// Lens distortion (radial k1-k6 + tangential p1,p2).
+    pub distortion: PolynomialDistortion,
+}
 
+impl CameraCalib {
+    fn from_euroc(cam: &EurocCameraCalibration) -> Self {
+        Self {
+            width: cam.width,
+            height: cam.height,
+            fx: cam.fx,
+            fy: cam.fy,
+            cx: cam.cx,
+            cy: cam.cy,
+            distortion: PolynomialDistortion {
+                k1: cam.k1,
+                k2: cam.k2,
+                k3: 0.0,
+                k4: 0.0,
+                k5: 0.0,
+                k6: 0.0,
+                p1: cam.p1,
+                p2: cam.p2,
+            },
+        }
+    }
+}
+
+impl StereoRectifier {
+    /// Builds the rectifier from cam0 (left) and cam1 (right) EuRoC
+    /// calibrations, deriving the relative pose from their `T_BS` extrinsics.
+    pub fn new(cam0: &EurocCameraCalibration, cam1: &EurocCameraCalibration) -> Self {
         // Relative pose cam0 -> cam1: X_c1 = R * X_c0 + t.
         let (r0, t0) = decompose_t_bs(&cam0.t_bs);
         let (r1, t1) = decompose_t_bs(&cam1.t_bs);
         let r1t = r1.transpose();
         let r_rel = r1t * r0;
         let t_rel = r1t * (t0 - t1);
+        Self::from_calib(
+            &CameraCalib::from_euroc(cam0),
+            &CameraCalib::from_euroc(cam1),
+            r_rel,
+            t_rel,
+        )
+    }
+
+    /// Builds the rectifier from generic left/right calibration and the
+    /// relative pose left → right (`X_right = r_rel * X_left + t_rel`, with
+    /// `t_rel` in metres).
+    pub fn from_calib(
+        left: &CameraCalib,
+        right: &CameraCalib,
+        r_rel: Mat3F64,
+        t_rel: Vec3F64,
+    ) -> Self {
+        let width = left.width;
+        let height = left.height;
 
         // Bouguet: split the relative rotation in half so both cameras rotate
         // symmetrically into a common plane.
@@ -81,12 +141,12 @@ impl StereoRectifier {
 
         // Shared rectified intrinsics. Disparity = uL - uR is invariant to the
         // common principal point, so centering the image is safe.
-        let f = (cam0.fx + cam0.fy + cam1.fx + cam1.fy) / 4.0;
+        let f = (left.fx + left.fy + right.fx + right.fy) / 4.0;
         let cx = (width as f64 - 1.0) * 0.5;
         let cy = (height as f64 - 1.0) * 0.5;
 
-        let left_map = build_map(width, height, f, cx, cy, &rect_l, cam0);
-        let right_map = build_map(width, height, f, cx, cy, &rect_r, cam1);
+        let left_map = build_map(width, height, f, cx, cy, &rect_l, left);
+        let right_map = build_map(width, height, f, cx, cy, &rect_r, right);
 
         Self {
             width,
@@ -167,7 +227,7 @@ fn build_map(
     cx: f64,
     cy: f64,
     rect: &Mat3F64,
-    cam: &EurocCameraCalibration,
+    cam: &CameraCalib,
 ) -> Vec<[f32; 2]> {
     let rect_t = rect.transpose(); // rectified-normalized -> camera-normalized
     let intrinsic = CameraIntrinsic {
@@ -176,16 +236,7 @@ fn build_map(
         cx: cam.cx,
         cy: cam.cy,
     };
-    let distortion = PolynomialDistortion {
-        k1: cam.k1,
-        k2: cam.k2,
-        k3: 0.0,
-        k4: 0.0,
-        k5: 0.0,
-        k6: 0.0,
-        p1: cam.p1,
-        p2: cam.p2,
-    };
+    let distortion = cam.distortion;
 
     let mut map = vec![[0.0f32; 2]; width * height];
     for v in 0..height {
