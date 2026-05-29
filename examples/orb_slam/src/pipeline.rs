@@ -15,7 +15,7 @@ use kornia_algebra::Vec3F64;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_slam::Frame;
 use kornia_slam::estimation::MapProjectionEstimator;
-use kornia_slam::estimation::stereo::unproject_stereo;
+use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::map::{Keyframe, Map, MapPoint};
 use kornia_slam::system::{

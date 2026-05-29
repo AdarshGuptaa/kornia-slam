@@ -2,12 +2,17 @@
 //!
 //! EuRoC ships raw cam0/cam1 images with independent intrinsics, distortion,
 //! and a `T_BS` body-frame extrinsic each — not row-aligned. The stereo matcher
-//! ([`kornia_slam::estimation::stereo`]) assumes a rectified, row-aligned pair,
+//! ([`kornia_slam::stereo`]) assumes a rectified, row-aligned pair,
 //! so we rectify online: compute Bouguet rectification rotations, build a
 //! per-pixel undistort+rectify remap for each view, and resample the raw images.
 //!
 //! Mirrors OpenCV's `stereoRectify` + `initUndistortRectifyMap` + `remap`, which
 //! is what ORB-SLAM3's EuRoC stereo example uses.
+//!
+//! TODO: the Bouguet rectifier core is generic CV, not SLAM- or EuRoC-specific.
+//! When a second consumer appears, lift it into `kornia-imgproc::calibration`
+//! upstream (keyed on `CameraIntrinsic`/`CameraExtrinsic` + distortion, next to
+//! `distortion`/`fisheye`) and keep only the `EurocCameraCalibration` adapter here.
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_algebra::{Mat3F64, Vec3F64};
