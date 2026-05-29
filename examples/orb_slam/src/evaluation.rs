@@ -163,7 +163,10 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
     eprintln!("Scale            : {:.6}", a.scale);
     eprintln!("ATE RMSE         : {:.4} m", compute_ate(&aligned, gt));
     eprintln!("RPE RMSE         : {:.4} m", compute_rpe(&aligned, gt));
-    eprintln!("Final Drift      : {:.4} %", compute_drift(&aligned, gt) * 100.0);
+    eprintln!(
+        "Final Drift      : {:.4} %",
+        compute_drift(&aligned, gt) * 100.0
+    );
     eprintln!("=======================================================");
     Ok(())
 }

@@ -236,8 +236,15 @@ fn build_u8_pyramid(img: &Image<u8, 1, CpuAllocator>) -> Vec<Image<u8, 1, CpuAll
         let inv = 1.0 / ORB_SCALE.powi(level as i32);
         let w = ((w0 * inv).round() as usize).max(1);
         let h = ((h0 * inv).round() as usize).max(1);
-        let mut dst = Image::from_size_val(ImageSize { width: w, height: h }, 0u8, CpuAllocator)
-            .expect("pyramid level allocation");
+        let mut dst = Image::from_size_val(
+            ImageSize {
+                width: w,
+                height: h,
+            },
+            0u8,
+            CpuAllocator,
+        )
+        .expect("pyramid level allocation");
         resize_fast_mono(img, &mut dst, InterpolationMode::Bilinear).expect("pyramid resize");
         pyramid.push(dst);
     }
@@ -549,7 +556,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // ── Trajectory evaluation (EuRoC, --evaluate only) ─────────────────────
     if evaluate {
-        evaluation::report(&est_positions, &gt_positions, std::path::Path::new(&eval_out))?;
+        evaluation::report(
+            &est_positions,
+            &gt_positions,
+            std::path::Path::new(&eval_out),
+        )?;
     }
     Ok(())
 }

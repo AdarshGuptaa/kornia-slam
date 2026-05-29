@@ -218,10 +218,7 @@ where
         // Left patch must fit inside the octave image.
         let lw = left_img.width() as i32;
         let lh = left_img.height() as i32;
-        if scaled_u_l - w < 0
-            || scaled_u_l + w >= lw
-            || scaled_v_l - w < 0
-            || scaled_v_l + w >= lh
+        if scaled_u_l - w < 0 || scaled_u_l + w >= lw || scaled_v_l - w < 0 || scaled_v_l + w >= lh
         {
             continue;
         }
@@ -497,7 +494,9 @@ mod tests {
         assert!((p0.x - 5.0).abs() < 1e-9 && p0.y.abs() < 1e-9 && (p0.z - 5.0).abs() < 1e-9);
         let p2 = pts[1].1;
         assert_eq!(pts[1].0, 2);
-        assert!((p2.z - 2.0).abs() < 1e-9 && (p2.x - 1.0).abs() < 1e-9 && (p2.y - 1.0).abs() < 1e-9);
+        assert!(
+            (p2.z - 2.0).abs() < 1e-9 && (p2.x - 1.0).abs() < 1e-9 && (p2.y - 1.0).abs() < 1e-9
+        );
     }
 
     #[test]
