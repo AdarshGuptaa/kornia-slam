@@ -153,7 +153,7 @@ struct McapCmd {
     start_frame: usize,
 }
 
-/// Run live on an OAK-D camera (CamB mono).
+/// Run live on an OAK-D camera (CamB mono, or CamB+CamC stereo with --stereo).
 #[cfg(feature = "oakd")]
 #[derive(argh::FromArgs)]
 #[argh(subcommand, name = "oakd")]
@@ -162,17 +162,25 @@ struct OakdCmd {
     #[argh(option, default = "0")]
     max_frames: usize,
 
-    /// frame width in pixels (depthai resizes the source to this)
+    /// frame width in pixels (mono only; stereo uses the calibration's width)
     #[argh(option, default = "640")]
     width: u32,
 
-    /// frame height in pixels
+    /// frame height in pixels (mono only; stereo uses the calibration's height)
     #[argh(option, default = "400")]
     height: u32,
 
     /// camera FPS
     #[argh(option, default = "30.0")]
     fps: f32,
+
+    /// open CamB+CamC and rectify online; requires --calib
+    #[argh(switch)]
+    stereo: bool,
+
+    /// path to a stereo calibration YAML (required for --stereo)
+    #[argh(option)]
+    calib: Option<String>,
 }
 
 /// Run live on a UVC camera (laptop webcam, USB cam, CSI-to-UVC adapter…),
@@ -323,10 +331,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (Box::new(src), None)
             }
             #[cfg(feature = "oakd")]
-            SourceCmd::Oakd(o) => (
-                Box::new(OakdSource::open(o.width, o.height, o.fps, o.max_frames)?),
-                None,
-            ),
+            SourceCmd::Oakd(o) => {
+                let src = if o.stereo {
+                    let calib = o
+                        .calib
+                        .as_deref()
+                        .ok_or("oakd --stereo requires --calib <stereo calibration YAML>")?;
+                    OakdSource::open_stereo(o.fps, std::path::Path::new(calib), o.max_frames)?
+                } else {
+                    OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
+                };
+                (Box::new(src), None)
+            }
             #[cfg(feature = "uvc")]
             SourceCmd::Uvc(w) => {
                 let camera = kornia_3d::camera::PinholeCamera {

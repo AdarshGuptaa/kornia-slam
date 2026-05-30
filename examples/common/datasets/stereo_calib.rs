@@ -30,8 +30,10 @@ struct CamYaml {
 /// Deserialized stereo calibration (see module docs for the schema).
 #[derive(Deserialize)]
 pub struct StereoCalib {
-    width: usize,
-    height: usize,
+    /// Image width (pixels) both views are calibrated for.
+    pub width: usize,
+    /// Image height (pixels) both views are calibrated for.
+    pub height: usize,
     left: CamYaml,
     right: CamYaml,
     /// Left→right rotation, row-major 3×3.
