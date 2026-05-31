@@ -9,14 +9,14 @@ use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::EurocDataset;
 use crate::datasets::StereoRectifier;
 use crate::datasets::euroc::GroundTruthPose;
-/// Reads cam0 (and optionally rectified cam0+cam1) PNG frames from an EuRoC
-/// dataset in order.
+/// Reads left-camera (and optionally rectified left+right) PNG frames from an
+/// EuRoC dataset in order.
 pub struct EurocSource {
     dataset: EurocDataset,
     cursor: usize,
     start: usize,
     end: usize,
-    /// When `Some`, the source rectifies cam0+cam1 and yields stereo pairs.
+    /// When `Some`, the source rectifies the left+right pair and yields stereo.
     rectifier: Option<StereoRectifier>,
 }
 
@@ -24,7 +24,7 @@ impl EurocSource {
     /// Opens the dataset and configures the iteration window.
     ///
     /// `max_frames == 0` means "until the dataset is exhausted". `start_frame`
-    /// is the index into `cam0_samples` of the first sample to yield; later
+    /// is the index into the left-camera samples of the first sample to yield; later
     /// samples retain their absolute index in `FrameItem::idx`.
     pub fn open(
         root: impl AsRef<Path>,
@@ -34,8 +34,8 @@ impl EurocSource {
         Self::open_inner(root, start_frame, max_frames, false)
     }
 
-    /// Like [`Self::open`], but rectifies cam0+cam1 and yields stereo pairs.
-    /// Errors if the dataset has no usable cam1.
+    /// Like [`Self::open`], but rectifies the left+right pair and yields stereo
+    /// pairs. Errors if the dataset has no usable right camera.
     pub fn open_stereo(
         root: impl AsRef<Path>,
         start_frame: usize,
@@ -62,13 +62,13 @@ impl EurocSource {
         let rectifier = if stereo {
             if !dataset.is_stereo() {
                 return Err(SourceError::other(
-                    "stereo requested but dataset has no usable cam1",
+                    "stereo requested but dataset has no usable right camera",
                 ));
             }
-            let cam1 = dataset
-                .cam1_calibration
-                .expect("is_stereo() guarantees cam1 calibration");
-            Some(StereoRectifier::new(&dataset.cam0_calibration, &cam1))
+            let right = dataset
+                .right_calibration
+                .expect("is_stereo() guarantees right-camera calibration");
+            Some(StereoRectifier::new(&dataset.left_calibration, &right))
         } else {
             None
         };
@@ -113,7 +113,7 @@ impl FrameSource for EurocSource {
             return Ok(None);
         }
         let idx = self.cursor;
-        let sample = &self.dataset.cam0_samples[idx];
+        let sample = &self.dataset.left_samples[idx];
         let timestamp_sec = sample.timestamp_sec;
         let left_raw = read_image_png_mono8(&sample.image_path)
             .map_err(SourceError::other)?
@@ -121,7 +121,7 @@ impl FrameSource for EurocSource {
 
         let (image, right_image) = match &self.rectifier {
             Some(rect) => {
-                let right_path = &self.dataset.cam1_samples[idx].image_path;
+                let right_path = &self.dataset.right_samples[idx].image_path;
                 let right_raw = read_image_png_mono8(right_path)
                     .map_err(SourceError::other)?
                     .into_inner();

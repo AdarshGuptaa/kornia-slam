@@ -129,14 +129,14 @@ pub struct EurocDataset {
     /// Base directory of the extracted dataset.
     #[allow(dead_code)]
     pub root: std::path::PathBuf,
-    /// Ordered camera samples.
-    pub cam0_samples: Vec<DatasetSample>,
-    /// Camera calibration for `cam0`.
-    pub cam0_calibration: EurocCameraCalibration,
-    /// Ordered `cam1` (right) samples; empty if the dataset is monocular.
-    pub cam1_samples: Vec<DatasetSample>,
-    /// Camera calibration for `cam1`; `None` if the dataset is monocular.
-    pub cam1_calibration: Option<EurocCameraCalibration>,
+    /// Ordered left-camera (`cam0`) samples.
+    pub left_samples: Vec<DatasetSample>,
+    /// Left-camera (`cam0`) calibration.
+    pub left_calibration: EurocCameraCalibration,
+    /// Ordered right-camera (`cam1`) samples; empty if the dataset is monocular.
+    pub right_samples: Vec<DatasetSample>,
+    /// Right-camera (`cam1`) calibration; `None` if the dataset is monocular.
+    pub right_calibration: Option<EurocCameraCalibration>,
     /// Ground-truth poses (empty if GT file not present).
     #[allow(dead_code)]
     pub ground_truth: Vec<GroundTruthPose>,
@@ -147,12 +147,12 @@ impl EurocDataset {
     /// when present.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, DatasetError> {
         let root = root.as_ref().to_path_buf();
-        let cam0_calibration = Self::load_camera_calibration(&root, "cam0")?;
-        let cam0_samples = Self::load_camera_samples(&root, "cam0")?;
+        let left_calibration = Self::load_camera_calibration(&root, "cam0")?;
+        let left_samples = Self::load_camera_samples(&root, "cam0")?;
 
-        // cam1 is optional: present only for stereo datasets.
-        let cam1_dir = root.join("mav0").join("cam1");
-        let (cam1_calibration, cam1_samples) = if cam1_dir.exists() {
+        // The right camera (cam1) is present only for stereo datasets.
+        let right_dir = root.join("mav0").join("cam1");
+        let (right_calibration, right_samples) = if right_dir.exists() {
             (
                 Some(Self::load_camera_calibration(&root, "cam1")?),
                 Self::load_camera_samples(&root, "cam1")?,
@@ -165,10 +165,10 @@ impl EurocDataset {
 
         Ok(Self {
             root,
-            cam0_samples,
-            cam0_calibration,
-            cam1_samples,
-            cam1_calibration,
+            left_samples,
+            left_calibration,
+            right_samples,
+            right_calibration,
             ground_truth,
         })
     }
@@ -215,19 +215,19 @@ impl EurocDataset {
         Ok(samples)
     }
 
-    /// Returns ordered cam0 samples.
+    /// Returns ordered left-camera samples.
     pub fn samples(&self) -> &[DatasetSample] {
-        &self.cam0_samples
+        &self.left_samples
     }
 
-    /// Whether the dataset has a usable cam1 (calibration + matching samples).
+    /// Whether the dataset has a usable right camera (calibration + samples).
     pub fn is_stereo(&self) -> bool {
-        self.cam1_calibration.is_some() && !self.cam1_samples.is_empty()
+        self.right_calibration.is_some() && !self.right_samples.is_empty()
     }
 
-    /// Returns the `cam0` camera model.
+    /// Returns the left-camera model.
     pub fn camera(&self) -> PinholeCamera {
-        self.cam0_calibration.to_pinhole_camera()
+        self.left_calibration.to_pinhole_camera()
     }
 
     /// Returns parsed ground-truth poses (possibly empty).
@@ -433,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn dataset_loads_cam0_calibration() {
+    fn dataset_loads_left_calibration() {
         let dir = TestDir::new("euroc-calibration-ok");
         write_minimal_euroc_tree(dir.path(), true);
 

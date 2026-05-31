@@ -101,7 +101,7 @@ struct EurocCmd {
     #[argh(option, default = "0")]
     start_frame: usize,
 
-    /// rectify cam0+cam1 and compute per-keypoint stereo depth
+    /// rectify the left+right cameras and compute per-keypoint stereo depth
     #[argh(switch)]
     stereo: bool,
 

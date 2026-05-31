@@ -1,6 +1,6 @@
 //! Online stereo rectification for EuRoC (and other non-rectified) pairs.
 //!
-//! EuRoC ships raw cam0/cam1 images with independent intrinsics, distortion,
+//! EuRoC ships raw left/right (cam0/cam1) images with independent intrinsics, distortion,
 //! and a `T_BS` body-frame extrinsic each — not row-aligned. The stereo matcher
 //! ([`kornia_slam::stereo`]) assumes a rectified, row-aligned pair,
 //! so we rectify online: compute Bouguet rectification rotations, build a
@@ -83,18 +83,18 @@ impl CameraCalib {
 }
 
 impl StereoRectifier {
-    /// Builds the rectifier from cam0 (left) and cam1 (right) EuRoC
+    /// Builds the rectifier from the left (`cam0`) and right (`cam1`) EuRoC
     /// calibrations, deriving the relative pose from their `T_BS` extrinsics.
-    pub fn new(cam0: &EurocCameraCalibration, cam1: &EurocCameraCalibration) -> Self {
-        // Relative pose cam0 -> cam1: X_c1 = R * X_c0 + t.
-        let (r0, t0) = decompose_t_bs(&cam0.t_bs);
-        let (r1, t1) = decompose_t_bs(&cam1.t_bs);
-        let r1t = r1.transpose();
-        let r_rel = r1t * r0;
-        let t_rel = r1t * (t0 - t1);
+    pub fn new(left: &EurocCameraCalibration, right: &EurocCameraCalibration) -> Self {
+        // Relative pose left -> right: X_right = R * X_left + t.
+        let (r_l, t_l) = decompose_t_bs(&left.t_bs);
+        let (r_r, t_r) = decompose_t_bs(&right.t_bs);
+        let r_rt = r_r.transpose();
+        let r_rel = r_rt * r_l;
+        let t_rel = r_rt * (t_l - t_r);
         Self::from_calib(
-            &CameraCalib::from_euroc(cam0),
-            &CameraCalib::from_euroc(cam1),
+            &CameraCalib::from_euroc(left),
+            &CameraCalib::from_euroc(right),
             r_rel,
             t_rel,
         )
@@ -136,8 +136,8 @@ impl StereoRectifier {
         };
         let w_r = rodrigues_mat(&ww);
 
-        let rect_l = w_r * r_l; // cam0 -> rectified
-        let rect_r = w_r * r_r; // cam1 -> rectified
+        let rect_l = w_r * r_l; // left -> rectified
+        let rect_r = w_r * r_r; // right -> rectified
 
         // Shared rectified intrinsics. Disparity = uL - uR is invariant to the
         // common principal point, so centering the image is safe.
@@ -428,9 +428,9 @@ mod tests {
             0.0,
             1.0,
         ];
-        let cam0 = cam(t_bs0, 367.215, 248.375);
-        let cam1 = cam(t_bs1, 379.999, 255.238);
-        let rect = StereoRectifier::new(&cam0, &cam1);
+        let left = cam(t_bs0, 367.215, 248.375);
+        let right = cam(t_bs1, 379.999, 255.238);
+        let rect = StereoRectifier::new(&left, &right);
 
         // EuRoC VI-sensor stereo baseline is ~0.11 m.
         assert!(
