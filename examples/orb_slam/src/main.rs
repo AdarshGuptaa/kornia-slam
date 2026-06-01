@@ -246,6 +246,12 @@ const ORB_SCALE: f32 = 1.2;
 /// ORB pyramid level count (matches `OrbDetector` default `n_scales`).
 const ORB_LEVELS: usize = 8;
 
+// TODO: dedupe with kornia-imgproc — `OrbDetector::build_pyramid` (and helpers
+// `pyramid_size_at_level` / `pyramid_reduce_u8`) implement this same 1.2-scale,
+// 8-level pyramid, but they're private. Once those are exposed publicly (e.g. in
+// `kornia_imgproc::pyramid`), call them here instead. Note the semantic diff:
+// this builder resizes the original full-res image each level, whereas kornia
+// resizes the previous level (ORB-SLAM3 behavior) — reconcile before switching.
 /// Builds an ORB-consistent u8 image pyramid: level `o` is the full image
 /// downscaled by `ORB_SCALE^o`, so a full-resolution keypoint at octave `o`
 /// maps into level `o` by multiplying its coordinates by `ORB_SCALE^-o`.
