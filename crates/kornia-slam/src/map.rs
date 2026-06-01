@@ -87,6 +87,14 @@ impl Keyframe {
 /// A triangulated point ready for map insertion: (position, descriptor, color, prev_desc_idx, curr_desc_idx).
 pub type TriangulatedPoint = (Vec3F64, [u8; 32], [u8; 3], usize, usize);
 
+/// Relative standard deviation of a stereo depth measurement, as a fraction of
+/// the measured depth (used to weight the BA depth residual). Depth-proportional
+/// so far points—where disparity is least reliable—are downweighted.
+pub const STEREO_DEPTH_REL_SIGMA: f32 = 0.05;
+/// Floor on the stereo depth sigma (metres) to avoid over-trusting very near
+/// points.
+pub const STEREO_DEPTH_MIN_SIGMA: f32 = 0.02;
+
 /// ORB pyramid scale factor between adjacent levels (matches the kornia-imgproc
 /// ORB extractor default `downscale = 1.2`, which equals ORB-SLAM3's default).
 pub const ORB_SCALE_FACTOR: f64 = 1.2;
@@ -743,14 +751,15 @@ impl Map {
                     };
                     if let Some(kp) = kf.frame.features.keypoints_xy.get(desc_idx) {
                         let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                        let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
                         observations.push(BaObservation {
                             pose_idx,
                             point_idx,
                             pixel: [p.x as f32, p.y as f32],
                             fixed_pose: is_fixed,
                             fixed_point: false,
-                            depth_meas: None,
-                            depth_sigma: 1.0,
+                            depth_meas,
+                            depth_sigma,
                         });
                     }
                 }
@@ -888,14 +897,15 @@ impl Map {
                     };
                     if let Some(kp) = kf.frame.features.keypoints_xy.get(desc_idx) {
                         let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                        let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
                         observations.push(BaObservation {
                             pose_idx: kf_idx,
                             point_idx,
                             pixel: [p.x as f32, p.y as f32],
                             fixed_pose: is_fixed,
                             fixed_point: false,
-                            depth_meas: None,
-                            depth_sigma: 1.0,
+                            depth_meas,
+                            depth_sigma,
                         });
                     }
                 }
@@ -927,6 +937,21 @@ impl Map {
         for &global_idx in &mp_global_indices {
             self.update_map_point_geometry(global_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
         }
+    }
+}
+
+/// Depth measurement + sigma for a BA observation at `desc_idx` of `kf`.
+///
+/// Returns `(Some(z), sigma)` when the keyframe's keypoint has a valid stereo
+/// depth (anchoring the BA's metric scale), else `(None, 1.0)` for a pure
+/// reprojection observation.
+fn stereo_depth_obs(kf: &Keyframe, desc_idx: usize) -> (Option<f32>, f32) {
+    match kf.frame.stereo_depth(desc_idx) {
+        Some(z) => (
+            Some(z),
+            (STEREO_DEPTH_REL_SIGMA * z).max(STEREO_DEPTH_MIN_SIGMA),
+        ),
+        None => (None, 1.0),
     }
 }
 
@@ -1008,6 +1033,8 @@ mod tests {
                 height: 480,
             },
             keypoint_colors: vec![[0; 3]; n],
+            u_right: Vec::new(),
+            depth: Vec::new(),
         }
     }
 
@@ -1059,6 +1086,31 @@ mod tests {
         assert!((mp.found_ratio() - 0.4).abs() < 1e-9);
         mp.mark_culled();
         assert!(mp.culled);
+    }
+
+    #[test]
+    fn stereo_depth_obs_uses_proportional_sigma_with_floor() {
+        let mut frame = test_frame(0, vec![[0u8; 32], [1u8; 32]]);
+        frame.depth = vec![10.0, -1.0];
+        frame.u_right = vec![5.0, -1.0];
+        let kf = Keyframe::from_frame(frame);
+
+        // Valid depth: sigma = 0.05 * 10 = 0.5.
+        let (d, s) = stereo_depth_obs(&kf, 0);
+        assert_eq!(d, Some(10.0));
+        assert!((s - 0.5).abs() < 1e-6);
+
+        // Sentinel depth: no measurement.
+        let (d1, s1) = stereo_depth_obs(&kf, 1);
+        assert_eq!(d1, None);
+        assert!((s1 - 1.0).abs() < 1e-9);
+
+        // Very near depth clamps to the sigma floor.
+        let mut near = test_frame(1, vec![[0u8; 32]]);
+        near.depth = vec![0.1]; // 0.05 * 0.1 = 0.005 < floor
+        let kf_near = Keyframe::from_frame(near);
+        let (_, s2) = stereo_depth_obs(&kf_near, 0);
+        assert!((s2 - STEREO_DEPTH_MIN_SIGMA).abs() < 1e-9);
     }
 
     #[test]
