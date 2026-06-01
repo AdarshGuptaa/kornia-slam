@@ -8,6 +8,11 @@ pub struct PipelineConfig {
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
     pub enable_local_ba: bool,
+    /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
+    /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
+    /// keypoints directly into metric map points. `None` disables stereo
+    /// densification (monocular, or stereo without per-KF densification).
+    pub stereo_close_depth_m: Option<f64>,
     /// Emit per-frame diagnostics: skip reasons in bootstrap, reject reasons
     /// in tracking, keyframe-growth and fuse counters.
     pub debug: bool,
@@ -24,6 +29,7 @@ impl Default for PipelineConfig {
             map_projection: MapProjectionConfig::default(),
             keyframe_policy: KeyframePolicy::default(),
             enable_local_ba: true,
+            stereo_close_depth_m: None,
             debug: false,
         }
     }

@@ -3,6 +3,7 @@
 pub mod estimation;
 pub mod frame;
 pub mod map;
+pub mod stereo;
 pub mod system;
 
 pub use estimation::MapProjectionEstimator;

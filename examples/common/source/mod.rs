@@ -29,8 +29,10 @@ pub struct FrameItem {
     /// Capture timestamp in seconds (host clock for live sources).
     #[allow(dead_code)]
     pub timestamp_sec: f64,
-    /// Grayscale image.
+    /// Grayscale image (rectified left view when the source is stereo).
     pub image: Image<u8, 1, CpuAllocator>,
+    /// Rectified right view, when the source provides a stereo pair.
+    pub right_image: Option<Image<u8, 1, CpuAllocator>>,
 }
 
 /// Pull-based interface for monocular SLAM frame producers.
@@ -40,7 +42,14 @@ pub struct FrameItem {
 /// a CLI-imposed cap is reached.
 pub trait FrameSource {
     /// Camera intrinsics. Must be valid before the first `next_frame` call.
+    /// For a stereo source this is the rectified camera shared by both views.
     fn camera(&self) -> PinholeCamera;
+
+    /// Stereo baseline `bf = focal * baseline` in pixel·metre units, when the
+    /// source yields rectified stereo pairs. `None` for monocular sources.
+    fn stereo_bf(&self) -> Option<f64> {
+        None
+    }
 
     /// Total frames the source will yield, if known.
     ///
