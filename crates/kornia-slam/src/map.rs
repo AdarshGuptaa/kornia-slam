@@ -557,6 +557,48 @@ impl Map {
         }
     }
 
+    /// Covisibility neighbors of keyframe `kf_idx`: other keyframes that share
+    /// observed map points with it, as `(frame_idx, weight)` where `weight` is
+    /// the number of map points both observe, sorted by descending weight.
+    ///
+    /// Derived on demand by inverting `MapPoint::observation_kf_indices` — no
+    /// cached graph state, so it stays correct across culls and fuses. Mirrors
+    /// ORB-SLAM3's `KeyFrame::UpdateConnections`: links below `min_weight` are
+    /// dropped, but if none reach the threshold the single strongest link is
+    /// kept so the graph stays connected.
+    pub fn covisible_keyframes(&self, kf_idx: usize, min_weight: usize) -> Vec<(usize, usize)> {
+        let Some(kf) = self.get_keyframe(kf_idx) else {
+            return Vec::new();
+        };
+
+        let mut weights: HashMap<usize, usize> = HashMap::new();
+        for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+            let Some(mp) = self.map_points.get(*mp_idx) else {
+                continue;
+            };
+            if mp.culled {
+                continue;
+            }
+            for &obs_kf in &mp.observation_kf_indices {
+                if obs_kf != kf_idx {
+                    *weights.entry(obs_kf).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut connections: Vec<(usize, usize)> = weights.into_iter().collect();
+        // Descending weight; break ties by descending frame index for determinism.
+        connections.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+
+        let strongest = connections.first().copied();
+        connections.retain(|&(_, w)| w >= min_weight);
+        if connections.is_empty() {
+            // Keep the best link so an under-connected KF is never orphaned.
+            connections.extend(strongest);
+        }
+        connections
+    }
+
     /// Builds a local map of visible points from nearby keyframes.
     pub fn build_local_map_points(
         &self,
@@ -564,7 +606,8 @@ impl Map {
         current_keyframe: Option<&Keyframe>,
     ) -> (Vec<MapPoint>, Vec<usize>) {
         const MAX_VOTED_KEYFRAMES: usize = 10;
-        const MAX_RECENT_KEYFRAMES: usize = 10;
+        const MAX_COVIS_NEIGHBORS: usize = 10;
+        const MIN_COVIS_WEIGHT: usize = 15;
 
         let mut keyframe_votes: HashMap<usize, usize> = HashMap::new();
         for &(mp_idx, _) in tracked_matches {
@@ -576,15 +619,29 @@ impl Map {
         let mut voted_kfs: Vec<(usize, usize)> = keyframe_votes.into_iter().collect();
         voted_kfs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
 
+        // Local keyframes (ORB-SLAM3 TrackLocalMap): the current KF plus the KFs
+        // owning the tracked points (K1), then their covisibility-graph
+        // neighbors (K2). Replaces the former recency-based fallback.
         let mut local_kf_indices: HashSet<usize> = HashSet::new();
-        if let Some(kf) = current_keyframe {
-            local_kf_indices.insert(kf.frame.idx);
+        let mut seed_kfs: Vec<usize> = Vec::new();
+        if let Some(kf) = current_keyframe
+            && local_kf_indices.insert(kf.frame.idx)
+        {
+            seed_kfs.push(kf.frame.idx);
         }
         for (kf_idx, _) in voted_kfs.into_iter().take(MAX_VOTED_KEYFRAMES) {
-            local_kf_indices.insert(kf_idx);
+            if local_kf_indices.insert(kf_idx) {
+                seed_kfs.push(kf_idx);
+            }
         }
-        for kf in self.keyframes.iter().rev().take(MAX_RECENT_KEYFRAMES) {
-            local_kf_indices.insert(kf.frame.idx);
+        for &seed in &seed_kfs {
+            for (nb_idx, _) in self
+                .covisible_keyframes(seed, MIN_COVIS_WEIGHT)
+                .into_iter()
+                .take(MAX_COVIS_NEIGHBORS)
+            {
+                local_kf_indices.insert(nb_idx);
+            }
         }
 
         let mut mp_indices: HashSet<usize> = HashSet::new();
@@ -1086,6 +1143,61 @@ mod tests {
         assert!((mp.found_ratio() - 0.4).abs() < 1e-9);
         mp.mark_culled();
         assert!(mp.culled);
+    }
+
+    #[test]
+    fn covisible_keyframes_weights_by_shared_points() {
+        // Three keyframes; map points observed by overlapping subsets:
+        //   A: KF0, KF1, KF2   B: KF0, KF1   C: KF0, KF2
+        // From KF0's view: KF1 shares {A,B}=2, KF2 shares {A,C}=2.
+        let mut map = Map::new();
+        for idx in 0..3 {
+            // Four descriptor slots so KF0 can hold its three observations.
+            map.upsert_keyframe(Keyframe::from_frame(test_frame(
+                idx,
+                (0..4).map(|d| [(idx * 10 + d) as u8; 32]).collect(),
+            )));
+        }
+
+        // (observers, name) -> push a map point and associate desc slot 0/1.
+        let specs: [(&[usize], usize); 3] = [(&[0, 1, 2], 0), (&[0, 1], 1), (&[0, 2], 1)];
+        for (observers, _) in specs {
+            let mp_idx = map.push_map_point(MapPoint::new(
+                Vec3F64::new(0.0, 0.0, 1.0),
+                [0u8; 32],
+                0,
+                [0; 3],
+                observers[0],
+            ));
+            for (slot, &kf_idx) in observers.iter().enumerate() {
+                if slot > 0
+                    && let Some(mp) = map.map_points.get_mut(mp_idx)
+                {
+                    mp.add_observation_descriptor(kf_idx, [0u8; 32]);
+                }
+                // Associate a free descriptor slot in that keyframe.
+                let kf = map.get_keyframe_mut(kf_idx).unwrap();
+                let free = kf.map_point_by_desc_idx.iter().position(|s| s.is_none());
+                kf.associate_map_point(free.unwrap_or(0), mp_idx);
+            }
+        }
+
+        // min_weight 1 keeps both neighbors; sorted by descending weight.
+        let covis = map.covisible_keyframes(0, 1);
+        assert_eq!(covis.len(), 2);
+        assert!(covis.iter().all(|&(_, w)| w == 2));
+        assert_eq!(
+            covis.iter().map(|&(k, _)| k).collect::<HashSet<_>>(),
+            HashSet::from([1, 2])
+        );
+
+        // High threshold drops everything but the strongest link is retained.
+        let fallback = map.covisible_keyframes(0, 99);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].1, 2);
+
+        // Unknown keyframe yields no connections.
+        assert!(map.covisible_keyframes(999, 1).is_empty());
     }
 
     #[test]
