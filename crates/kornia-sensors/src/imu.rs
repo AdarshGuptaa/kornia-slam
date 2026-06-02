@@ -1,6 +1,4 @@
-use kornia_algebra::{Mat3F64, Vec3F64};
-
-use crate::so3;
+use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
 /// A single IMU reading: angular velocity and linear acceleration in the body frame.
 #[derive(Debug, Clone, Copy)]
@@ -101,15 +99,15 @@ impl PreintegratedImu {
 
         // Incremental rotation and its right Jacobian
         let omega_dt = gyro * dt;
-        let d_rot = so3::exp(&omega_dt);
-        let jr = so3::right_jacobian(&omega_dt);
+        let d_rot = SO3F64::exp(omega_dt).matrix();
+        let jr = SO3F64::right_jacobian(omega_dt);
 
         // Rotate acceleration by current ΔR: group action SO(3) × R³ → R³
         let rotated_accel = mat3_mul_vec3(&self.delta_rotation, &accel);
 
         // Skew-symmetric matrix of unrotated acceleration (needed for A matrix Jacobians).
         // We use hat(a) pre-multiplied by ΔR, NOT hat(ΔR·a), following Forster et al. / ORB-SLAM3.
-        let accel_hat = so3::hat(&accel);
+        let accel_hat = SO3F64::hat(accel);
 
         // --- Covariance propagation: C' = A·C·Aᵀ + B·N·Bᵀ ---
 
