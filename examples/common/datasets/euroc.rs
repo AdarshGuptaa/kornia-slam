@@ -59,7 +59,7 @@ pub struct GroundTruthPose {
     pub qz: f64,
 }
 
-/// EuRoC `cam0` calibration loaded from `sensor.yaml`.
+/// EuRoC camera calibration loaded from a cam's `sensor.yaml`.
 #[derive(Debug, Clone, Copy)]
 pub struct EurocCameraCalibration {
     /// Focal length in x.
@@ -78,6 +78,13 @@ pub struct EurocCameraCalibration {
     pub p1: f64,
     /// Tangential distortion coefficient.
     pub p2: f64,
+    /// Image width in pixels (`resolution[0]`).
+    pub width: usize,
+    /// Image height in pixels (`resolution[1]`).
+    pub height: usize,
+    /// Sensor-to-body transform `T_BS` (row-major 4x4): maps a point in the
+    /// camera frame to the body frame, `X_body = T_BS * X_cam`.
+    pub t_bs: [f64; 16],
 }
 
 impl EurocCameraCalibration {
@@ -97,11 +104,20 @@ impl EurocCameraCalibration {
 }
 
 #[derive(Debug, Deserialize)]
+struct TbsBlock {
+    data: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct EurocSensorYaml {
     camera_model: String,
     distortion_model: Option<String>,
     intrinsics: Vec<f64>,
     distortion_coefficients: Vec<f64>,
+    #[serde(default)]
+    resolution: Vec<usize>,
+    #[serde(rename = "T_BS")]
+    t_bs: Option<TbsBlock>,
 }
 
 /// Reader for the EuRoC MAV dataset (ASL format).
@@ -113,23 +129,54 @@ pub struct EurocDataset {
     /// Base directory of the extracted dataset.
     #[allow(dead_code)]
     pub root: std::path::PathBuf,
-    /// Ordered camera samples.
-    pub cam0_samples: Vec<DatasetSample>,
-    /// Camera calibration for `cam0`.
-    pub cam0_calibration: EurocCameraCalibration,
+    /// Ordered left-camera (`cam0`) samples.
+    pub left_samples: Vec<DatasetSample>,
+    /// Left-camera (`cam0`) calibration.
+    pub left_calibration: EurocCameraCalibration,
+    /// Ordered right-camera (`cam1`) samples; empty if the dataset is monocular.
+    pub right_samples: Vec<DatasetSample>,
+    /// Right-camera (`cam1`) calibration; `None` if the dataset is monocular.
+    pub right_calibration: Option<EurocCameraCalibration>,
     /// Ground-truth poses (empty if GT file not present).
     #[allow(dead_code)]
     pub ground_truth: Vec<GroundTruthPose>,
 }
 
 impl EurocDataset {
-    /// Opens the dataset from `<root>/mav0/cam0/data.csv`.
+    /// Opens the dataset from `<root>/mav0/cam0/data.csv`, also loading `cam1`
+    /// when present.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, DatasetError> {
         let root = root.as_ref().to_path_buf();
-        let csv = root.join("mav0").join("cam0").join("data.csv");
-        let data_dir = root.join("mav0").join("cam0").join("data");
-        let cam0_calibration = Self::load_cam0_calibration(&root)?;
+        let left_calibration = Self::load_camera_calibration(&root, "cam0")?;
+        let left_samples = Self::load_camera_samples(&root, "cam0")?;
 
+        // The right camera (cam1) is present only for stereo datasets.
+        let right_dir = root.join("mav0").join("cam1");
+        let (right_calibration, right_samples) = if right_dir.exists() {
+            (
+                Some(Self::load_camera_calibration(&root, "cam1")?),
+                Self::load_camera_samples(&root, "cam1")?,
+            )
+        } else {
+            (None, Vec::new())
+        };
+
+        let ground_truth = Self::load_ground_truth(&root);
+
+        Ok(Self {
+            root,
+            left_samples,
+            left_calibration,
+            right_samples,
+            right_calibration,
+            ground_truth,
+        })
+    }
+
+    /// Loads the ordered image samples for a given camera (`cam0` / `cam1`).
+    fn load_camera_samples(root: &Path, cam: &str) -> Result<Vec<DatasetSample>, DatasetError> {
+        let csv = root.join("mav0").join(cam).join("data.csv");
+        let data_dir = root.join("mav0").join(cam).join("data");
         if !csv.exists() {
             return Err(DatasetError::FileNotFound(csv));
         }
@@ -165,25 +212,22 @@ impl EurocDataset {
                 image_path: data_dir.join(file_str.trim()),
             });
         }
-
-        let ground_truth = Self::load_ground_truth(&root);
-
-        Ok(Self {
-            root,
-            cam0_samples: samples,
-            cam0_calibration,
-            ground_truth,
-        })
+        Ok(samples)
     }
 
-    /// Returns ordered cam0 samples.
+    /// Returns ordered left-camera samples.
     pub fn samples(&self) -> &[DatasetSample] {
-        &self.cam0_samples
+        &self.left_samples
     }
 
-    /// Returns the `cam0` camera model.
+    /// Whether the dataset has a usable right camera (calibration + samples).
+    pub fn is_stereo(&self) -> bool {
+        self.right_calibration.is_some() && !self.right_samples.is_empty()
+    }
+
+    /// Returns the left-camera model.
     pub fn camera(&self) -> PinholeCamera {
-        self.cam0_calibration.to_pinhole_camera()
+        self.left_calibration.to_pinhole_camera()
     }
 
     /// Returns parsed ground-truth poses (possibly empty).
@@ -244,8 +288,11 @@ impl EurocDataset {
         poses
     }
 
-    fn load_cam0_calibration(root: &Path) -> Result<EurocCameraCalibration, DatasetError> {
-        let sensor_yaml = root.join("mav0").join("cam0").join("sensor.yaml");
+    fn load_camera_calibration(
+        root: &Path,
+        cam: &str,
+    ) -> Result<EurocCameraCalibration, DatasetError> {
+        let sensor_yaml = root.join("mav0").join(cam).join("sensor.yaml");
         if !sensor_yaml.exists() {
             return Err(DatasetError::FileNotFound(sensor_yaml));
         }
@@ -253,7 +300,7 @@ impl EurocDataset {
         let file = File::open(&sensor_yaml)?;
         let sensor: EurocSensorYaml = serde_yaml::from_reader(file).map_err(|e| {
             DatasetError::Parse(format!(
-                "invalid EuRoC cam0 calibration at {}: {e}",
+                "invalid EuRoC {cam} calibration at {}: {e}",
                 sensor_yaml.display()
             ))
         })?;
@@ -289,6 +336,28 @@ impl EurocDataset {
             )));
         };
 
+        let (width, height) = match sensor.resolution.as_slice() {
+            [w, h] => (*w, *h),
+            _ => (0, 0),
+        };
+
+        let t_bs = match sensor.t_bs {
+            Some(block) if block.data.len() == 16 => {
+                let mut m = [0.0f64; 16];
+                m.copy_from_slice(&block.data);
+                m
+            }
+            // Identity fallback when T_BS is absent (monocular use).
+            _ => {
+                let mut m = [0.0f64; 16];
+                m[0] = 1.0;
+                m[5] = 1.0;
+                m[10] = 1.0;
+                m[15] = 1.0;
+                m
+            }
+        };
+
         Ok(EurocCameraCalibration {
             fx: *fx,
             fy: *fy,
@@ -298,6 +367,9 @@ impl EurocDataset {
             k2: *k2,
             p1: *p1,
             p2: *p2,
+            width,
+            height,
+            t_bs,
         })
     }
 }
@@ -361,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn dataset_loads_cam0_calibration() {
+    fn dataset_loads_left_calibration() {
         let dir = TestDir::new("euroc-calibration-ok");
         write_minimal_euroc_tree(dir.path(), true);
 

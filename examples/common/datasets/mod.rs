@@ -3,4 +3,5 @@ pub mod euroc;
 pub mod hilti;
 
 pub use euroc::EurocDataset;
-pub use hilti::HiltiDataset;
+pub use rectify::StereoRectifier;
+pub use stereo_calib::StereoCalib;

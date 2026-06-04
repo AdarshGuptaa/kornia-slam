@@ -33,10 +33,14 @@ mod tui;
 mod utils;
 use crate::datasets::euroc::GroundTruthPose;
 use config::PipelineConfig;
-use evaluation::{align_sim3, associate_gt, compute_ate, compute_drift, compute_rpe};
+use evaluation::associate_gt;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
+use kornia_image::{Image, ImageSize, InterpolationMode};
+use kornia_imgproc::resize::resize_fast_mono;
 use kornia_slam::Frame;
+use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
+use kornia_tensor::CpuAllocator;
 use pipeline::Pipeline;
 #[cfg(feature = "oakd")]
 use source::OakdSource;
@@ -96,6 +100,19 @@ struct EurocCmd {
     /// skip this many initial frames
     #[argh(option, default = "0")]
     start_frame: usize,
+
+    /// rectify the left+right cameras and compute per-keypoint stereo depth
+    #[argh(switch)]
+    stereo: bool,
+
+    /// after the run, align the trajectory to ground truth and report
+    /// ATE/RPE/drift (writes kornia_slam_raw.csv and kornia_slam_aligned.csv)
+    #[argh(switch)]
+    evaluate: bool,
+
+    /// directory for the evaluation CSVs (created if missing; default: current dir)
+    #[argh(option, default = "String::from(\".\")")]
+    eval_out: String,
 }
 
 /// Run on a bubbaloop MCAP recording.
@@ -110,9 +127,22 @@ struct McapCmd {
     #[argh(option)]
     path: String,
 
-    /// channel suffix to read (e.g. mono_left, mono_right, compressed)
+    /// channel suffix to read (e.g. mono_left, mono_right, compressed).
+    /// In stereo mode this is the left channel.
     #[argh(option, default = "String::from(\"mono_left\")")]
     channel: String,
+
+    /// rectify a stereo pair and compute per-keypoint depth; requires --calib
+    #[argh(switch)]
+    stereo: bool,
+
+    /// right stereo channel suffix (stereo mode)
+    #[argh(option, default = "String::from(\"mono_right\")")]
+    right_channel: String,
+
+    /// path to a stereo calibration YAML (required for --stereo)
+    #[argh(option)]
+    calib: Option<String>,
 
     /// maximum number of frames to process (0 = all)
     #[argh(option, default = "0")]
@@ -123,7 +153,7 @@ struct McapCmd {
     start_frame: usize,
 }
 
-/// Run live on an OAK-D camera (CamB mono).
+/// Run live on an OAK-D camera (CamB mono, or CamB+CamC stereo with --stereo).
 #[cfg(feature = "oakd")]
 #[derive(argh::FromArgs)]
 #[argh(subcommand, name = "oakd")]
@@ -132,17 +162,25 @@ struct OakdCmd {
     #[argh(option, default = "0")]
     max_frames: usize,
 
-    /// frame width in pixels (depthai resizes the source to this)
+    /// frame width in pixels (mono only; stereo uses the calibration's width)
     #[argh(option, default = "640")]
     width: u32,
 
-    /// frame height in pixels
+    /// frame height in pixels (mono only; stereo uses the calibration's height)
     #[argh(option, default = "400")]
     height: u32,
 
     /// camera FPS
     #[argh(option, default = "30.0")]
     fps: f32,
+
+    /// open CamB+CamC and rectify online; requires --calib
+    #[argh(switch)]
+    stereo: bool,
+
+    /// path to a stereo calibration YAML (required for --stereo)
+    #[argh(option)]
+    calib: Option<String>,
 }
 
 /// Run live on a UVC camera (laptop webcam, USB cam, CSI-to-UVC adapter…),
@@ -203,6 +241,43 @@ struct UvcCmd {
     p2: f64,
 }
 
+/// ORB pyramid scale factor (matches `OrbDetector` default `downscale`).
+const ORB_SCALE: f32 = 1.2;
+/// ORB pyramid level count (matches `OrbDetector` default `n_scales`).
+const ORB_LEVELS: usize = 8;
+
+// TODO: dedupe with kornia-imgproc — `OrbDetector::build_pyramid` (and helpers
+// `pyramid_size_at_level` / `pyramid_reduce_u8`) implement this same 1.2-scale,
+// 8-level pyramid, but they're private. Once those are exposed publicly (e.g. in
+// `kornia_imgproc::pyramid`), call them here instead. Note the semantic diff:
+// this builder resizes the original full-res image each level, whereas kornia
+// resizes the previous level (ORB-SLAM3 behavior) — reconcile before switching.
+/// Builds an ORB-consistent u8 image pyramid: level `o` is the full image
+/// downscaled by `ORB_SCALE^o`, so a full-resolution keypoint at octave `o`
+/// maps into level `o` by multiplying its coordinates by `ORB_SCALE^-o`.
+fn build_u8_pyramid(img: &Image<u8, 1, CpuAllocator>) -> Vec<Image<u8, 1, CpuAllocator>> {
+    let mut pyramid = Vec::with_capacity(ORB_LEVELS);
+    pyramid.push(img.clone());
+    let (w0, h0) = (img.width() as f32, img.height() as f32);
+    for level in 1..ORB_LEVELS {
+        let inv = 1.0 / ORB_SCALE.powi(level as i32);
+        let w = ((w0 * inv).round() as usize).max(1);
+        let h = ((h0 * inv).round() as usize).max(1);
+        let mut dst = Image::from_size_val(
+            ImageSize {
+                width: w,
+                height: h,
+            },
+            0u8,
+            CpuAllocator,
+        )
+        .expect("pyramid level allocation");
+        resize_fast_mono(img, &mut dst, InterpolationMode::Bilinear).expect("pyramid resize");
+        pyramid.push(dst);
+    }
+    pyramid
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
@@ -213,10 +288,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tui_active = !args.no_tui;
 
     // ── Source ─────────────────────────────────────────────────────────────
+    let mut evaluate = false;
+    let mut eval_out = String::from(".");
     let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) =
         match args.source {
             SourceCmd::Euroc(e) => {
-                let src = EurocSource::open(&e.data, e.start_frame, e.max_frames)?;
+                evaluate = e.evaluate;
+                eval_out = e.eval_out.clone();
+                let src = if e.stereo {
+                    EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
+                } else {
+                    EurocSource::open(&e.data, e.start_frame, e.max_frames)?
+                };
                 if !tui_active {
                     let total = src.dataset_len();
                     let n = src.n_frames_hint().unwrap_or(0);
@@ -231,22 +314,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (Box::new(src), Some(gt))
             }
             SourceCmd::Mcap(m) => {
-                let src = McapSource::open(
-                    std::path::Path::new(&m.path),
-                    &m.channel,
-                    m.start_frame,
-                    m.max_frames,
-                )?;
+                let path = std::path::Path::new(&m.path);
+                let src = if m.stereo {
+                    let calib = m
+                        .calib
+                        .as_deref()
+                        .ok_or("mcap --stereo requires --calib <stereo calibration YAML>")?;
+                    McapSource::open_stereo(
+                        path,
+                        &m.channel,
+                        &m.right_channel,
+                        std::path::Path::new(calib),
+                        m.start_frame,
+                        m.max_frames,
+                    )?
+                } else {
+                    McapSource::open(path, &m.channel, m.start_frame, m.max_frames)?
+                };
                 if !tui_active && let Some(n) = src.n_frames_hint() {
                     eprintln!("MCAP: {n} frames from /{}", m.channel);
                 }
                 (Box::new(src), None)
             }
             #[cfg(feature = "oakd")]
-            SourceCmd::Oakd(o) => (
-                Box::new(OakdSource::open(o.width, o.height, o.fps, o.max_frames)?),
-                None,
-            ),
+            SourceCmd::Oakd(o) => {
+                let src = if o.stereo {
+                    let calib = o
+                        .calib
+                        .as_deref()
+                        .ok_or("oakd --stereo requires --calib <stereo calibration YAML>")?;
+                    OakdSource::open_stereo(o.fps, std::path::Path::new(calib), o.max_frames)?
+                } else {
+                    OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
+                };
+                (Box::new(src), None)
+            }
             #[cfg(feature = "uvc")]
             SourceCmd::Uvc(w) => {
                 let camera = kornia_3d::camera::PinholeCamera {
@@ -275,6 +377,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let camera = source.camera();
     let n_frames_hint = source.n_frames_hint();
 
+    // Stereo config (when the source yields rectified pairs).
+    let stereo_bf = source.stereo_bf();
+    // Near/far split: close points (z < baseline * TH_DEPTH) get direct stereo
+    // back-projection at each keyframe (ORB-SLAM3's ThDepth ~ 35 for EuRoC).
+    const TH_DEPTH: f64 = 35.0;
+    let stereo_close_depth_m = stereo_bf.map(|bf| (bf / camera.fx) * TH_DEPTH);
+    let stereo_config = stereo_bf.map(|bf| {
+        let baseline = bf / camera.fx;
+        if !tui_active {
+            eprintln!(
+                "Stereo: rectified fx={:.2} baseline={:.4}m bf={:.2} close_depth={:.2}m",
+                camera.fx,
+                baseline,
+                bf,
+                baseline * TH_DEPTH,
+            );
+        }
+        StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
+    });
+
     // ── ORB detector ───────────────────────────────────────────────────────
     let detector = kornia_imgproc::features::OrbDetector {
         n_keypoints: 1000,
@@ -284,6 +406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── SLAM system ────────────────────────────────────────────────────────
     let pipeline_config = PipelineConfig {
         debug: args.debug,
+        stereo_close_depth_m,
         ..PipelineConfig::default()
     };
     let mut system = Pipeline::new(camera.clone(), pipeline_config);
@@ -308,7 +431,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let euroc_samples_meta = euroc_gt.is_some();
     let (mut est_positions, mut gt_positions): (Vec<Vec3F64>, Vec<Vec3F64>) =
         (Vec::new(), Vec::new());
     // ── Main loop ──────────────────────────────────────────────────────────
@@ -320,11 +442,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             idx,
             timestamp_sec,
             image: gray_u8,
+            right_image,
         } = item;
         let image_size = gray_u8.size();
 
         // Extract ORB features.
         let features = detector.detect_and_extract_u8(&gray_u8)?;
+
+        // Stereo: match the rectified right view to fill per-keypoint depth.
+        let (u_right, depth) = match (&stereo_config, &right_image) {
+            (Some(cfg), Some(right_img)) => {
+                let right_features = detector.detect_and_extract_u8(right_img)?;
+                let left_pyr = build_u8_pyramid(&gray_u8);
+                let right_pyr = build_u8_pyramid(right_img);
+                let matches =
+                    compute_stereo_matches(&left_pyr, &right_pyr, &features, &right_features, cfg);
+                if args.debug && !tui_active {
+                    let n = matches.num_matched();
+                    let mut ds: Vec<f32> =
+                        matches.depth.iter().copied().filter(|&d| d > 0.0).collect();
+                    let med = if ds.is_empty() {
+                        0.0
+                    } else {
+                        ds.sort_by(|a, b| a.total_cmp(b));
+                        ds[ds.len() / 2]
+                    };
+                    eprintln!("[stereo] frame={idx} matched={n} median_depth={med:.3}m");
+                }
+                (matches.u_right, matches.depth)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
         #[cfg(feature = "viz")]
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &gray_u8, &features.keypoints_xy);
@@ -350,6 +498,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pose_world_to_cam: Pose3d::IDENTITY,
             image_size,
             keypoint_colors,
+            u_right,
+            depth,
         };
         let t0 = std::time::Instant::now();
         let result = system.process_frame(frame);
@@ -375,8 +525,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let traj_pt = trajectory_point_from_pose(&result.pose_world_to_cam);
         trajectory.push(traj_pt);
 
-        // Evaluation collection (EuRoC only).
-        if euroc_samples_meta {
+        // Evaluation collection (EuRoC, --evaluate only).
+        if evaluate {
             let est_pos = Vec3F64::new(traj_pt[0] as f64, traj_pt[1] as f64, traj_pt[2] as f64);
             est_positions.push(est_pos);
 
@@ -450,56 +600,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
-    // ── Trajectory evaluation (EuRoC only) ─────────────────────────────────
-    if euroc_samples_meta && est_positions.len() >= 2 && gt_positions.len() == est_positions.len() {
-        // Save raw (unaligned, monocular scale) trajectory.
-        {
-            use std::io::Write;
-            let mut raw_file = std::fs::File::create("kornia_slam_raw.csv")?;
-            writeln!(raw_file, "timestamp_sec,x,y,z")?;
-            // We no longer have sample timestamps here; reconstruct index from source.
-            // Write position index as a proxy — replace with real timestamps if
-            // EurocSource exposes them via a `timestamps()` method.
-            for (i, pos) in est_positions.iter().enumerate() {
-                writeln!(raw_file, "{i},{:.9},{:.9},{:.9}", pos.x, pos.y, pos.z)?;
-            }
-            eprintln!("Saved kornia_slam_raw.csv");
-        }
-
-        let alignment = align_sim3(&est_positions, &gt_positions);
-
-        let aligned_est: Vec<Vec3F64> = est_positions
-            .iter()
-            .map(|p| alignment.translation + (alignment.rotation * *p) * alignment.scale)
-            .collect();
-
-        // Save aligned trajectory.
-        {
-            use std::io::Write;
-            let mut aligned_file = std::fs::File::create("kornia_slam_aligned.csv")?;
-            writeln!(aligned_file, "idx,x,y,z,gt_x,gt_y,gt_z")?;
-            for (i, (pos, gt)) in aligned_est.iter().zip(gt_positions.iter()).enumerate() {
-                writeln!(
-                    aligned_file,
-                    "{i},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9}",
-                    pos.x, pos.y, pos.z, gt.x, gt.y, gt.z
-                )?;
-            }
-            eprintln!("Saved kornia_slam_aligned.csv");
-        }
-
-        let ate = compute_ate(&aligned_est, &gt_positions);
-        let rpe = compute_rpe(&aligned_est, &gt_positions);
-        let drift = compute_drift(&aligned_est, &gt_positions);
-
-        eprintln!();
-        eprintln!("================ Trajectory Evaluation ================");
-        eprintln!("Frames evaluated : {}", aligned_est.len());
-        eprintln!("Scale            : {:.6}", alignment.scale);
-        eprintln!("ATE RMSE         : {:.4} m", ate);
-        eprintln!("RPE RMSE         : {:.4} m", rpe);
-        eprintln!("Final Drift      : {:.4} %", drift * 100.0);
-        eprintln!("=======================================================");
+    // ── Trajectory evaluation (EuRoC, --evaluate only) ─────────────────────
+    if evaluate {
+        evaluation::report(
+            &est_positions,
+            &gt_positions,
+            std::path::Path::new(&eval_out),
+        )?;
     }
     Ok(())
 }
