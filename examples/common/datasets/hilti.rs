@@ -470,10 +470,7 @@ cam1:
         assert_eq!(dataset.imu_samples.len(), 2);
         assert_eq!(dataset.imu_samples[0].timestamp, 1.0);
         assert_eq!(dataset.imu_samples[0].gyro, Vec3F64::new(0.1, 0.2, 0.3));
-        assert_eq!(
-            dataset.imu_samples[1].accel,
-            Vec3F64::new(0.03, 0.02, 9.81)
-        );
+        assert_eq!(dataset.imu_samples[1].accel, Vec3F64::new(0.03, 0.02, 9.81));
     }
 
     #[test]
