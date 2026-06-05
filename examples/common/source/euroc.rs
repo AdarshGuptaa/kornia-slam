@@ -7,8 +7,8 @@ use kornia_io::png::read_image_png_mono8;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::EurocDataset;
-use crate::datasets::{rectifier_from_euroc, StereoRectifier};
 use crate::datasets::euroc::GroundTruthPose;
+use crate::datasets::{StereoRectifier, rectifier_from_euroc};
 /// Reads left-camera (and optionally rectified left+right) PNG frames from an
 /// EuRoC dataset in order.
 pub struct EurocSource {
