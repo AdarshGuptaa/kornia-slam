@@ -118,7 +118,7 @@ impl OakdSource {
     ) -> Result<Self, SourceError> {
         let calib = StereoCalib::load(calib_path).map_err(SourceError::other)?;
         let (width, height) = (calib.width as u32, calib.height as u32);
-        let rectifier = calib.rectifier();
+        let rectifier = calib.rectifier().map_err(SourceError::other)?;
 
         eprintln!("[oakd] opening device (stereo)…");
         let device = Device::new().map_err(SourceError::other)?;
@@ -209,8 +209,8 @@ impl FrameSource for OakdSource {
             if let (Some(rq), Some(rect)) = (self.right_queue.as_mut(), self.rectifier.as_ref()) {
                 let right_raw = pull_gray8(rq, &self.image_size, self.n_pixels)?;
                 (
-                    rect.rectify_left(&left_raw),
-                    Some(rect.rectify_right(&right_raw)),
+                    rect.rectify_left(&left_raw).map_err(SourceError::other)?,
+                    Some(rect.rectify_right(&right_raw).map_err(SourceError::other)?),
                 )
             } else {
                 (left_raw, None)

@@ -7,7 +7,7 @@ use kornia_io::png::read_image_png_mono8;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::EurocDataset;
-use crate::datasets::StereoRectifier;
+use crate::datasets::{rectifier_from_euroc, StereoRectifier};
 use crate::datasets::euroc::GroundTruthPose;
 /// Reads left-camera (and optionally rectified left+right) PNG frames from an
 /// EuRoC dataset in order.
@@ -68,7 +68,10 @@ impl EurocSource {
             let right = dataset
                 .right_calibration
                 .expect("is_stereo() guarantees right-camera calibration");
-            Some(StereoRectifier::new(&dataset.left_calibration, &right))
+            Some(
+                rectifier_from_euroc(&dataset.left_calibration, &right)
+                    .map_err(SourceError::other)?,
+            )
         } else {
             None
         };
@@ -126,8 +129,8 @@ impl FrameSource for EurocSource {
                     .map_err(SourceError::other)?
                     .into_inner();
                 (
-                    rect.rectify_left(&left_raw),
-                    Some(rect.rectify_right(&right_raw)),
+                    rect.rectify_left(&left_raw).map_err(SourceError::other)?,
+                    Some(rect.rectify_right(&right_raw).map_err(SourceError::other)?),
                 )
             }
             None => (left_raw, None),
