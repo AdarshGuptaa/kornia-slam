@@ -120,7 +120,7 @@ impl McapSource {
     ) -> Result<Self, SourceError> {
         let bytes = fs::read(path).map_err(SourceError::Io)?;
         let calib = StereoCalib::load(calib_path).map_err(SourceError::other)?;
-        let rectifier = calib.rectifier();
+        let rectifier = calib.rectifier().map_err(SourceError::other)?;
         let rect_cam = rectifier.rectified_camera();
 
         let left = read_channel(&bytes, left_suffix)?;
@@ -146,12 +146,14 @@ impl McapSource {
 
         let prepared: Vec<PreparedFrame> = sel
             .into_iter()
-            .map(|(t, limg, rimg)| PreparedFrame {
-                timestamp_sec: t - t0,
-                image: rectifier.rectify_left(&limg),
-                right_image: Some(rectifier.rectify_right(&rimg)),
+            .map(|(t, limg, rimg)| {
+                Ok(PreparedFrame {
+                    timestamp_sec: t - t0,
+                    image: rectifier.rectify_left(&limg).map_err(SourceError::other)?,
+                    right_image: Some(rectifier.rectify_right(&rimg).map_err(SourceError::other)?),
+                })
             })
-            .collect();
+            .collect::<Result<_, SourceError>>()?;
 
         eprintln!(
             "[mcap] {}: {n_total} stereo pairs @ {w}x{h} ({left_suffix} + {right_suffix}) \

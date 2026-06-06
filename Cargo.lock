@@ -5765,7 +5765,7 @@ dependencies = [
 [[package]]
 name = "kornia-3d"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#8e336f51753dab9a35eba0eef80351f425709e54"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#9cadbf139e9c2bc81a1009441cde0d7c6b3594c6"
 dependencies = [
  "bincode 2.0.1",
  "faer",
@@ -5784,7 +5784,7 @@ dependencies = [
 [[package]]
 name = "kornia-algebra"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#8e336f51753dab9a35eba0eef80351f425709e54"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#9cadbf139e9c2bc81a1009441cde0d7c6b3594c6"
 dependencies = [
  "glam 0.30.10",
  "nalgebra 0.32.6",
@@ -5795,7 +5795,7 @@ dependencies = [
 [[package]]
 name = "kornia-image"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#8e336f51753dab9a35eba0eef80351f425709e54"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#9cadbf139e9c2bc81a1009441cde0d7c6b3594c6"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -5806,7 +5806,7 @@ dependencies = [
 [[package]]
 name = "kornia-imgproc"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#8e336f51753dab9a35eba0eef80351f425709e54"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#9cadbf139e9c2bc81a1009441cde0d7c6b3594c6"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -5820,7 +5820,7 @@ dependencies = [
 [[package]]
 name = "kornia-io"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#8e336f51753dab9a35eba0eef80351f425709e54"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#9cadbf139e9c2bc81a1009441cde0d7c6b3594c6"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -5855,7 +5855,7 @@ dependencies = [
 [[package]]
 name = "kornia-tensor"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#8e336f51753dab9a35eba0eef80351f425709e54"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#9cadbf139e9c2bc81a1009441cde0d7c6b3594c6"
 dependencies = [
  "num-traits",
  "rayon",

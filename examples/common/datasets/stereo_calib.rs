@@ -15,7 +15,7 @@ use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_imgproc::calibration::distortion::PolynomialDistortion;
 use serde::Deserialize;
 
-use super::rectify::{CameraCalib, StereoRectifier};
+use kornia_3d::stereo::{CameraCalib, StereoError, StereoRectifier};
 
 #[derive(Deserialize)]
 struct CamYaml {
@@ -50,7 +50,7 @@ impl StereoCalib {
     }
 
     /// Builds a [`StereoRectifier`] from this calibration.
-    pub fn rectifier(&self) -> StereoRectifier {
+    pub fn rectifier(&self) -> Result<StereoRectifier, StereoError> {
         let calib = |c: &CamYaml| CameraCalib {
             width: self.width,
             height: self.height,
