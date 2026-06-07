@@ -22,7 +22,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::euroc::{DatasetError, DatasetSample};
+use kornia_3d::camera::PinholeCamera;
+
+use super::euroc::{DatasetError, DatasetSample, GroundTruthPose};
 
 /// Kannala-Brandt fisheye calibration parsed from Kalibr YAML.
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +51,28 @@ pub struct KannalaBrandtCalibration {
     pub height: u32,
 }
 
+impl KannalaBrandtCalibration {
+    /// Virtual pinhole camera that fisheye keypoints are undistorted into.
+    ///
+    /// Keeps the calibrated focal and principal point and drops distortion. ORB
+    /// runs on the raw fisheye image; each keypoint is unprojected through the
+    /// Kannala-Brandt model to a bearing and reprojected through this pinhole,
+    /// so the existing pinhole geometry (PnP, triangulation, BA) stays valid.
+    /// The focal only sets the pixel scale of the undistorted coordinates.
+    pub fn to_undistorted_pinhole(&self) -> PinholeCamera {
+        PinholeCamera {
+            fx: self.fx,
+            fy: self.fy,
+            cx: self.cx,
+            cy: self.cy,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+}
+
 /// Reader for the Hilti-Trimble SLAM Challenge 2026 dataset.
 #[derive(Debug, Clone)]
 pub struct HiltiDataset {
@@ -69,6 +93,9 @@ pub struct HiltiDataset {
     pub t_cam0_imu: [[f64; 4]; 4],
     /// Transform from IMU to `cam1`.
     pub t_cam1_imu: [[f64; 4]; 4],
+    /// Ground-truth poses from `state_groundtruth_estimate0/data.csv`. Empty
+    /// when the extraction ran without a `--gt-topic`.
+    pub ground_truth: Vec<GroundTruthPose>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +133,7 @@ impl HiltiDataset {
         let cam0_samples = read_image_samples(&root, "cam0")?;
         let cam1_samples = read_optional_image_samples(&root, "cam1")?;
         let imu_samples = read_optional_imu_samples(&root)?;
+        let ground_truth = read_optional_ground_truth(&root)?;
 
         Ok(Self {
             root,
@@ -116,12 +144,23 @@ impl HiltiDataset {
             cam1_calibration,
             t_cam0_imu,
             t_cam1_imu,
+            ground_truth,
         })
     }
 
     /// Returns ordered `cam0` samples.
     pub fn samples(&self) -> &[DatasetSample] {
         &self.cam0_samples
+    }
+
+    /// Returns the ground-truth poses (empty when none were extracted).
+    pub fn ground_truth(&self) -> &[GroundTruthPose] {
+        &self.ground_truth
+    }
+
+    /// True when a usable `cam1` stream is present.
+    pub fn is_stereo(&self) -> bool {
+        !self.cam1_samples.is_empty()
     }
 }
 
@@ -209,9 +248,17 @@ fn read_kalibr_chain(path: &Path) -> Result<KalibrChain, DatasetError> {
         return Err(DatasetError::FileNotFound(path.to_path_buf()));
     }
 
-    let file = File::open(path)?;
     let path_display = path.display();
-    serde_yaml::from_reader(file).map_err(|e| {
+    // Hilti ships the Kalibr chain with an OpenCV FileStorage header
+    // (`%YAML:1.0`), which is not a valid YAML directive and trips serde_yaml.
+    // Drop any leading `%YAML…` line before parsing.
+    let raw = std::fs::read_to_string(path)?;
+    let cleaned: String = raw
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("%YAML"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_yaml::from_str(&cleaned).map_err(|e| {
         DatasetError::Parse(format!("invalid Kalibr calibration at {path_display}: {e}"))
     })
 }
@@ -338,6 +385,63 @@ fn read_optional_imu_samples(root: &Path) -> Result<Vec<ImuMeasurement>, Dataset
 
     samples.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
     Ok(samples)
+}
+
+/// Reads `state_groundtruth_estimate0/data.csv` (EuRoC ground-truth format)
+/// when present. Returns an empty Vec when the directory or file is absent.
+fn read_optional_ground_truth(root: &Path) -> Result<Vec<GroundTruthPose>, DatasetError> {
+    let csv = root.join("state_groundtruth_estimate0").join("data.csv");
+    if !csv.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(&csv)?;
+    let reader = BufReader::new(file);
+    let mut poses = Vec::new();
+    let csv_path = csv.display();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+
+        let line_number = line_idx + 1;
+        // Columns: timestamp_ns, px, py, pz, qw, qx, qy, qz, ...
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() < 8 {
+            return Err(DatasetError::Parse(format!(
+                "expected at least 8 ground-truth columns at {csv_path}:{line_number}"
+            )));
+        }
+        let parse = |idx: usize| {
+            cols[idx].trim().parse::<f64>().map_err(|e| {
+                DatasetError::Parse(format!(
+                    "invalid ground-truth value at {csv_path}:{line_number} column {}: {e}",
+                    idx + 1
+                ))
+            })
+        };
+        let ts_ns = cols[0].trim().parse::<u64>().map_err(|e| {
+            DatasetError::Parse(format!(
+                "invalid ground-truth timestamp at {csv_path}:{line_number}: {e}"
+            ))
+        })?;
+
+        poses.push(GroundTruthPose {
+            timestamp_sec: ts_ns as f64 * 1e-9,
+            tx: parse(1)?,
+            ty: parse(2)?,
+            tz: parse(3)?,
+            qw: parse(4)?,
+            qx: parse(5)?,
+            qy: parse(6)?,
+            qz: parse(7)?,
+        });
+    }
+
+    poses.sort_by(|a, b| a.timestamp_sec.total_cmp(&b.timestamp_sec));
+    Ok(poses)
 }
 
 #[cfg(test)]
@@ -498,6 +602,24 @@ cam1:
         assert_eq!(dataset.cam1_calibration.fx, 462.0);
         assert_eq!(dataset.t_cam0_imu[0][3], 0.01);
         assert_eq!(dataset.t_cam1_imu[0][3], -0.10);
+    }
+
+    #[test]
+    fn open_parses_opencv_filestorage_yaml_header() {
+        // The real Hilti chain starts with an OpenCV `%YAML:1.0` header, which
+        // is not valid YAML; the reader must strip it.
+        let dir = TestDir::new("opencv-header");
+        let calibration = dir.path().join("kalibr_imucam_chain.yaml");
+        let with_header = format!("%YAML:1.0 # need to specify the file type at the top!\n{KALIBR_YAML}");
+        fs::write(&calibration, with_header).unwrap();
+        write_camera(
+            dir.path(),
+            "cam0",
+            "#timestamp [ns],filename\n1000000000,1000000000.png\n",
+        );
+
+        let dataset = HiltiDataset::open(dir.path(), calibration).unwrap();
+        assert_eq!(dataset.cam0_calibration.fx, 461.64);
     }
 
     #[test]
