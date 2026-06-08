@@ -5850,6 +5850,7 @@ dependencies = [
  "kornia-algebra",
  "kornia-image",
  "kornia-imgproc",
+ "kornia-sensors",
 ]
 
 [[package]]
