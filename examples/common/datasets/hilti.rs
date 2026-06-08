@@ -610,7 +610,8 @@ cam1:
         // is not valid YAML; the reader must strip it.
         let dir = TestDir::new("opencv-header");
         let calibration = dir.path().join("kalibr_imucam_chain.yaml");
-        let with_header = format!("%YAML:1.0 # need to specify the file type at the top!\n{KALIBR_YAML}");
+        let with_header =
+            format!("%YAML:1.0 # need to specify the file type at the top!\n{KALIBR_YAML}");
         fs::write(&calibration, with_header).unwrap();
         write_camera(
             dir.path(),

@@ -337,112 +337,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Source ─────────────────────────────────────────────────────────────
     let mut evaluate = false;
     let mut eval_out = String::from(".");
-    let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) =
-        match args.source {
-            SourceCmd::Euroc(e) => {
-                evaluate = e.evaluate;
-                eval_out = e.eval_out.clone();
-                let src = if e.stereo {
-                    EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
-                } else {
-                    EurocSource::open(&e.data, e.start_frame, e.max_frames)?
-                };
-                if !tui_active {
-                    let total = src.dataset_len();
-                    let n = src.n_frames_hint().unwrap_or(0);
-                    eprintln!(
-                        "Dataset: {total} frames (processing {}..{})",
-                        e.start_frame,
-                        e.start_frame + n,
-                    );
-                }
-                // Clone the GT poses before the source is moved into the box.
-                let gt = src.ground_truth_poses_cloned();
-                (Box::new(src), Some(gt))
+    let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) = match args
+        .source
+    {
+        SourceCmd::Euroc(e) => {
+            evaluate = e.evaluate;
+            eval_out = e.eval_out.clone();
+            let src = if e.stereo {
+                EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
+            } else {
+                EurocSource::open(&e.data, e.start_frame, e.max_frames)?
+            };
+            if !tui_active {
+                let total = src.dataset_len();
+                let n = src.n_frames_hint().unwrap_or(0);
+                eprintln!(
+                    "Dataset: {total} frames (processing {}..{})",
+                    e.start_frame,
+                    e.start_frame + n,
+                );
             }
-            SourceCmd::Hilti(h) => {
-                evaluate = h.evaluate;
-                eval_out = h.eval_out.clone();
-                let src = HiltiSource::open(
-                    &h.data,
-                    &h.calib,
+            // Clone the GT poses before the source is moved into the box.
+            let gt = src.ground_truth_poses_cloned();
+            (Box::new(src), Some(gt))
+        }
+        SourceCmd::Hilti(h) => {
+            evaluate = h.evaluate;
+            eval_out = h.eval_out.clone();
+            let src =
+                HiltiSource::open(&h.data, &h.calib, h.start_frame, h.max_frames, !h.no_rotate)?;
+            if !tui_active {
+                let total = src.dataset_len();
+                let n = src.n_frames_hint().unwrap_or(0);
+                eprintln!(
+                    "Dataset: {total} frames (processing {}..{})",
                     h.start_frame,
-                    h.max_frames,
-                    !h.no_rotate,
-                )?;
-                if !tui_active {
-                    let total = src.dataset_len();
-                    let n = src.n_frames_hint().unwrap_or(0);
-                    eprintln!(
-                        "Dataset: {total} frames (processing {}..{})",
-                        h.start_frame,
-                        h.start_frame + n,
-                    );
-                }
-                // Clone the GT poses before the source is moved into the box.
-                let gt = src.ground_truth_poses_cloned();
-                (Box::new(src), Some(gt))
+                    h.start_frame + n,
+                );
             }
-            SourceCmd::Mcap(m) => {
-                let path = std::path::Path::new(&m.path);
-                let src = if m.stereo {
-                    let calib = m
-                        .calib
-                        .as_deref()
-                        .ok_or("mcap --stereo requires --calib <stereo calibration YAML>")?;
-                    McapSource::open_stereo(
-                        path,
-                        &m.channel,
-                        &m.right_channel,
-                        std::path::Path::new(calib),
-                        m.start_frame,
-                        m.max_frames,
-                    )?
-                } else {
-                    McapSource::open(path, &m.channel, m.start_frame, m.max_frames)?
-                };
-                if !tui_active && let Some(n) = src.n_frames_hint() {
-                    eprintln!("MCAP: {n} frames from /{}", m.channel);
-                }
-                (Box::new(src), None)
+            // Clone the GT poses before the source is moved into the box.
+            let gt = src.ground_truth_poses_cloned();
+            (Box::new(src), Some(gt))
+        }
+        SourceCmd::Mcap(m) => {
+            let path = std::path::Path::new(&m.path);
+            let src = if m.stereo {
+                let calib = m
+                    .calib
+                    .as_deref()
+                    .ok_or("mcap --stereo requires --calib <stereo calibration YAML>")?;
+                McapSource::open_stereo(
+                    path,
+                    &m.channel,
+                    &m.right_channel,
+                    std::path::Path::new(calib),
+                    m.start_frame,
+                    m.max_frames,
+                )?
+            } else {
+                McapSource::open(path, &m.channel, m.start_frame, m.max_frames)?
+            };
+            if !tui_active && let Some(n) = src.n_frames_hint() {
+                eprintln!("MCAP: {n} frames from /{}", m.channel);
             }
-            #[cfg(feature = "oakd")]
-            SourceCmd::Oakd(o) => {
-                let src = if o.stereo {
-                    let calib = o
-                        .calib
-                        .as_deref()
-                        .ok_or("oakd --stereo requires --calib <stereo calibration YAML>")?;
-                    OakdSource::open_stereo(o.fps, std::path::Path::new(calib), o.max_frames)?
-                } else {
-                    OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
-                };
-                (Box::new(src), None)
-            }
-            #[cfg(feature = "uvc")]
-            SourceCmd::Uvc(w) => {
-                let camera = kornia_3d::camera::PinholeCamera {
-                    fx: w.fx,
-                    fy: w.fy,
-                    cx: w.cx,
-                    cy: w.cy,
-                    k1: w.k1,
-                    k2: w.k2,
-                    p1: w.p1,
-                    p2: w.p2,
-                };
-                (
-                    Box::new(UvcSource::open(
-                        w.index,
-                        w.width,
-                        w.height,
-                        camera,
-                        w.max_frames,
-                    )?),
-                    None,
-                )
-            }
-        };
+            (Box::new(src), None)
+        }
+        #[cfg(feature = "oakd")]
+        SourceCmd::Oakd(o) => {
+            let src = if o.stereo {
+                let calib = o
+                    .calib
+                    .as_deref()
+                    .ok_or("oakd --stereo requires --calib <stereo calibration YAML>")?;
+                OakdSource::open_stereo(o.fps, std::path::Path::new(calib), o.max_frames)?
+            } else {
+                OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
+            };
+            (Box::new(src), None)
+        }
+        #[cfg(feature = "uvc")]
+        SourceCmd::Uvc(w) => {
+            let camera = kornia_3d::camera::PinholeCamera {
+                fx: w.fx,
+                fy: w.fy,
+                cx: w.cx,
+                cy: w.cy,
+                k1: w.k1,
+                k2: w.k2,
+                p1: w.p1,
+                p2: w.p2,
+            };
+            (
+                Box::new(UvcSource::open(
+                    w.index,
+                    w.width,
+                    w.height,
+                    camera,
+                    w.max_frames,
+                )?),
+                None,
+            )
+        }
+    };
 
     let camera = source.camera();
     let n_frames_hint = source.n_frames_hint();
