@@ -22,10 +22,9 @@
 
 use std::path::Path;
 
-use kornia_3d::camera::PinholeCamera;
+use kornia_3d::camera::{FisheyeCamera, PinholeCamera};
+use kornia_algebra::Vec2F64;
 use kornia_image::Image;
-use kornia_imgproc::calibration::CameraIntrinsic;
-use kornia_imgproc::calibration::fisheye::{EquidistantDistortion, unproject_equidistant};
 use kornia_imgproc::features::OrbFeatures;
 use kornia_io::png::read_image_png_mono8;
 use kornia_tensor::CpuAllocator;
@@ -44,9 +43,8 @@ pub struct HiltiSource {
     dataset: HiltiDataset,
     /// Virtual pinhole that keypoints are undistorted into; reported by `camera()`.
     camera: PinholeCamera,
-    /// Source fisheye intrinsics (upright image) for unprojection.
-    intrinsic: CameraIntrinsic,
-    distortion: EquidistantDistortion,
+    /// Source Kannala-Brandt fisheye (upright image) for unprojecting keypoints.
+    fisheye: FisheyeCamera,
     rotate_180: bool,
     /// `cosθ` floor for the incidence-angle cap.
     min_bearing_z: f64,
@@ -80,24 +78,12 @@ impl HiltiSource {
 
         let calib = &dataset.cam0_calibration;
         let camera = calib.to_undistorted_pinhole();
-        let intrinsic = CameraIntrinsic {
-            fx: calib.fx,
-            fy: calib.fy,
-            cx: calib.cx,
-            cy: calib.cy,
-        };
-        let distortion = EquidistantDistortion {
-            k1: calib.k1,
-            k2: calib.k2,
-            k3: calib.k3,
-            k4: calib.k4,
-        };
+        let fisheye = calib.to_fisheye_camera();
 
         Ok(Self {
             dataset,
             camera,
-            intrinsic,
-            distortion,
+            fisheye,
             rotate_180,
             min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
             cursor: start,
@@ -168,13 +154,13 @@ impl FrameSource for HiltiSource {
 
         for i in 0..n {
             let [u, v] = features.keypoints_xy[i];
-            let b = unproject_equidistant(u as f64, v as f64, &self.intrinsic, &self.distortion);
-            // b is a unit bearing; b[2] = cosθ. Drop rays too close to / past 90°.
-            if b[2] <= self.min_bearing_z {
+            let b = self.fisheye.unproject(&Vec2F64::new(u as f64, v as f64));
+            // b is a unit bearing; b.z = cosθ. Drop rays too close to / past 90°.
+            if b.z <= self.min_bearing_z {
                 continue;
             }
-            let xn = b[0] / b[2];
-            let yn = b[1] / b[2];
+            let xn = b.x / b.z;
+            let yn = b.y / b.z;
             let pu = self.camera.fx * xn + self.camera.cx;
             let pv = self.camera.fy * yn + self.camera.cy;
 
@@ -230,18 +216,7 @@ mod tests {
                 ground_truth: Vec::new(),
             },
             camera: calib.to_undistorted_pinhole(),
-            intrinsic: CameraIntrinsic {
-                fx: calib.fx,
-                fy: calib.fy,
-                cx: calib.cx,
-                cy: calib.cy,
-            },
-            distortion: EquidistantDistortion {
-                k1: calib.k1,
-                k2: calib.k2,
-                k3: calib.k3,
-                k4: calib.k4,
-            },
+            fisheye: calib.to_fisheye_camera(),
             rotate_180: true,
             min_bearing_z: MAX_INCIDENCE_DEG.to_radians().cos(),
             cursor: 0,
