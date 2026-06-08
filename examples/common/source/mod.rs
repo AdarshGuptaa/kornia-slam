@@ -5,6 +5,7 @@
 //! so the main binary can stay source-agnostic.
 
 pub mod euroc;
+pub mod hilti;
 pub mod mcap;
 #[cfg(feature = "oakd")]
 pub mod oakd;
@@ -13,9 +14,11 @@ pub mod uvc;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::Image;
+use kornia_imgproc::features::OrbFeatures;
 use kornia_tensor::CpuAllocator;
 
 pub use euroc::EurocSource;
+pub use hilti::HiltiSource;
 pub use mcap::McapSource;
 #[cfg(feature = "oakd")]
 pub use oakd::OakdSource;
@@ -59,6 +62,18 @@ pub trait FrameSource {
 
     /// Pull the next frame. `Ok(None)` ⇒ end of stream.
     fn next_frame(&mut self) -> Result<Option<FrameItem>, SourceError>;
+
+    /// Map keypoints from raw-image pixels into the coordinate frame implied by
+    /// [`Self::camera`], filtering features the camera model cannot represent.
+    ///
+    /// Default is a no-op: sources that yield images already in `camera()`'s
+    /// frame (EuRoC, rectified stereo) leave features untouched. A fisheye
+    /// source extracts ORB on the raw fisheye image, then overrides this to
+    /// undistort each keypoint to its virtual-pinhole pixel and drop features
+    /// beyond the usable incidence angle. Called after extraction, before the
+    /// features are handed to the SLAM pipeline. All per-feature arrays
+    /// (keypoints, orientations, descriptors, octaves) stay aligned.
+    fn undistort_features(&self, _features: &mut OrbFeatures) {}
 }
 
 /// Errors returned from a [`FrameSource`].

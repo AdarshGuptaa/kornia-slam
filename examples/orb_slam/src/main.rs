@@ -46,7 +46,7 @@ use pipeline::Pipeline;
 use source::OakdSource;
 #[cfg(feature = "uvc")]
 use source::UvcSource;
-use source::{EurocSource, FrameItem, FrameSource, McapSource};
+use source::{EurocSource, FrameItem, FrameSource, HiltiSource, McapSource};
 use utils::trajectory_point_from_pose;
 #[cfg(feature = "viz")]
 use utils::{
@@ -72,12 +72,18 @@ struct Args {
     /// map-projection reject reasons, keyframe growth and fuse counters
     #[argh(switch)]
     debug: bool,
+
+    /// ORB keypoints to extract per frame (default 1000; the 2 MP Hilti fisheye
+    /// frames need ~3000 to bootstrap)
+    #[argh(option, default = "1000")]
+    n_keypoints: usize,
 }
 
 #[derive(argh::FromArgs)]
 #[argh(subcommand)]
 enum SourceCmd {
     Euroc(EurocCmd),
+    Hilti(HiltiCmd),
     Mcap(McapCmd),
     #[cfg(feature = "oakd")]
     Oakd(OakdCmd),
@@ -104,6 +110,47 @@ struct EurocCmd {
     /// rectify the left+right cameras and compute per-keypoint stereo depth
     #[argh(switch)]
     stereo: bool,
+
+    /// after the run, align the trajectory to ground truth and report
+    /// ATE/RPE/drift (writes kornia_slam_raw.csv and kornia_slam_aligned.csv)
+    #[argh(switch)]
+    evaluate: bool,
+
+    /// directory for the evaluation CSVs (created if missing; default: current dir)
+    #[argh(option, default = "String::from(\".\")")]
+    eval_out: String,
+}
+
+/// Run on a Hilti-Trimble SLAM Challenge 2026 sequence extracted to the
+/// EuRoC-style layout by the challenge `ros2bag_to_euroc.py` tool.
+///
+/// ORB runs on the raw fisheye `cam0` image; keypoints (not pixels) are
+/// undistorted into a virtual pinhole, preserving the full field of view. Images
+/// are rotated 180° by default (inverted sensor mount); pass `--no-rotate` if the
+/// extraction already rotated them. These 2 MP frames need `--n-keypoints ~3000`
+/// to bootstrap.
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "hilti")]
+struct HiltiCmd {
+    /// path to the extracted sequence root (the dir containing cam0/, imu0/)
+    #[argh(option)]
+    data: String,
+
+    /// path to the Kalibr camera-IMU chain YAML
+    #[argh(option)]
+    calib: String,
+
+    /// maximum number of frames to process (0 = all)
+    #[argh(option, default = "0")]
+    max_frames: usize,
+
+    /// skip this many initial frames
+    #[argh(option, default = "0")]
+    start_frame: usize,
+
+    /// do not rotate frames 180° (use when the extraction already rotated them)
+    #[argh(switch)]
+    no_rotate: bool,
 
     /// after the run, align the trajectory to ground truth and report
     /// ATE/RPE/drift (writes kornia_slam_raw.csv and kornia_slam_aligned.csv)
@@ -290,89 +337,108 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Source ─────────────────────────────────────────────────────────────
     let mut evaluate = false;
     let mut eval_out = String::from(".");
-    let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) =
-        match args.source {
-            SourceCmd::Euroc(e) => {
-                evaluate = e.evaluate;
-                eval_out = e.eval_out.clone();
-                let src = if e.stereo {
-                    EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
-                } else {
-                    EurocSource::open(&e.data, e.start_frame, e.max_frames)?
-                };
-                if !tui_active {
-                    let total = src.dataset_len();
-                    let n = src.n_frames_hint().unwrap_or(0);
-                    eprintln!(
-                        "Dataset: {total} frames (processing {}..{})",
-                        e.start_frame,
-                        e.start_frame + n,
-                    );
-                }
-                // Clone the GT poses before the source is moved into the box.
-                let gt = src.ground_truth_poses_cloned();
-                (Box::new(src), Some(gt))
+    let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) = match args
+        .source
+    {
+        SourceCmd::Euroc(e) => {
+            evaluate = e.evaluate;
+            eval_out = e.eval_out.clone();
+            let src = if e.stereo {
+                EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
+            } else {
+                EurocSource::open(&e.data, e.start_frame, e.max_frames)?
+            };
+            if !tui_active {
+                let total = src.dataset_len();
+                let n = src.n_frames_hint().unwrap_or(0);
+                eprintln!(
+                    "Dataset: {total} frames (processing {}..{})",
+                    e.start_frame,
+                    e.start_frame + n,
+                );
             }
-            SourceCmd::Mcap(m) => {
-                let path = std::path::Path::new(&m.path);
-                let src = if m.stereo {
-                    let calib = m
-                        .calib
-                        .as_deref()
-                        .ok_or("mcap --stereo requires --calib <stereo calibration YAML>")?;
-                    McapSource::open_stereo(
-                        path,
-                        &m.channel,
-                        &m.right_channel,
-                        std::path::Path::new(calib),
-                        m.start_frame,
-                        m.max_frames,
-                    )?
-                } else {
-                    McapSource::open(path, &m.channel, m.start_frame, m.max_frames)?
-                };
-                if !tui_active && let Some(n) = src.n_frames_hint() {
-                    eprintln!("MCAP: {n} frames from /{}", m.channel);
-                }
-                (Box::new(src), None)
+            // Clone the GT poses before the source is moved into the box.
+            let gt = src.ground_truth_poses_cloned();
+            (Box::new(src), Some(gt))
+        }
+        SourceCmd::Hilti(h) => {
+            evaluate = h.evaluate;
+            eval_out = h.eval_out.clone();
+            let src =
+                HiltiSource::open(&h.data, &h.calib, h.start_frame, h.max_frames, !h.no_rotate)?;
+            if !tui_active {
+                let total = src.dataset_len();
+                let n = src.n_frames_hint().unwrap_or(0);
+                eprintln!(
+                    "Dataset: {total} frames (processing {}..{})",
+                    h.start_frame,
+                    h.start_frame + n,
+                );
             }
-            #[cfg(feature = "oakd")]
-            SourceCmd::Oakd(o) => {
-                let src = if o.stereo {
-                    let calib = o
-                        .calib
-                        .as_deref()
-                        .ok_or("oakd --stereo requires --calib <stereo calibration YAML>")?;
-                    OakdSource::open_stereo(o.fps, std::path::Path::new(calib), o.max_frames)?
-                } else {
-                    OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
-                };
-                (Box::new(src), None)
+            // Clone the GT poses before the source is moved into the box.
+            let gt = src.ground_truth_poses_cloned();
+            (Box::new(src), Some(gt))
+        }
+        SourceCmd::Mcap(m) => {
+            let path = std::path::Path::new(&m.path);
+            let src = if m.stereo {
+                let calib = m
+                    .calib
+                    .as_deref()
+                    .ok_or("mcap --stereo requires --calib <stereo calibration YAML>")?;
+                McapSource::open_stereo(
+                    path,
+                    &m.channel,
+                    &m.right_channel,
+                    std::path::Path::new(calib),
+                    m.start_frame,
+                    m.max_frames,
+                )?
+            } else {
+                McapSource::open(path, &m.channel, m.start_frame, m.max_frames)?
+            };
+            if !tui_active && let Some(n) = src.n_frames_hint() {
+                eprintln!("MCAP: {n} frames from /{}", m.channel);
             }
-            #[cfg(feature = "uvc")]
-            SourceCmd::Uvc(w) => {
-                let camera = kornia_3d::camera::PinholeCamera {
-                    fx: w.fx,
-                    fy: w.fy,
-                    cx: w.cx,
-                    cy: w.cy,
-                    k1: w.k1,
-                    k2: w.k2,
-                    p1: w.p1,
-                    p2: w.p2,
-                };
-                (
-                    Box::new(UvcSource::open(
-                        w.index,
-                        w.width,
-                        w.height,
-                        camera,
-                        w.max_frames,
-                    )?),
-                    None,
-                )
-            }
-        };
+            (Box::new(src), None)
+        }
+        #[cfg(feature = "oakd")]
+        SourceCmd::Oakd(o) => {
+            let src = if o.stereo {
+                let calib = o
+                    .calib
+                    .as_deref()
+                    .ok_or("oakd --stereo requires --calib <stereo calibration YAML>")?;
+                OakdSource::open_stereo(o.fps, std::path::Path::new(calib), o.max_frames)?
+            } else {
+                OakdSource::open(o.width, o.height, o.fps, o.max_frames)?
+            };
+            (Box::new(src), None)
+        }
+        #[cfg(feature = "uvc")]
+        SourceCmd::Uvc(w) => {
+            let camera = kornia_3d::camera::PinholeCamera {
+                fx: w.fx,
+                fy: w.fy,
+                cx: w.cx,
+                cy: w.cy,
+                k1: w.k1,
+                k2: w.k2,
+                p1: w.p1,
+                p2: w.p2,
+            };
+            (
+                Box::new(UvcSource::open(
+                    w.index,
+                    w.width,
+                    w.height,
+                    camera,
+                    w.max_frames,
+                )?),
+                None,
+            )
+        }
+    };
 
     let camera = source.camera();
     let n_frames_hint = source.n_frames_hint();
@@ -399,7 +465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── ORB detector ───────────────────────────────────────────────────────
     let detector = kornia_imgproc::features::OrbDetector {
-        n_keypoints: 1000,
+        n_keypoints: args.n_keypoints,
         ..Default::default()
     };
 
@@ -446,8 +512,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } = item;
         let image_size = gray_u8.size();
 
-        // Extract ORB features.
-        let features = detector.detect_and_extract_u8(&gray_u8)?;
+        // Extract ORB features (on the raw image — for a fisheye source this is
+        // the distorted frame; keypoints are undistorted below).
+        let mut features = detector.detect_and_extract_u8(&gray_u8)?;
 
         // Stereo: match the rectified right view to fill per-keypoint depth.
         let (u_right, depth) = match (&stereo_config, &right_image) {
@@ -477,6 +544,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref rec) = rec {
             log_frame_to_rerun(rec, &gray_u8, &features.keypoints_xy);
         }
+
+        // Undistort keypoints into the camera's coordinate frame. No-op for
+        // pinhole/rectified sources; for the fisheye source this remaps each
+        // keypoint to its virtual-pinhole pixel and drops over-wide rays, so it
+        // must run before colors/Frame so all per-feature arrays stay aligned.
+        source.undistort_features(&mut features);
 
         // Sample pixel colors at each keypoint location.
         let image_bytes = gray_u8.as_slice();

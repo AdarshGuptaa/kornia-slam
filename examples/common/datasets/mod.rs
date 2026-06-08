@@ -1,4 +1,6 @@
 pub mod euroc;
+#[allow(dead_code)]
+pub mod hilti;
 pub mod stereo_calib;
 
 // The Bouguet stereo rectifier lives upstream in kornia-3d; re-export it here so
