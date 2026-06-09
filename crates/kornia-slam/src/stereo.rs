@@ -484,6 +484,7 @@ mod tests {
             keypoint_colors: vec![[0; 3]; 3],
             u_right: vec![95.0, -1.0, 45.0],
             depth: vec![5.0, -1.0, 2.0],
+            keypoints_undist: Vec::new(),
         };
 
         let pts = unproject_stereo(&frame, &camera);

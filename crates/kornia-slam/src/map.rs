@@ -451,6 +451,23 @@ impl Map {
         self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
     }
 
+    /// [`Map::register_observation`] for a keyframe already stored in the
+    /// map, addressed by frame index. Lets callers register observations
+    /// while only holding `&mut Map` (no borrowed `Keyframe` clone needed).
+    pub fn register_observation_at(&mut self, mp_idx: usize, kf_idx: usize, desc_idx: usize) {
+        let Some(descriptor) = self
+            .get_keyframe(kf_idx)
+            .and_then(|kf| kf.frame.features.descriptors.get(desc_idx))
+            .copied()
+        else {
+            return;
+        };
+        if let Some(mp) = self.map_points.get_mut(mp_idx) {
+            mp.add_observation_descriptor(kf_idx, descriptor);
+        }
+        self.update_map_point_geometry(mp_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+    }
+
     /// Recomputes the mean viewing direction and scale-invariance distance
     /// bounds for one map point from its observing keyframes (ORB-SLAM3's
     /// `MapPoint::UpdateNormalAndDepth`). No-op if the point is culled or its
@@ -817,13 +834,12 @@ impl Map {
                     let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
                         continue;
                     };
-                    if let Some(kp) = kf.frame.features.keypoints_xy.get(desc_idx) {
-                        let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                    if let Some(p) = kf.frame.undistorted_xy(desc_idx, camera) {
                         let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
                         observations.push(BaObservation {
                             pose_idx,
                             point_idx,
-                            pixel: [p.x as f32, p.y as f32],
+                            pixel: p,
                             fixed_pose: is_fixed,
                             fixed_point: false,
                             depth_meas,
@@ -963,13 +979,12 @@ impl Map {
                     let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
                         continue;
                     };
-                    if let Some(kp) = kf.frame.features.keypoints_xy.get(desc_idx) {
-                        let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                    if let Some(p) = kf.frame.undistorted_xy(desc_idx, camera) {
                         let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
                         observations.push(BaObservation {
                             pose_idx: kf_idx,
                             point_idx,
-                            pixel: [p.x as f32, p.y as f32],
+                            pixel: p,
                             fixed_pose: is_fixed,
                             fixed_point: false,
                             depth_meas,
@@ -1103,6 +1118,7 @@ mod tests {
             keypoint_colors: vec![[0; 3]; n],
             u_right: Vec::new(),
             depth: Vec::new(),
+            keypoints_undist: Vec::new(),
         }
     }
 

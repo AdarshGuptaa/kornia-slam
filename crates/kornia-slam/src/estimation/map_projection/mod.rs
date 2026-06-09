@@ -326,15 +326,23 @@ impl MapProjectionEstimator {
         const KEYPOINT_GRID_CELL_SIZE: f32 = 64.0;
         const MIN_MATCHES_BEFORE_WIDE: usize = 20;
 
-        let keypoints_undist: Vec<[f32; 2]> = frame
-            .features
-            .keypoints_xy
-            .iter()
-            .map(|kp| {
-                let p = camera.undistort(kp[0] as f64, kp[1] as f64);
-                [p.x as f32, p.y as f32]
-            })
-            .collect();
+        // Use the frame's undistortion cache when filled (the pipeline fills
+        // it once per frame); only frames built outside the pipeline pay the
+        // per-keypoint undistortion here.
+        let keypoints_undist: Vec<[f32; 2]> =
+            if frame.keypoints_undist.len() == frame.features.keypoints_xy.len() {
+                frame.keypoints_undist.clone()
+            } else {
+                frame
+                    .features
+                    .keypoints_xy
+                    .iter()
+                    .map(|kp| {
+                        let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                        [p.x as f32, p.y as f32]
+                    })
+                    .collect()
+            };
 
         let grid = KeypointGrid::new(
             &keypoints_undist,

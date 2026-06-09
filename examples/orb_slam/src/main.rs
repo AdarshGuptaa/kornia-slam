@@ -573,6 +573,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             keypoint_colors,
             u_right,
             depth,
+            keypoints_undist: Vec::new(),
         };
         let t0 = std::time::Instant::now();
         let result = system.process_frame(frame);
