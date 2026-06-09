@@ -140,8 +140,15 @@ impl MapProjectionEstimator {
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
 
+        // Bound the initial projection search to the local map around the
+        // reference keyframe (its points plus covisibility neighbors'), so
+        // per-frame tracking cost is independent of total map size. With no
+        // reference KF yet the builder falls back to all non-culled points.
+        let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
+        let local_indices = map.build_local_map_point_indices(&[], current_kf);
+
         let (projection_matches, curr_keypoints_undist, grid) =
-            self.match_map_to_frame(map.map_points(), frame, candidate_pose, camera);
+            self.match_map_to_frame(map, &local_indices, frame, candidate_pose, camera);
 
         // Shared logic: try_track → refine_pose → Estimate, or propagate rejection.
         let try_track_and_refine = |correspondences: Vec<(usize, usize)>,
@@ -196,7 +203,6 @@ impl MapProjectionEstimator {
         };
 
         // Fallback: match against reference keyframe descriptors.
-        let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
         let Some(current_kf) = current_kf else {
             return Err(last_reject);
         };
@@ -245,15 +251,15 @@ impl MapProjectionEstimator {
         pose_init: &Pose3d,
     ) -> Option<Estimate> {
         let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
-        let (local_map_points, local_to_global) =
-            map.build_local_map_points(tracked_matches, current_kf);
+        let local_indices = map.build_local_map_point_indices(tracked_matches, current_kf);
         let min_corr = self.config.pnp.min_correspondences;
-        if local_map_points.len() < min_corr {
+        if local_indices.len() < min_corr {
             return None;
         }
 
-        let local_matches = self.match_by_projection(
-            &local_map_points,
+        let global_matches = self.match_by_projection(
+            map.map_points(),
+            &local_indices,
             curr_keypoints_undist,
             curr_descriptors,
             curr_octaves,
@@ -263,19 +269,6 @@ impl MapProjectionEstimator {
             image_size,
             self.config.local_projection,
         );
-        if local_matches.len() < min_corr {
-            return None;
-        }
-
-        let global_matches: Vec<(usize, usize)> = local_matches
-            .into_iter()
-            .filter_map(|(local_mp_idx, curr_idx)| {
-                local_to_global
-                    .get(local_mp_idx)
-                    .copied()
-                    .map(|global_mp_idx| (global_mp_idx, curr_idx))
-            })
-            .collect();
         if global_matches.len() < min_corr {
             return None;
         }
@@ -321,10 +314,11 @@ impl MapProjectionEstimator {
     }
 
     /// Undistorts keypoints, builds a spatial grid, and runs projection matching
-    /// with narrow-to-wide fallback.
+    /// with narrow-to-wide fallback over the candidate map-point indices.
     fn match_map_to_frame(
         &self,
-        map_points: &[MapPoint],
+        map: &Map,
+        candidates: &[usize],
         frame: &Frame,
         pose: &Pose3d,
         camera: &PinholeCamera,
@@ -351,7 +345,8 @@ impl MapProjectionEstimator {
 
         let config = self.config.projection;
         let mut matches = self.match_by_projection(
-            map_points,
+            map.map_points(),
+            candidates,
             &keypoints_undist,
             &frame.features.descriptors,
             &frame.features.octaves,
@@ -364,7 +359,8 @@ impl MapProjectionEstimator {
 
         if matches.len() < MIN_MATCHES_BEFORE_WIDE {
             matches = self.match_by_projection(
-                map_points,
+                map.map_points(),
+                candidates,
                 &keypoints_undist,
                 &frame.features.descriptors,
                 &frame.features.octaves,
@@ -386,6 +382,7 @@ impl MapProjectionEstimator {
     fn match_by_projection(
         &self,
         map_points: &[MapPoint],
+        candidates: &[usize],
         keypoints_xy: &[[f32; 2]],
         descriptors: &[[u8; 32]],
         octaves: &[u8],
@@ -399,7 +396,10 @@ impl MapProjectionEstimator {
         let mut matches = Vec::new();
         let camera_center = pose_world_to_cam.inverse().translation;
 
-        for (mp_idx, mp) in map_points.iter().enumerate() {
+        for &mp_idx in candidates {
+            let Some(mp) = map_points.get(mp_idx) else {
+                continue;
+            };
             if mp.culled {
                 continue;
             }
@@ -524,6 +524,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            &[0],
             &keypoints_xy,
             &descriptors,
             &octaves,
@@ -565,6 +566,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            &[0],
             &keypoints_xy,
             &descriptors,
             &octaves,
@@ -605,6 +607,7 @@ mod matching_tests {
 
         let matches = estimator.match_by_projection(
             &map_points,
+            &[0],
             &keypoints_xy,
             &descriptors,
             &octaves,

@@ -441,9 +441,20 @@ impl Pipeline {
         }
 
         if status == TrackingStatus::Tracked {
-            let visible = self
-                .map
-                .map_points_in_frustum(&self.camera, &candidate_pose, image_size);
+            // Visibility bookkeeping over the local map only (mirrors
+            // ORB-SLAM3, which counts mnVisible on local-map points): full-map
+            // scans here would grow with trajectory length.
+            let current_kf = self
+                .state
+                .current_keyframe_idx
+                .and_then(|ki| self.map.get_keyframe(ki));
+            let local_indices = self.map.build_local_map_point_indices(&matches, current_kf);
+            let visible = self.map.map_points_in_frustum(
+                &local_indices,
+                &self.camera,
+                &candidate_pose,
+                image_size,
+            );
             self.map.update_observation_counts(&visible, &matches);
 
             if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {

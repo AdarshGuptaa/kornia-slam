@@ -519,15 +519,20 @@ impl Map {
         &mut self.map_points
     }
 
-    /// Returns indices of non-culled map points that project inside the image frustum.
+    /// Returns the subset of `candidates` (map-point indices) that are
+    /// non-culled and project inside the image frustum.
     pub fn map_points_in_frustum(
         &self,
+        candidates: &[usize],
         camera: &PinholeCamera,
         pose_world_to_cam: &Pose3d,
         image_size: ImageSize,
     ) -> HashSet<usize> {
         let mut visible = HashSet::new();
-        for (mp_idx, mp) in self.map_points.iter().enumerate() {
+        for &mp_idx in candidates {
+            let Some(mp) = self.map_points.get(mp_idx) else {
+                continue;
+            };
             if mp.culled {
                 continue;
             }
@@ -599,49 +604,55 @@ impl Map {
         connections
     }
 
-    /// Builds a local map of visible points from nearby keyframes.
-    pub fn build_local_map_points(
+    /// Builds the local map for tracking: indices of non-culled map points
+    /// observed by the current keyframe, the keyframes owning the tracked
+    /// points, and their covisibility neighbors.
+    pub fn build_local_map_point_indices(
         &self,
         tracked_matches: &[(usize, usize)],
         current_keyframe: Option<&Keyframe>,
-    ) -> (Vec<MapPoint>, Vec<usize>) {
+    ) -> Vec<usize> {
         const MAX_VOTED_KEYFRAMES: usize = 10;
         const MAX_COVIS_NEIGHBORS: usize = 10;
         const MIN_COVIS_WEIGHT: usize = 15;
 
+        // Vote over every keyframe observing each tracked point (ORB-SLAM3's
+        // UpdateLocalKeyFrames). The vote map already encodes covisibility
+        // with the current frame, so no per-seed covisibility recomputation
+        // is needed — that scan is O(KF points x observations) per seed and
+        // dominated per-frame tracking cost.
         let mut keyframe_votes: HashMap<usize, usize> = HashMap::new();
         for &(mp_idx, _) in tracked_matches {
             if let Some(mp) = self.map_points.get(mp_idx) {
-                *keyframe_votes.entry(mp.keyframe_idx).or_insert(0) += 1;
+                for &obs_kf in &mp.observation_kf_indices {
+                    *keyframe_votes.entry(obs_kf).or_insert(0) += 1;
+                }
             }
         }
 
         let mut voted_kfs: Vec<(usize, usize)> = keyframe_votes.into_iter().collect();
         voted_kfs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
 
-        // Local keyframes (ORB-SLAM3 TrackLocalMap): the current KF plus the KFs
-        // owning the tracked points (K1), then their covisibility-graph
-        // neighbors (K2). Replaces the former recency-based fallback.
+        // Local keyframes: the current KF plus the best-covisible KFs from
+        // the votes. Only when there are no votes (start of tracking, before
+        // any matches exist) fall back to one covisibility expansion around
+        // the current KF — that scan is the expensive part, so it must not
+        // run on every build.
         let mut local_kf_indices: HashSet<usize> = HashSet::new();
-        let mut seed_kfs: Vec<usize> = Vec::new();
-        if let Some(kf) = current_keyframe
-            && local_kf_indices.insert(kf.frame.idx)
-        {
-            seed_kfs.push(kf.frame.idx);
+        if let Some(kf) = current_keyframe {
+            local_kf_indices.insert(kf.frame.idx);
+            if voted_kfs.is_empty() {
+                for (nb_idx, _) in self
+                    .covisible_keyframes(kf.frame.idx, MIN_COVIS_WEIGHT)
+                    .into_iter()
+                    .take(MAX_COVIS_NEIGHBORS)
+                {
+                    local_kf_indices.insert(nb_idx);
+                }
+            }
         }
         for (kf_idx, _) in voted_kfs.into_iter().take(MAX_VOTED_KEYFRAMES) {
-            if local_kf_indices.insert(kf_idx) {
-                seed_kfs.push(kf_idx);
-            }
-        }
-        for &seed in &seed_kfs {
-            for (nb_idx, _) in self
-                .covisible_keyframes(seed, MIN_COVIS_WEIGHT)
-                .into_iter()
-                .take(MAX_COVIS_NEIGHBORS)
-            {
-                local_kf_indices.insert(nb_idx);
-            }
+            local_kf_indices.insert(kf_idx);
         }
 
         let mut mp_indices: HashSet<usize> = HashSet::new();
@@ -661,18 +672,18 @@ impl Map {
             }
         }
 
+        mp_indices.retain(|&idx| !self.map_points[idx].culled);
+
         let mut global_indices: Vec<usize> = mp_indices.into_iter().collect();
         global_indices.sort_unstable();
 
         if global_indices.len() < 4 && self.map_points.len() >= 4 {
-            global_indices = (0..self.map_points.len()).collect();
+            global_indices = (0..self.map_points.len())
+                .filter(|&idx| !self.map_points[idx].culled)
+                .collect();
         }
 
-        let local_map_points: Vec<MapPoint> = global_indices
-            .iter()
-            .filter_map(|&idx| self.map_points.get(idx).filter(|mp| !mp.culled).cloned())
-            .collect();
-        (local_map_points, global_indices)
+        global_indices
     }
 
     /// Cull map points with poor observation ratios or that project behind cameras.
