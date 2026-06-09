@@ -8,15 +8,13 @@ use std::collections::HashSet;
 use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{
-    TriangulationConfig, TwoViewEstimator, TwoViewModel, triangulate_matched_points,
-};
-use kornia_algebra::Vec3F64;
+use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
+use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_slam::Frame;
 use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use kornia_slam::map::{Keyframe, Map, MapPoint};
+use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
@@ -594,25 +592,56 @@ impl Pipeline {
         match_config: OrbMatchConfig,
         triangulation_config: &TriangulationConfig,
     ) -> usize {
-        const MIN_GROWTH_INLIERS: usize = 15;
+        const MIN_GROWTH_MATCHES: usize = 15;
+        // 1-DOF chi-square gate at 95% for the point-to-epipolar-line distance
+        // (ORB-SLAM3's CheckDistEpipolarLine), scaled per-octave below.
+        const EPIPOLAR_CHI2: f64 = 3.84;
 
         // Only consider features that don't already have a map point in either
         // KF. Matching the full descriptor arrays and then filtering discards
         // almost everything once the KFs are mature (the best matches always
-        // land on the already-tracked features). Instead, build sub-arrays of
-        // unassociated features from each side and match only those.
+        // land on the already-tracked features).
         let prev_unassoc: Vec<usize> = (0..prev_kf.frame.features.descriptors.len())
             .filter(|&i| prev_kf.map_point(i).is_none())
             .collect();
         let curr_unassoc: Vec<usize> = (0..curr_kf.frame.features.descriptors.len())
             .filter(|&i| curr_kf.map_point(i).is_none())
             .collect();
-
-        // Need at least 8 unassociated features on each side for F-matrix RANSAC.
-        if prev_unassoc.len() < 8 || curr_unassoc.len() < 8 {
+        if prev_unassoc.is_empty() || curr_unassoc.is_empty() {
             return 0;
         }
 
+        // Both keyframe poses are known, so the fundamental matrix between the
+        // pair is fully determined: F = K^-T [t]x R K^-1 with (R, t) the
+        // prev->curr relative pose. Epipolar-guided matching against this F
+        // replaces the brute-force descriptor matching + F-matrix RANSAC of
+        // the two-view estimator (mirrors ORB-SLAM3's SearchForTriangulation).
+        let rel = Pose3d::between(
+            &prev_kf.frame.pose_world_to_cam,
+            &curr_kf.frame.pose_world_to_cam,
+        );
+        if rel.translation.length() <= 1e-8 {
+            // No baseline: epipolar geometry degenerates and triangulation
+            // would reject everything anyway.
+            return 0;
+        }
+        let t = rel.translation;
+        let t_skew = Mat3F64::from_cols(
+            Vec3F64::new(0.0, t.z, -t.y),
+            Vec3F64::new(-t.z, 0.0, t.x),
+            Vec3F64::new(t.y, -t.x, 0.0),
+        );
+        let camera = &self.camera;
+        let k_inv = Mat3F64::from_cols(
+            Vec3F64::new(1.0 / camera.fx, 0.0, 0.0),
+            Vec3F64::new(0.0, 1.0 / camera.fy, 0.0),
+            Vec3F64::new(-camera.cx / camera.fx, -camera.cy / camera.fy, 1.0),
+        );
+        let f_mat = k_inv.transpose() * (t_skew * rel.rotation) * k_inv;
+
+        // Brute-force descriptor matching over the unassociated subsets, same
+        // as before (global second-best ratio test + orientation consistency
+        // live inside the matcher and are essential for match quality).
         let prev_orients: Vec<f32> = prev_unassoc
             .iter()
             .map(|&i| prev_kf.frame.features.orientations[i])
@@ -638,60 +667,53 @@ impl Pipeline {
             match_config,
         );
 
-        // Map sub-array indices back to original feature indices.
-        let mut pair_indices: Vec<(usize, usize)> = Vec::with_capacity(sub_matches.len());
+        // Keep only matches consistent with the pose-derived epipolar
+        // geometry: distance from the curr keypoint to its epipolar line must
+        // pass the chi-square gate at the octave's detection sigma. This is
+        // the (cheap, analytic) replacement for the F-matrix RANSAC.
+        let mut pair_indices: Vec<(usize, usize)> = Vec::new();
+        let mut matched_prev: Vec<Vec2F64> = Vec::new();
+        let mut matched_curr: Vec<Vec2F64> = Vec::new();
         for (prev_sub, curr_sub) in sub_matches {
-            let Some(&prev_idx) = prev_unassoc.get(prev_sub) else {
+            let (Some(&prev_idx), Some(&curr_idx)) =
+                (prev_unassoc.get(prev_sub), curr_unassoc.get(curr_sub))
+            else {
                 continue;
             };
-            let Some(&curr_idx) = curr_unassoc.get(curr_sub) else {
-                continue;
-            };
-            if prev_idx >= prev_kf.frame.features.keypoints_xy.len()
-                || curr_idx >= curr_kf.frame.features.keypoints_xy.len()
-            {
+            let kp_p = prev_kf.frame.features.keypoints_xy[prev_idx];
+            let kp_c = curr_kf.frame.features.keypoints_xy[curr_idx];
+            let p = camera.undistort(kp_p[0] as f64, kp_p[1] as f64);
+            let q = camera.undistort(kp_c[0] as f64, kp_c[1] as f64);
+
+            let l = f_mat * Vec3F64::new(p.x, p.y, 1.0);
+            let line_norm_sq = l.x * l.x + l.y * l.y;
+            if line_norm_sq <= 1e-12 {
                 continue;
             }
+            let d = l.x * q.x + l.y * q.y + l.z;
+            let octave = curr_kf
+                .frame
+                .features
+                .octaves
+                .get(curr_idx)
+                .copied()
+                .unwrap_or(0);
+            let sigma_sq = ORB_SCALE_FACTOR.powi(2 * octave as i32);
+            if d * d > EPIPOLAR_CHI2 * sigma_sq * line_norm_sq {
+                continue;
+            }
+
             pair_indices.push((prev_idx, curr_idx));
+            matched_prev.push(p);
+            matched_curr.push(q);
         }
-
-        let camera = &self.camera;
-        let (prev_pts, curr_pts) = camera.undistort_matched_pairs(
-            &prev_kf.frame.features.keypoints_xy,
-            &curr_kf.frame.features.keypoints_xy,
-            &pair_indices,
-        );
-        if pair_indices.len() < 8 {
+        if pair_indices.len() < MIN_GROWTH_MATCHES {
             return 0;
         }
-
-        let k = camera.intrinsic_matrix();
-        let estimator = TwoViewEstimator::builder()
-            .triangulation(triangulation_config.clone())
-            .build();
-        let two_view = match estimator.estimate(&prev_pts, &curr_pts, &k, &k) {
-            Ok(tv) if matches!(tv.model, TwoViewModel::Fundamental(_)) => tv,
-            _ => return 0,
-        };
-        if two_view.inlier_indices.len() < MIN_GROWTH_INLIERS {
-            return 0;
-        }
-
-        // Collect inlier undistorted points for triangulation.
-        let inlier_prev: Vec<_> = two_view
-            .inlier_indices
-            .iter()
-            .map(|&i| prev_pts[i])
-            .collect();
-        let inlier_curr: Vec<_> = two_view
-            .inlier_indices
-            .iter()
-            .map(|&i| curr_pts[i])
-            .collect();
 
         let triangulated = match triangulate_matched_points(
-            &inlier_prev,
-            &inlier_curr,
+            &matched_prev,
+            &matched_curr,
             &prev_kf.frame.pose_world_to_cam,
             &curr_kf.frame.pose_world_to_cam,
             camera,
@@ -702,13 +724,11 @@ impl Pipeline {
         };
 
         let mut points = Vec::new();
-        let mut used_curr = HashSet::new();
         for tp in &triangulated {
-            let inlier_idx = two_view.inlier_indices[tp.pair_index];
-            let Some(&(prev_idx, curr_idx)) = pair_indices.get(inlier_idx) else {
+            let Some(&(prev_idx, curr_idx)) = pair_indices.get(tp.pair_index) else {
                 continue;
             };
-            if curr_kf.map_point(curr_idx).is_some() || !used_curr.insert(curr_idx) {
+            if curr_kf.map_point(curr_idx).is_some() {
                 continue;
             }
             let color = curr_kf
