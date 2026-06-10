@@ -661,6 +661,25 @@ impl Pipeline {
             );
             let f_mat = k_inv.transpose() * (t_skew * rel.rotation) * k_inv;
 
+            // Epipole of the prev camera in the curr image (projection of
+            // prev's camera center). Near it every keypoint is close to every
+            // epipolar line, so the chi-square gate below is uninformative
+            // there: wrong matches survive and triangulate to depth-garbage
+            // points that still reproject well in both views. Mirrors
+            // ORB-SLAM3's epipole-proximity rejection in
+            // SearchForTriangulation; RANSAC consensus used to absorb these.
+            let prev_center_world = prev_kf.frame.pose_world_to_cam.inverse().translation;
+            let epipole_cam = curr_kf
+                .frame
+                .pose_world_to_cam
+                .transform_point(&prev_center_world);
+            let epipole_px = (epipole_cam.z.abs() > 1e-9).then(|| {
+                Vec2F64::new(
+                    camera.fx * epipole_cam.x / epipole_cam.z + camera.cx,
+                    camera.fy * epipole_cam.y / epipole_cam.z + camera.cy,
+                )
+            });
+
             // Brute-force descriptor matching over the unassociated subsets
             // (global second-best ratio test + orientation consistency live
             // inside the matcher and are essential for match quality).
@@ -709,6 +728,23 @@ impl Pipeline {
                 };
                 let p = Vec2F64::new(pu[0] as f64, pu[1] as f64);
                 let q = Vec2F64::new(qu[0] as f64, qu[1] as f64);
+
+                // Reject curr keypoints near the epipole (radius grows with
+                // octave; ORB-SLAM3 uses 100 * scaleFactor^octave px^2).
+                if let Some(e) = epipole_px {
+                    let octave = curr_kf
+                        .frame
+                        .features
+                        .octaves
+                        .get(curr_idx)
+                        .copied()
+                        .unwrap_or(0);
+                    let dx = q.x - e.x;
+                    let dy = q.y - e.y;
+                    if dx * dx + dy * dy < 100.0 * ORB_SCALE_FACTOR.powi(octave as i32) {
+                        continue;
+                    }
+                }
 
                 let l = f_mat * Vec3F64::new(p.x, p.y, 1.0);
                 let line_norm_sq = l.x * l.x + l.y * l.y;

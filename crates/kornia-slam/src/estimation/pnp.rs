@@ -67,6 +67,22 @@ pub fn solve_pnp(
         return None;
     }
 
+    // Normalize for the f32 LM solver: express points relative to the prior
+    // camera center and scale to unit median depth. Reprojection is invariant
+    // to this similarity transform, but the f32 normal equations are not —
+    // once monocular scale drift grows the map (world coords and camera
+    // translation in the tens), the unnormalized solve goes singular
+    // ("LU solve failed") on perfectly well-posed problems. With
+    // `center = -R^T t` the normalized prior translation is exactly zero.
+    let center = pose_init.inverse().translation;
+    let mut depths: Vec<f64> = prior_inlier_indices
+        .iter()
+        .map(|&i| pose_init.transform_point(&points_world_f64[i]).z)
+        .collect();
+    let mid = depths.len() / 2;
+    depths.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    let scale = 1.0 / depths[mid].max(1e-9);
+
     // Build f32 arrays for LM solver.
     let k = Mat3AF32::from_cols(
         Vec3AF32::new(camera.fx as f32, 0.0, 0.0),
@@ -76,7 +92,7 @@ pub fn solve_pnp(
     let mut world_inliers = Vec::with_capacity(prior_inlier_indices.len());
     let mut image_inliers = Vec::with_capacity(prior_inlier_indices.len());
     for &i in &prior_inlier_indices {
-        let pw = &points_world_f64[i];
+        let pw = (points_world_f64[i] - center) * scale;
         world_inliers.push(Vec3AF32::new(pw.x as f32, pw.y as f32, pw.z as f32));
         image_inliers.push(points_image[i]);
     }
@@ -98,11 +114,8 @@ pub fn solve_pnp(
             pose_init.rotation.col(2).z as f32,
         ),
     );
-    let t_init_f32 = Vec3AF32::new(
-        pose_init.translation.x as f32,
-        pose_init.translation.y as f32,
-        pose_init.translation.z as f32,
-    );
+    // Normalized prior translation: t' = s * (t + R * center) = 0.
+    let t_init_f32 = Vec3AF32::new(0.0, 0.0, 0.0);
 
     let lm = refine_pose_lm(
         &world_inliers,
@@ -122,7 +135,11 @@ pub fn solve_pnp(
         Vec3F64::new(r.col(1).x as f64, r.col(1).y as f64, r.col(1).z as f64),
         Vec3F64::new(r.col(2).x as f64, r.col(2).y as f64, r.col(2).z as f64),
     );
-    let t_new = Vec3F64::new(t.x as f64, t.y as f64, t.z as f64);
+    // Undo the similarity normalization: the LM pose maps
+    // s*(w - center) -> cam, so the world-frame pose is
+    // (R_lm, t_lm / s - R_lm * center).
+    let t_lm = Vec3F64::new(t.x as f64, t.y as f64, t.z as f64);
+    let t_new = t_lm / scale - r_new * center;
     let pose_new = Pose3d::new(r_new, t_new);
 
     let final_inliers = count_reprojection_inliers(
