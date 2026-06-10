@@ -1,5 +1,6 @@
 //! Core frame-domain types shared across the crate.
 
+use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::OrbFeatures;
@@ -28,12 +29,48 @@ pub struct Frame {
     /// Metric depth per left keypoint (ORB-SLAM3's `mvDepth`); `-1.0` = no
     /// stereo match. Parallel to `features.keypoints_xy`. Empty when monocular.
     pub depth: Vec<f32>,
+    /// Undistorted pixel coordinates per keypoint, parallel to
+    /// `features.keypoints_xy`. Filled once by [`Frame::ensure_undistorted`];
+    /// empty until then. Undistortion is iterative and shows up in every
+    /// stage that consumes keypoints (tracking, BA gathering, fuse), so it
+    /// must not be recomputed per consumer.
+    pub keypoints_undist: Vec<[f32; 2]>,
 }
 
 impl Frame {
     /// Whether this frame carries per-keypoint stereo depth.
     pub fn is_stereo(&self) -> bool {
         !self.depth.is_empty()
+    }
+
+    /// Computes and caches undistorted keypoint coordinates (no-op when
+    /// already computed for the current keypoint set).
+    pub fn ensure_undistorted(&mut self, camera: &PinholeCamera) {
+        if self.keypoints_undist.len() == self.features.keypoints_xy.len() {
+            return;
+        }
+        self.keypoints_undist = self
+            .features
+            .keypoints_xy
+            .iter()
+            .map(|kp| {
+                let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+                [p.x as f32, p.y as f32]
+            })
+            .collect();
+    }
+
+    /// Undistorted coordinates of keypoint `i`, from the cache when present
+    /// (frames built outside the pipeline fall back to undistorting on the
+    /// fly).
+    pub fn undistorted_xy(&self, i: usize, camera: &PinholeCamera) -> Option<[f32; 2]> {
+        if !self.keypoints_undist.is_empty() {
+            return self.keypoints_undist.get(i).copied();
+        }
+        self.features.keypoints_xy.get(i).map(|kp| {
+            let p = camera.undistort(kp[0] as f64, kp[1] as f64);
+            [p.x as f32, p.y as f32]
+        })
     }
 
     /// Metric depth for keypoint `i`, if it has a valid stereo match.
@@ -67,6 +104,7 @@ mod tests {
             keypoint_colors: Vec::new(),
             u_right,
             depth,
+            keypoints_undist: Vec::new(),
         }
     }
 

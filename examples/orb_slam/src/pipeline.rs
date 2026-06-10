@@ -8,15 +8,13 @@ use std::collections::HashSet;
 use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
-use kornia_3d::pose::{
-    TriangulationConfig, TwoViewEstimator, TwoViewModel, triangulate_matched_points,
-};
-use kornia_algebra::Vec3F64;
+use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
+use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_slam::Frame;
 use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use kornia_slam::map::{Keyframe, Map, MapPoint};
+use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
@@ -65,7 +63,10 @@ impl Pipeline {
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
-    pub fn process_frame(&mut self, frame: Frame) -> TrackingResult {
+    pub fn process_frame(&mut self, mut frame: Frame) -> TrackingResult {
+        // Fill the per-frame undistortion cache once; tracking, BA gathering,
+        // growth, and fuse all read from it.
+        frame.ensure_undistorted(&self.camera);
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame),
             SystemMode::Tracking => self.tracking_step(frame),
@@ -443,9 +444,20 @@ impl Pipeline {
         }
 
         if status == TrackingStatus::Tracked {
-            let visible = self
-                .map
-                .map_points_in_frustum(&self.camera, &candidate_pose, image_size);
+            // Visibility bookkeeping over the local map only (mirrors
+            // ORB-SLAM3, which counts mnVisible on local-map points): full-map
+            // scans here would grow with trajectory length.
+            let current_kf = self
+                .state
+                .current_keyframe_idx
+                .and_then(|ki| self.map.get_keyframe(ki));
+            let local_indices = self.map.build_local_map_point_indices(&matches, current_kf);
+            let visible = self.map.map_points_in_frustum(
+                &local_indices,
+                &self.camera,
+                &candidate_pose,
+                image_size,
+            );
             self.map.update_observation_counts(&visible, &matches);
 
             if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {
@@ -509,6 +521,7 @@ impl Pipeline {
             keypoint_colors: frame.keypoint_colors.clone(),
             u_right: frame.u_right.clone(),
             depth: frame.depth.clone(),
+            keypoints_undist: frame.keypoints_undist.clone(),
         });
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
@@ -533,16 +546,16 @@ impl Pipeline {
         // not just the immediate predecessor. Mirrors ORB-SLAM3's
         // CreateNewMapPoints which uses the 30 best covisible KFs; we
         // approximate covisibility by recency until a covisibility graph is
-        // available. Cloning upfront releases the shared borrow on self.map
-        // so grow_map_points_from_keyframe_pair can take &mut self.
+        // available. The grow pass works against keyframes stored in the map
+        // (addressed by frame index), so no keyframe clones are needed.
         const MAX_COVIS_KFS: usize = 10;
-        let neighbor_kfs: Vec<Keyframe> = self
+        let neighbor_kf_indices: Vec<usize> = self
             .map
             .keyframes()
             .iter()
             .rev()
             .take(MAX_COVIS_KFS)
-            .cloned()
+            .map(|kf| kf.frame.idx)
             .collect();
 
         let enable_local_ba = self.enable_local_ba;
@@ -550,9 +563,9 @@ impl Pipeline {
         let triangulation_config = self.two_view_init_config.triangulation_config.clone();
 
         let mut total_grown = 0usize;
-        for neighbor_kf in &neighbor_kfs {
+        for &nb_kf_idx in &neighbor_kf_indices {
             total_grown += self.grow_map_points_from_keyframe_pair(
-                neighbor_kf,
+                nb_kf_idx,
                 &mut curr_kf,
                 match_config,
                 &triangulation_config,
@@ -562,7 +575,7 @@ impl Pipeline {
             "[kf] frame={} grown={} from {} neighbor kfs",
             frame.idx,
             total_grown,
-            neighbor_kfs.len()
+            neighbor_kf_indices.len()
         ));
 
         self.map.upsert_keyframe(curr_kf);
@@ -572,7 +585,6 @@ impl Pipeline {
         // Forward SearchInNeighbors / Fuse: extend each curr_kf-observed map
         // point's observation list to neighbor KFs that don't yet observe it.
         // Run before local BA so BA sees the extra reprojection constraints.
-        let neighbor_kf_indices: Vec<usize> = neighbor_kfs.iter().map(|kf| kf.frame.idx).collect();
         let n_fused = self.fuse_into_neighbors(frame.idx, &neighbor_kf_indices);
         self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
 
@@ -589,159 +601,228 @@ impl Pipeline {
 
     fn grow_map_points_from_keyframe_pair(
         &mut self,
-        prev_kf: &Keyframe,
+        prev_kf_idx: usize,
         curr_kf: &mut Keyframe,
         match_config: OrbMatchConfig,
         triangulation_config: &TriangulationConfig,
     ) -> usize {
-        const MIN_GROWTH_INLIERS: usize = 15;
+        const MIN_GROWTH_MATCHES: usize = 15;
+        // 1-DOF chi-square gate at 95% for the point-to-epipolar-line distance
+        // (ORB-SLAM3's CheckDistEpipolarLine), scaled per-octave below.
+        const EPIPOLAR_CHI2: f64 = 3.84;
 
-        // Only consider features that don't already have a map point in either
-        // KF. Matching the full descriptor arrays and then filtering discards
-        // almost everything once the KFs are mature (the best matches always
-        // land on the already-tracked features). Instead, build sub-arrays of
-        // unassociated features from each side and match only those.
-        let prev_unassoc: Vec<usize> = (0..prev_kf.frame.features.descriptors.len())
-            .filter(|&i| prev_kf.map_point(i).is_none())
-            .collect();
-        let curr_unassoc: Vec<usize> = (0..curr_kf.frame.features.descriptors.len())
-            .filter(|&i| curr_kf.map_point(i).is_none())
-            .collect();
-
-        // Need at least 8 unassociated features on each side for F-matrix RANSAC.
-        if prev_unassoc.len() < 8 || curr_unassoc.len() < 8 {
-            return 0;
-        }
-
-        let prev_orients: Vec<f32> = prev_unassoc
-            .iter()
-            .map(|&i| prev_kf.frame.features.orientations[i])
-            .collect();
-        let prev_descs: Vec<[u8; 32]> = prev_unassoc
-            .iter()
-            .map(|&i| prev_kf.frame.features.descriptors[i])
-            .collect();
-        let curr_orients: Vec<f32> = curr_unassoc
-            .iter()
-            .map(|&i| curr_kf.frame.features.orientations[i])
-            .collect();
-        let curr_descs: Vec<[u8; 32]> = curr_unassoc
-            .iter()
-            .map(|&i| curr_kf.frame.features.descriptors[i])
-            .collect();
-
-        let sub_matches = match_orb_descriptors(
-            &prev_orients,
-            &prev_descs,
-            &curr_orients,
-            &curr_descs,
-            match_config,
-        );
-
-        // Map sub-array indices back to original feature indices.
-        let mut pair_indices: Vec<(usize, usize)> = Vec::with_capacity(sub_matches.len());
-        for (prev_sub, curr_sub) in sub_matches {
-            let Some(&prev_idx) = prev_unassoc.get(prev_sub) else {
-                continue;
+        // Read-only phase: match and triangulate against the neighbor
+        // keyframe stored in the map. The shared borrow on self.map ends with
+        // this block so the write phase below can mutate the map.
+        let points = {
+            let Some(prev_kf) = self.map.get_keyframe(prev_kf_idx) else {
+                return 0;
             };
-            let Some(&curr_idx) = curr_unassoc.get(curr_sub) else {
-                continue;
-            };
-            if prev_idx >= prev_kf.frame.features.keypoints_xy.len()
-                || curr_idx >= curr_kf.frame.features.keypoints_xy.len()
-            {
-                continue;
+
+            // Only consider features that don't already have a map point in
+            // either KF. Matching the full descriptor arrays and then
+            // filtering discards almost everything once the KFs are mature
+            // (the best matches always land on the already-tracked features).
+            let prev_unassoc: Vec<usize> = (0..prev_kf.frame.features.descriptors.len())
+                .filter(|&i| prev_kf.map_point(i).is_none())
+                .collect();
+            let curr_unassoc: Vec<usize> = (0..curr_kf.frame.features.descriptors.len())
+                .filter(|&i| curr_kf.map_point(i).is_none())
+                .collect();
+            if prev_unassoc.is_empty() || curr_unassoc.is_empty() {
+                return 0;
             }
-            pair_indices.push((prev_idx, curr_idx));
-        }
 
-        let camera = &self.camera;
-        let (prev_pts, curr_pts) = camera.undistort_matched_pairs(
-            &prev_kf.frame.features.keypoints_xy,
-            &curr_kf.frame.features.keypoints_xy,
-            &pair_indices,
-        );
-        if pair_indices.len() < 8 {
-            return 0;
-        }
-
-        let k = camera.intrinsic_matrix();
-        let estimator = TwoViewEstimator::builder()
-            .triangulation(triangulation_config.clone())
-            .build();
-        let two_view = match estimator.estimate(&prev_pts, &curr_pts, &k, &k) {
-            Ok(tv) if matches!(tv.model, TwoViewModel::Fundamental(_)) => tv,
-            _ => return 0,
-        };
-        if two_view.inlier_indices.len() < MIN_GROWTH_INLIERS {
-            return 0;
-        }
-
-        // Collect inlier undistorted points for triangulation.
-        let inlier_prev: Vec<_> = two_view
-            .inlier_indices
-            .iter()
-            .map(|&i| prev_pts[i])
-            .collect();
-        let inlier_curr: Vec<_> = two_view
-            .inlier_indices
-            .iter()
-            .map(|&i| curr_pts[i])
-            .collect();
-
-        let triangulated = match triangulate_matched_points(
-            &inlier_prev,
-            &inlier_curr,
-            &prev_kf.frame.pose_world_to_cam,
-            &curr_kf.frame.pose_world_to_cam,
-            camera,
-            triangulation_config,
-        ) {
-            Ok(pts) => pts,
-            Err(_) => return 0,
-        };
-
-        let mut points = Vec::new();
-        let mut used_curr = HashSet::new();
-        for tp in &triangulated {
-            let inlier_idx = two_view.inlier_indices[tp.pair_index];
-            let Some(&(prev_idx, curr_idx)) = pair_indices.get(inlier_idx) else {
-                continue;
-            };
-            if curr_kf.map_point(curr_idx).is_some() || !used_curr.insert(curr_idx) {
-                continue;
+            // Both keyframe poses are known, so the fundamental matrix between
+            // the pair is fully determined: F = K^-T [t]x R K^-1 with (R, t)
+            // the prev->curr relative pose. Filtering matches against this F
+            // replaces the F-matrix RANSAC of the two-view estimator (mirrors
+            // ORB-SLAM3's SearchForTriangulation).
+            let rel = Pose3d::between(
+                &prev_kf.frame.pose_world_to_cam,
+                &curr_kf.frame.pose_world_to_cam,
+            );
+            if rel.translation.length() <= 1e-8 {
+                // No baseline: epipolar geometry degenerates and triangulation
+                // would reject everything anyway.
+                return 0;
             }
-            let color = curr_kf
+            let t = rel.translation;
+            let t_skew = Mat3F64::from_cols(
+                Vec3F64::new(0.0, t.z, -t.y),
+                Vec3F64::new(-t.z, 0.0, t.x),
+                Vec3F64::new(t.y, -t.x, 0.0),
+            );
+            let camera = &self.camera;
+            let k_inv = Mat3F64::from_cols(
+                Vec3F64::new(1.0 / camera.fx, 0.0, 0.0),
+                Vec3F64::new(0.0, 1.0 / camera.fy, 0.0),
+                Vec3F64::new(-camera.cx / camera.fx, -camera.cy / camera.fy, 1.0),
+            );
+            let f_mat = k_inv.transpose() * (t_skew * rel.rotation) * k_inv;
+
+            // Epipole of the prev camera in the curr image (projection of
+            // prev's camera center). Near it every keypoint is close to every
+            // epipolar line, so the chi-square gate below is uninformative
+            // there: wrong matches survive and triangulate to depth-garbage
+            // points that still reproject well in both views. Mirrors
+            // ORB-SLAM3's epipole-proximity rejection in
+            // SearchForTriangulation; RANSAC consensus used to absorb these.
+            let prev_center_world = prev_kf.frame.pose_world_to_cam.inverse().translation;
+            let epipole_cam = curr_kf
                 .frame
-                .keypoint_colors
-                .get(curr_idx)
-                .copied()
-                .unwrap_or([128; 3]);
-            points.push((
-                tp.position,
-                curr_kf.frame.features.descriptors[curr_idx],
-                color,
-                prev_idx,
-                curr_idx,
-            ));
-        }
+                .pose_world_to_cam
+                .transform_point(&prev_center_world);
+            let epipole_px = (epipole_cam.z.abs() > 1e-9).then(|| {
+                Vec2F64::new(
+                    camera.fx * epipole_cam.x / epipole_cam.z + camera.cx,
+                    camera.fy * epipole_cam.y / epipole_cam.z + camera.cy,
+                )
+            });
 
-        // Create the new map points; curr_kf is registered as the first
-        // observer inside add_triangulated_points.
-        let prev_kf_idx = prev_kf.frame.idx;
+            // Brute-force descriptor matching over the unassociated subsets
+            // (global second-best ratio test + orientation consistency live
+            // inside the matcher and are essential for match quality).
+            let prev_orients: Vec<f32> = prev_unassoc
+                .iter()
+                .map(|&i| prev_kf.frame.features.orientations[i])
+                .collect();
+            let prev_descs: Vec<[u8; 32]> = prev_unassoc
+                .iter()
+                .map(|&i| prev_kf.frame.features.descriptors[i])
+                .collect();
+            let curr_orients: Vec<f32> = curr_unassoc
+                .iter()
+                .map(|&i| curr_kf.frame.features.orientations[i])
+                .collect();
+            let curr_descs: Vec<[u8; 32]> = curr_unassoc
+                .iter()
+                .map(|&i| curr_kf.frame.features.descriptors[i])
+                .collect();
+
+            let sub_matches = match_orb_descriptors(
+                &prev_orients,
+                &prev_descs,
+                &curr_orients,
+                &curr_descs,
+                match_config,
+            );
+
+            // Keep only matches consistent with the pose-derived epipolar
+            // geometry: distance from the curr keypoint to its epipolar line
+            // must pass the chi-square gate at the octave's detection sigma.
+            let mut pair_indices: Vec<(usize, usize)> = Vec::new();
+            let mut matched_prev: Vec<Vec2F64> = Vec::new();
+            let mut matched_curr: Vec<Vec2F64> = Vec::new();
+            for (prev_sub, curr_sub) in sub_matches {
+                let (Some(&prev_idx), Some(&curr_idx)) =
+                    (prev_unassoc.get(prev_sub), curr_unassoc.get(curr_sub))
+                else {
+                    continue;
+                };
+                let (Some(pu), Some(qu)) = (
+                    prev_kf.frame.undistorted_xy(prev_idx, camera),
+                    curr_kf.frame.undistorted_xy(curr_idx, camera),
+                ) else {
+                    continue;
+                };
+                let p = Vec2F64::new(pu[0] as f64, pu[1] as f64);
+                let q = Vec2F64::new(qu[0] as f64, qu[1] as f64);
+
+                // Reject curr keypoints near the epipole (radius grows with
+                // octave; ORB-SLAM3 uses 100 * scaleFactor^octave px^2).
+                if let Some(e) = epipole_px {
+                    let octave = curr_kf
+                        .frame
+                        .features
+                        .octaves
+                        .get(curr_idx)
+                        .copied()
+                        .unwrap_or(0);
+                    let dx = q.x - e.x;
+                    let dy = q.y - e.y;
+                    if dx * dx + dy * dy < 100.0 * ORB_SCALE_FACTOR.powi(octave as i32) {
+                        continue;
+                    }
+                }
+
+                let l = f_mat * Vec3F64::new(p.x, p.y, 1.0);
+                let line_norm_sq = l.x * l.x + l.y * l.y;
+                if line_norm_sq <= 1e-12 {
+                    continue;
+                }
+                let d = l.x * q.x + l.y * q.y + l.z;
+                let octave = curr_kf
+                    .frame
+                    .features
+                    .octaves
+                    .get(curr_idx)
+                    .copied()
+                    .unwrap_or(0);
+                let sigma_sq = ORB_SCALE_FACTOR.powi(2 * octave as i32);
+                if d * d > EPIPOLAR_CHI2 * sigma_sq * line_norm_sq {
+                    continue;
+                }
+
+                pair_indices.push((prev_idx, curr_idx));
+                matched_prev.push(p);
+                matched_curr.push(q);
+            }
+            if pair_indices.len() < MIN_GROWTH_MATCHES {
+                return 0;
+            }
+
+            let triangulated = match triangulate_matched_points(
+                &matched_prev,
+                &matched_curr,
+                &prev_kf.frame.pose_world_to_cam,
+                &curr_kf.frame.pose_world_to_cam,
+                camera,
+                triangulation_config,
+            ) {
+                Ok(pts) => pts,
+                Err(_) => return 0,
+            };
+
+            let mut points = Vec::new();
+            for tp in &triangulated {
+                let Some(&(prev_idx, curr_idx)) = pair_indices.get(tp.pair_index) else {
+                    continue;
+                };
+                if curr_kf.map_point(curr_idx).is_some() {
+                    continue;
+                }
+                let color = curr_kf
+                    .frame
+                    .keypoint_colors
+                    .get(curr_idx)
+                    .copied()
+                    .unwrap_or([128; 3]);
+                points.push((
+                    tp.position,
+                    curr_kf.frame.features.descriptors[curr_idx],
+                    color,
+                    prev_idx,
+                    curr_idx,
+                ));
+            }
+            points
+        };
+
+        // Write phase: create the new map points; curr_kf is registered as
+        // the first observer inside add_triangulated_points.
         let first_mp_idx = self.map.num_map_points();
         let added = self.map.add_triangulated_points(None, curr_kf, &points);
 
-        // Register the neighbor (`prev_kf`) as a second observer on each new
-        // map point. This is the SearchInNeighbors-equivalent piece for the
+        // Register the neighbor as a second observer on each new map point.
+        // This is the SearchInNeighbors-equivalent piece for the
         // triangulating pair: without it the new point would have a single
         // observation, biasing scale/normal geometry and making the cull
-        // overly aggressive. The neighbor KF in the map (not the clone) gets
-        // its desc slot pointed at the new map point.
+        // overly aggressive.
         for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().take(added).enumerate() {
             let mp_idx = first_mp_idx + i;
             self.map
-                .register_observation(mp_idx, prev_kf, prev_desc_idx);
+                .register_observation_at(mp_idx, prev_kf_idx, prev_desc_idx);
             if let Some(prev_live) = self.map.get_keyframe_mut(prev_kf_idx) {
                 prev_live.associate_map_point(prev_desc_idx, mp_idx);
             }
@@ -781,76 +862,70 @@ impl Pipeline {
             if nb_kf_idx == curr_kf_idx {
                 continue;
             }
-            // Clone the neighbor KF for the read-only inner loop; we need
-            // to take `&mut self` later to register observations.
-            let nb_kf = match self.map.get_keyframe(nb_kf_idx) {
-                Some(kf) => kf.clone(),
-                None => continue,
-            };
 
-            // Undistort neighbor keypoints once for projection comparison.
-            let nb_kp_undist: Vec<[f32; 2]> = nb_kf
-                .frame
-                .features
-                .keypoints_xy
-                .iter()
-                .map(|kp| {
-                    let p = self.camera.undistort(kp[0] as f64, kp[1] as f64);
-                    [p.x as f32, p.y as f32]
-                })
-                .collect();
-
-            // Proposals: (kp_idx_in_nb_kf, mp_idx). Resolved at the end so
-            // a single keypoint can't be claimed by two map points.
+            // Proposals: (kp_idx_in_nb_kf, mp_idx, hamming). Collected under a
+            // shared borrow of the neighbor KF in the map (no clone), resolved
+            // in the write phase below so a single keypoint can't be claimed
+            // by two map points.
             let mut proposals: Vec<(usize, usize, u32)> = Vec::new();
-
-            for &mp_idx in &curr_mp_indices {
-                let mp = match self.map.map_points().get(mp_idx) {
-                    Some(mp) if !mp.culled => mp,
-                    _ => continue,
-                };
-                // Skip if neighbor already observes this map point.
-                if mp.observation_kf_indices.contains(&nb_kf_idx) {
-                    continue;
-                }
-
-                // Project into the neighbor's frame.
-                let p_cam = nb_kf.frame.pose_world_to_cam.transform_point(&mp.position);
-                if p_cam.z <= 0.0 {
-                    continue;
-                }
-                let Ok(pixel) = self
-                    .camera
-                    .project_to_image(&p_cam, 0.0, nb_kf.frame.image_size)
-                else {
+            {
+                let Some(nb_kf) = self.map.get_keyframe(nb_kf_idx) else {
                     continue;
                 };
-                let u = pixel.x as f32;
-                let v = pixel.y as f32;
 
-                // Find the closest unassociated keypoint within the radius
-                // that matches the map point's representative descriptor.
-                let mut best_dist = u32::MAX;
-                let mut best_kp = usize::MAX;
-                for (kp_idx, kp) in nb_kp_undist.iter().enumerate() {
-                    if nb_kf.map_point(kp_idx).is_some() {
+                for &mp_idx in &curr_mp_indices {
+                    let mp = match self.map.map_points().get(mp_idx) {
+                        Some(mp) if !mp.culled => mp,
+                        _ => continue,
+                    };
+                    // Skip if neighbor already observes this map point.
+                    if mp.observation_kf_indices.contains(&nb_kf_idx) {
                         continue;
                     }
-                    let dx = kp[0] - u;
-                    let dy = kp[1] - v;
-                    if dx * dx + dy * dy > r2 {
+
+                    // Project into the neighbor's frame.
+                    let p_cam = nb_kf.frame.pose_world_to_cam.transform_point(&mp.position);
+                    if p_cam.z <= 0.0 {
                         continue;
                     }
-                    let dist =
-                        hamming_distance(&mp.descriptor, &nb_kf.frame.features.descriptors[kp_idx]);
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_kp = kp_idx;
-                    }
-                }
+                    let Ok(pixel) =
+                        self.camera
+                            .project_to_image(&p_cam, 0.0, nb_kf.frame.image_size)
+                    else {
+                        continue;
+                    };
+                    let u = pixel.x as f32;
+                    let v = pixel.y as f32;
 
-                if best_dist <= FUSE_MAX_HAMMING && best_kp != usize::MAX {
-                    proposals.push((best_kp, mp_idx, best_dist));
+                    // Find the closest unassociated keypoint within the radius
+                    // that matches the map point's representative descriptor.
+                    let mut best_dist = u32::MAX;
+                    let mut best_kp = usize::MAX;
+                    for kp_idx in 0..nb_kf.frame.features.keypoints_xy.len() {
+                        if nb_kf.map_point(kp_idx).is_some() {
+                            continue;
+                        }
+                        let Some(kp) = nb_kf.frame.undistorted_xy(kp_idx, &self.camera) else {
+                            continue;
+                        };
+                        let dx = kp[0] - u;
+                        let dy = kp[1] - v;
+                        if dx * dx + dy * dy > r2 {
+                            continue;
+                        }
+                        let dist = hamming_distance(
+                            &mp.descriptor,
+                            &nb_kf.frame.features.descriptors[kp_idx],
+                        );
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_kp = kp_idx;
+                        }
+                    }
+
+                    if best_dist <= FUSE_MAX_HAMMING && best_kp != usize::MAX {
+                        proposals.push((best_kp, mp_idx, best_dist));
+                    }
                 }
             }
 
@@ -874,7 +949,7 @@ impl Pipeline {
                 if already {
                     continue;
                 }
-                self.map.register_observation(mp_idx, &nb_kf, kp_idx);
+                self.map.register_observation_at(mp_idx, nb_kf_idx, kp_idx);
                 if let Some(nb_live) = self.map.get_keyframe_mut(nb_kf_idx) {
                     nb_live.associate_map_point(kp_idx, mp_idx);
                 }
