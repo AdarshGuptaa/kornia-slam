@@ -38,13 +38,18 @@ use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
-/// A frame promoted into the map, with descriptor-to-map-point associations.
+/// Preintegrated IMU measurements connecting two consecutive keyframes.
 #[derive(Debug, Clone)]
 pub struct ImuEdge {
+    /// Index of the earlier keyframe (`Keyframe::frame.idx`).
     pub prev_kf_idx: usize,
+    /// Index of the later keyframe.
     pub curr_kf_idx: usize,
+    /// IMU deltas integrated over the interval between the two keyframes.
     pub preintegrated: PreintegratedImu,
 }
+
+/// A frame promoted into the map, with descriptor-to-map-point associations.
 #[derive(Debug, Clone)]
 pub struct Keyframe {
     pub frame: Frame,
@@ -297,6 +302,7 @@ impl Map {
         &mut self.keyframes
     }
 
+    /// Records preintegrated IMU measurements between two consecutive keyframes.
     pub fn add_imu_edge(
         &mut self,
         prev_kf_idx: usize,
@@ -310,6 +316,7 @@ impl Map {
         });
     }
 
+    /// Returns all keyframe-to-keyframe IMU edges in insertion order.
     pub fn imu_edges(&self) -> &[ImuEdge] {
         &self.imu_edges
     }

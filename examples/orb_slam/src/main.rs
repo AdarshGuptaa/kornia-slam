@@ -345,9 +345,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             evaluate = e.evaluate;
             eval_out = e.eval_out.clone();
             let src = if e.stereo {
-                EurocSource::open_imu_stereo(&e.data, e.start_frame, e.max_frames)?
+                EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
             } else {
-                EurocSource::open_imu(&e.data, e.start_frame, e.max_frames)?
+                EurocSource::open(&e.data, e.start_frame, e.max_frames)?
             };
             if !tui_active {
                 let total = src.dataset_len();
@@ -477,6 +477,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..PipelineConfig::default()
     };
     let mut system = Pipeline::new(camera.clone(), pipeline_config);
+    if let Some(t_bc) = source.imu_extrinsics() {
+        system.set_imu_extrinsics(t_bc);
+    }
 
     // ── Rerun ──────────────────────────────────────────────────────────────
     #[cfg(feature = "viz")]

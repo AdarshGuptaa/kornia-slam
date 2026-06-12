@@ -103,6 +103,12 @@ pub struct EurocCameraCalibration {
 }
 
 impl EurocCameraCalibration {
+    /// Camera-to-body extrinsic `T_BS` as rotation + translation
+    /// (`X_body = R * X_cam + t`). On EuRoC the body frame is `imu0`.
+    pub fn body_from_camera(&self) -> (Mat3F64, Vec3F64) {
+        decompose_t_bs(&self.t_bs)
+    }
+
     /// Converts the parsed EuRoC calibration into a `PinholeCamera`.
     pub fn to_pinhole_camera(self) -> PinholeCamera {
         PinholeCamera {
@@ -252,11 +258,11 @@ impl EurocDataset {
         })
     }
 
-    /// Loads the imu samples (`imu0`).
+    /// Loads the IMU samples (`imu0`); empty when the dataset ships none.
     fn load_imu_samples(root: &Path) -> Result<Vec<ImuSample>, DatasetError> {
         let csv = root.join("mav0").join("imu0").join("data.csv");
         if !csv.exists() {
-            return Err(DatasetError::FileNotFound(csv));
+            return Ok(Vec::new());
         }
 
         let file = File::open(&csv)?;

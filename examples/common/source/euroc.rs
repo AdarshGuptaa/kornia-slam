@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
 use kornia_io::png::read_image_png_mono8;
 
 use super::{FrameItem, FrameSource, SourceError};
@@ -33,7 +34,7 @@ impl EurocSource {
         start_frame: usize,
         max_frames: usize,
     ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, false, false)
+        Self::open_inner(root, start_frame, max_frames, false)
     }
 
     /// Like [`Self::open`], but rectifies the left+right pair and yields stereo
@@ -43,23 +44,7 @@ impl EurocSource {
         start_frame: usize,
         max_frames: usize,
     ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, true, false)
-    }
-
-    pub fn open_imu(
-        root: impl AsRef<Path>,
-        start_frame: usize,
-        max_frames: usize,
-    ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, false, true)
-    }
-
-    pub fn open_imu_stereo(
-        root: impl AsRef<Path>,
-        start_frame: usize,
-        max_frames: usize,
-    ) -> Result<Self, SourceError> {
-        Self::open_inner(root, start_frame, max_frames, true, true)
+        Self::open_inner(root, start_frame, max_frames, true)
     }
 
     fn open_inner(
@@ -67,7 +52,6 @@ impl EurocSource {
         start_frame: usize,
         max_frames: usize,
         stereo: bool,
-        imu: bool,
     ) -> Result<Self, SourceError> {
         let dataset = EurocDataset::open(root).map_err(SourceError::other)?;
         let n = dataset.samples().len();
@@ -95,25 +79,18 @@ impl EurocSource {
             None
         };
 
-        if imu && !dataset.is_imu() {
-            return Err(SourceError::other(
-                "IMU requested but dataset has no IMU samples",
-            ));
-        }
-
-        let imu_cursor = if imu {
-            if start == 0 {
-                0
-            } else {
-                let boundary_ts = dataset
-                    .left_samples
-                    .get(start - 1)
-                    .map(|sample| sample.timestamp_sec)
-                    .unwrap_or(f64::INFINITY);
-                dataset
-                    .imu_samples
-                    .partition_point(|sample| sample.timestamp_sec <= boundary_ts)
-            }
+        // IMU samples are yielded whenever the dataset ships them (`imu0`);
+        // skip those preceding the first yielded camera frame.
+        let with_imu = dataset.is_imu();
+        let imu_cursor = if with_imu && start > 0 {
+            let boundary_ts = dataset
+                .left_samples
+                .get(start - 1)
+                .map(|sample| sample.timestamp_sec)
+                .unwrap_or(f64::INFINITY);
+            dataset
+                .imu_samples
+                .partition_point(|sample| sample.timestamp_sec <= boundary_ts)
         } else {
             0
         };
@@ -124,7 +101,7 @@ impl EurocSource {
             start,
             end,
             rectifier,
-            with_imu: imu,
+            with_imu,
             imu_cursor,
         })
     }
@@ -149,6 +126,17 @@ impl FrameSource for EurocSource {
 
     fn stereo_bf(&self) -> Option<f64> {
         self.rectifier.as_ref().map(|r| r.bf())
+    }
+
+    fn imu_extrinsics(&self) -> Option<Pose3d> {
+        // The raw cam0 T_BS only applies to the unrectified left frame; the
+        // rectified virtual camera differs by the (unexposed) rectifying
+        // rotation, so stereo runs without IMU pose prediction for now.
+        if !self.with_imu || self.rectifier.is_some() {
+            return None;
+        }
+        let (rotation, translation) = self.dataset.left_calibration.body_from_camera();
+        Some(Pose3d::from_rt(rotation, translation))
     }
 
     fn n_frames_hint(&self) -> Option<usize> {

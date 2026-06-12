@@ -9,7 +9,7 @@ use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
-use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
+use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
@@ -20,6 +20,8 @@ use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
 };
+
+const GRAVITY_MAGNITUDE: f64 = 9.81;
 
 struct InertialInitConfig {
     min_keyframes: usize,
@@ -32,6 +34,13 @@ struct ImuInitResult {
     gravity_world: Vec3F64,
     velocities_world: Vec<Vec3F64>,
     bias: ImuBias,
+}
+
+/// Output of one linear scale/gravity/velocity solve (`solve_scale_gravity`).
+struct InertialSolveResult {
+    scale: f64,
+    gravity_world: Vec3F64,
+    velocities_world: Vec<Vec3F64>,
 }
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
@@ -58,6 +67,10 @@ pub struct Pipeline {
     // IMU states
     imu_calib: ImuCalib,
     imu_bias: ImuBias,
+    // Camera-to-body extrinsic T_BC (X_body = T_BC * X_cam). IMU deltas live in
+    // the body frame, so every place that mixes them with camera poses must go
+    // through this; None disables the inertial path entirely.
+    imu_t_bc: Option<Pose3d>,
     pending_imu: Vec<ImuMeasurement>,
     gravity_world: Vec3F64,
     bootstrap_timestamp_sec: Option<f64>,
@@ -90,8 +103,9 @@ impl Pipeline {
                 accel_bias_noise: 3.0e-3,
             },
             imu_bias: ImuBias::default(),
+            imu_t_bc: None,
             pending_imu: Vec::new(),
-            gravity_world: Vec3F64::new(0.0, 0.0, -9.81),
+            gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
             bootstrap_timestamp_sec: None,
             last_keyframe_timestamp_sec: None,
             inertial_init_start_kf_idx: None,
@@ -101,6 +115,12 @@ impl Pipeline {
                 min_motion: 0.05,
             },
         }
+    }
+
+    /// Enables the inertial path by providing the camera-to-body extrinsic
+    /// `T_BC` (`X_body = T_BC * X_cam`). Without it, IMU samples are ignored.
+    pub fn set_imu_extrinsics(&mut self, t_bc: Pose3d) {
+        self.imu_t_bc = Some(t_bc);
     }
 
     /// Processes one frame (pre-extracted features) and returns the tracking result.
@@ -114,7 +134,6 @@ impl Pipeline {
         // growth, and fuse all read from it.
         frame.ensure_undistorted(&self.camera);
         self.pending_imu.extend(imu_samples);
-
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
@@ -292,6 +311,8 @@ impl Pipeline {
             ));
             self.state.bootstrap_frame = Some(curr_frame);
             self.bootstrap_timestamp_sec = Some(timestamp_sec);
+            // Samples before the reference frame can never enter an edge.
+            self.prune_imu_before(timestamp_sec);
             return TrackingResult {
                 pose_world_to_cam: self.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
@@ -374,10 +395,11 @@ impl Pipeline {
         }
 
         if let Some(prev_ts) = self.bootstrap_timestamp_sec {
-            let preint = self.preintegrate_pending_imu(prev_ts, timestamp_sec);
+            let preint = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
                 self.map.add_imu_edge(prev_idx, curr_idx, preint);
             }
+            self.prune_imu_before(timestamp_sec);
         }
 
         self.state.velocity = Some(Pose3d::between(
@@ -387,8 +409,14 @@ impl Pipeline {
 
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
-        self.state.mode = SystemMode::InertialInit;
-        self.inertial_init_start_kf_idx = Some(curr_idx);
+        // Inertial init needs the camera-to-body extrinsic to relate IMU deltas
+        // to camera poses; without it, run visual-only as before.
+        self.state.mode = if self.imu_t_bc.is_some() {
+            self.inertial_init_start_kf_idx = Some(curr_idx);
+            SystemMode::InertialInit
+        } else {
+            SystemMode::Tracking
+        };
         self.last_keyframe_timestamp_sec = Some(timestamp_sec);
 
         TrackingResult {
@@ -460,25 +488,25 @@ impl Pipeline {
         added
     }
 
-    fn preintegrate_pending_imu(&mut self, t0: f64, t1: f64) -> PreintegratedImu {
+    /// Preintegrates buffered IMU samples over `[t0, t1]` without consuming
+    /// them: the same samples serve both per-frame pose prediction and the
+    /// keyframe-to-keyframe edges. [`Self::prune_imu_before`] discards samples
+    /// once no future window can need them.
+    fn preintegrate_window(&self, t0: f64, t1: f64) -> PreintegratedImu {
         let mut pre = PreintegratedImu::new(self.imu_bias, self.imu_calib);
 
-        self.pending_imu
-            .sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
-
-        let samples: Vec<ImuMeasurement> = self
+        let mut samples: Vec<&ImuMeasurement> = self
             .pending_imu
             .iter()
-            .copied()
             .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
             .collect();
+        samples.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
 
         if samples.is_empty() {
             return pre;
         }
 
         let mut last_t = t0;
-
         for sample in &samples {
             let dt = sample.timestamp - last_t;
             if dt > 0.0 {
@@ -487,15 +515,29 @@ impl Pipeline {
             }
         }
 
-        if last_t < t1 {
-            if let Some(last_sample) = samples.last() {
-                pre.integrate(last_sample, t1 - last_t);
-            }
+        if last_t < t1
+            && let Some(last_sample) = samples.last()
+        {
+            pre.integrate(last_sample, t1 - last_t);
         }
 
-        self.pending_imu.retain(|m| m.timestamp > t1);
-
         pre
+    }
+
+    /// Drops buffered IMU samples strictly older than `t` (typically the last
+    /// keyframe timestamp: the next edge and all per-frame windows start there).
+    fn prune_imu_before(&mut self, t: f64) {
+        self.pending_imu.retain(|m| m.timestamp >= t);
+    }
+
+    /// Body-to-world pose `T_WB` for a world-to-camera pose, via
+    /// `T_WB = T_WC ∘ T_CB`. Treats camera == body when no extrinsic is set.
+    fn body_to_world(&self, pose_w2c: &Pose3d) -> Pose3d {
+        let cam_to_world = pose_w2c.inverse();
+        match &self.imu_t_bc {
+            Some(t_bc) => cam_to_world.compose(&t_bc.inverse()),
+            None => cam_to_world,
+        }
     }
 
     fn inertial_init_ready(&self) -> bool {
@@ -535,10 +577,12 @@ impl Pipeline {
         (last_center - first_center).length() >= self.inertial_init_config.min_motion
     }
 
+    /// Visual-inertial initialization: gyro bias from rotation residuals, then
+    /// metric scale, gravity, and per-keyframe velocities from a linear solve
+    /// over the keyframe-to-keyframe IMU edges (Martinelli / VINS-Mono style).
     fn try_initialize_imu(&self) -> Option<ImuInitResult> {
-        let Some(start_idx) = self.inertial_init_start_kf_idx else {
-            return None;
-        };
+        let start_idx = self.inertial_init_start_kf_idx?;
+        self.imu_t_bc?;
 
         let keyframes: Vec<&Keyframe> = self
             .map
@@ -556,13 +600,150 @@ impl Pipeline {
             frame_to_local.insert(kf.frame.idx, local_idx);
         }
 
-        let unknowns = 3 * n + 4;
+        let mut bias = self.imu_bias;
+        if let Some(gyro_bias) = self.estimate_gyro_bias(&keyframes, &frame_to_local) {
+            bias.gyro = gyro_bias;
+        }
+
+        // Free 3-DoF gravity first, then refine with ‖g‖ fixed at 9.81 and the
+        // direction perturbed in its 2-DoF tangent; re-solving keeps scale and
+        // velocities consistent with the constrained gravity (a post-hoc
+        // normalization alone would bias the scale).
+        let first = self.solve_scale_gravity(&keyframes, &frame_to_local, &bias, None)?;
+        let mut gravity_dir = first.gravity_world;
+        if !gravity_dir.length().is_finite() || gravity_dir.length() < 1e-6 {
+            return None;
+        }
+        gravity_dir /= gravity_dir.length();
+
+        let mut refined = None;
+        for _ in 0..2 {
+            let solved =
+                self.solve_scale_gravity(&keyframes, &frame_to_local, &bias, Some(gravity_dir))?;
+            gravity_dir = solved.gravity_world / solved.gravity_world.length();
+            refined = Some(solved);
+        }
+        let solved = refined?;
+
+        if !solved.scale.is_finite() || solved.scale <= 1e-6 {
+            return None;
+        }
+
+        Some(ImuInitResult {
+            scale: solved.scale,
+            gravity_world: gravity_dir * GRAVITY_MAGNITUDE,
+            velocities_world: solved.velocities_world,
+            bias,
+        })
+    }
+
+    /// Gauss-Newton gyro-bias estimate from per-edge rotation residuals
+    /// `Log(ΔR(bg)ᵀ · R_WB_iᵀ · R_WB_j)`, using the preintegrated ∂ΔR/∂bg.
+    fn estimate_gyro_bias(
+        &self,
+        keyframes: &[&Keyframe],
+        frame_to_local: &std::collections::HashMap<usize, usize>,
+    ) -> Option<Vec3F64> {
+        let r_cb = self.imu_t_bc?.inverse().rotation;
+        let mut bias = self.imu_bias;
+
+        for _ in 0..3 {
+            let mut h = vec![vec![0.0f64; 3]; 3];
+            let mut b = vec![0.0f64; 3];
+            let mut n_edges = 0usize;
+
+            for edge in self.map.imu_edges() {
+                let Some(&i) = frame_to_local.get(&edge.prev_kf_idx) else {
+                    continue;
+                };
+                let Some(&j) = frame_to_local.get(&edge.curr_kf_idx) else {
+                    continue;
+                };
+                if edge.preintegrated.dt <= 0.0 {
+                    continue;
+                }
+
+                let r_wb_i = keyframes[i].frame.pose_world_to_cam.inverse().rotation * r_cb;
+                let r_wb_j = keyframes[j].frame.pose_world_to_cam.inverse().rotation * r_cb;
+                let r_vis = Mat3F64(*r_wb_i.transpose()) * r_wb_j;
+                let d_rot = edge.preintegrated.delta_rotation_with_bias(&bias);
+                let resid = SO3F64::from_matrix(&(Mat3F64(*d_rot.transpose()) * r_vis)).log();
+                let jac = edge.preintegrated.d_rotation_d_bias_gyro.to_cols_array();
+                let resid = [resid.x, resid.y, resid.z];
+
+                // Accumulate JᵀJ and Jᵀr (column-major jac: jac[col*3 + row]).
+                for r in 0..3 {
+                    for c in 0..3 {
+                        for k in 0..3 {
+                            h[r][c] += jac[r * 3 + k] * jac[c * 3 + k];
+                        }
+                    }
+                    for k in 0..3 {
+                        b[r] += jac[r * 3 + k] * resid[k];
+                    }
+                }
+                n_edges += 1;
+            }
+
+            if n_edges < 2 {
+                return None;
+            }
+            let delta = solve_linear_system(h, b)?;
+            bias.gyro += Vec3F64::new(delta[0], delta[1], delta[2]);
+            if (delta[0].powi(2) + delta[1].powi(2) + delta[2].powi(2)).sqrt() < 1e-8 {
+                break;
+            }
+        }
+
+        // A gyro bias beyond ~0.1 rad/s means the solve latched onto something
+        // other than bias; better to integrate uncorrected than with garbage.
+        if !bias.gyro.length().is_finite() || bias.gyro.length() > 0.1 {
+            return None;
+        }
+        Some(bias.gyro)
+    }
+
+    /// One linear scale/gravity/velocity solve over the init window.
+    ///
+    /// With `gravity_dir: None` gravity is a free 3-DoF unknown; with
+    /// `Some(dir)` it is `9.81·dir` plus a 2-DoF perturbation in the tangent
+    /// plane of `dir`. Per edge (i, j), with body poses `T_WB = T_WC ∘ T_CB`
+    /// and visual camera centers `p̂` (arbitrary scale `s`):
+    ///
+    ///   `v_i·dt + ½g·dt² − s·(p̂_j − p̂_i) = (R_WC_j − R_WC_i)·t_CB − R_WB_i·Δp`
+    ///   `v_j − v_i − g·dt = R_WB_i·Δv`
+    fn solve_scale_gravity(
+        &self,
+        keyframes: &[&Keyframe],
+        frame_to_local: &std::collections::HashMap<usize, usize>,
+        bias: &ImuBias,
+        gravity_dir: Option<Vec3F64>,
+    ) -> Option<InertialSolveResult> {
+        let t_cb = self.imu_t_bc?.inverse();
+        let r_cb = t_cb.rotation;
+        let lever = t_cb.translation;
+        let n = keyframes.len();
+
+        // Tangent basis for the 2-DoF gravity refinement.
+        let gravity_basis = gravity_dir.map(|dir| {
+            let pick = if dir.x.abs() < 0.9 {
+                Vec3F64::new(1.0, 0.0, 0.0)
+            } else {
+                Vec3F64::new(0.0, 1.0, 0.0)
+            };
+            let b1 = dir.cross(pick).normalize();
+            let b2 = dir.cross(b1).normalize();
+            (b1, b2)
+        });
+        let n_gravity_cols = if gravity_basis.is_some() { 2 } else { 3 };
+
+        let unknowns = 3 * n + n_gravity_cols + 1;
         let mut rows: Vec<Vec<f64>> = Vec::new();
         let mut rhs: Vec<f64> = Vec::new();
 
         let vel_col = |kf_local: usize, axis: usize| -> usize { 3 * kf_local + axis };
         let gravity_col = |axis: usize| -> usize { 3 * n + axis };
-        let scale_col = 3 * n + 3;
+        let scale_col = 3 * n + n_gravity_cols;
 
         for edge in self.map.imu_edges() {
             let Some(&i) = frame_to_local.get(&edge.prev_kf_idx) else {
@@ -572,38 +753,56 @@ impl Pipeline {
                 continue;
             };
 
-            let kf_i = keyframes[i];
-            let kf_j = keyframes[j];
-            let cam_i_world = kf_i.frame.pose_world_to_cam.inverse();
-            let cam_j_world = kf_j.frame.pose_world_to_cam.inverse();
-            let r_i = cam_i_world.rotation;
-            let p_i = cam_i_world.translation;
-            let p_j = cam_j_world.translation;
+            let cam_i_world = keyframes[i].frame.pose_world_to_cam.inverse();
+            let cam_j_world = keyframes[j].frame.pose_world_to_cam.inverse();
+            let r_wb_i = cam_i_world.rotation * r_cb;
             let dt = edge.preintegrated.dt;
             if dt <= 0.0 {
                 continue;
             }
 
-            let delta_p_world = r_i * edge.preintegrated.delta_position;
-            let delta_v_world = r_i * edge.preintegrated.delta_velocity;
-            let visual_dp = p_j - p_i;
+            let delta_p_world = r_wb_i * edge.preintegrated.delta_position_with_bias(bias);
+            let delta_v_world = r_wb_i * edge.preintegrated.delta_velocity_with_bias(bias);
+            let visual_dp = cam_j_world.translation - cam_i_world.translation;
+            // Metric camera-to-body lever arm: the IMU sits at
+            // p_WB = s·p̂_WC + R_WC·t_CB, so the lever contribution to the
+            // position constraint stays outside the scale unknown.
+            let lever_dp = cam_j_world.rotation * lever - cam_i_world.rotation * lever;
 
             for axis in 0..3 {
                 let mut row = vec![0.0; unknowns];
                 row[vel_col(i, axis)] = dt;
-                row[gravity_col(axis)] = 0.5 * dt * dt;
                 row[scale_col] = -vec_axis(visual_dp, axis);
+                let mut b = vec_axis(lever_dp - delta_p_world, axis);
+                match gravity_basis {
+                    None => row[gravity_col(axis)] = 0.5 * dt * dt,
+                    Some((b1, b2)) => {
+                        row[gravity_col(0)] = 0.5 * dt * dt * vec_axis(b1, axis);
+                        row[gravity_col(1)] = 0.5 * dt * dt * vec_axis(b2, axis);
+                        let g0 = gravity_dir.unwrap() * GRAVITY_MAGNITUDE;
+                        b -= 0.5 * dt * dt * vec_axis(g0, axis);
+                    }
+                }
                 rows.push(row);
-                rhs.push(-vec_axis(delta_p_world, axis));
+                rhs.push(b);
             }
 
             for axis in 0..3 {
                 let mut row = vec![0.0; unknowns];
                 row[vel_col(j, axis)] = 1.0;
                 row[vel_col(i, axis)] = -1.0;
-                row[gravity_col(axis)] = -dt;
+                let mut b = vec_axis(delta_v_world, axis);
+                match gravity_basis {
+                    None => row[gravity_col(axis)] = -dt,
+                    Some((b1, b2)) => {
+                        row[gravity_col(0)] = -dt * vec_axis(b1, axis);
+                        row[gravity_col(1)] = -dt * vec_axis(b2, axis);
+                        let g0 = gravity_dir.unwrap() * GRAVITY_MAGNITUDE;
+                        b += dt * vec_axis(g0, axis);
+                    }
+                }
                 rows.push(row);
-                rhs.push(vec_axis(delta_v_world, axis));
+                rhs.push(b);
             }
         }
 
@@ -612,21 +811,22 @@ impl Pipeline {
         }
 
         let solution = solve_least_squares(&rows, &rhs)?;
-        let scale = solution[scale_col];
-        if !scale.is_finite() || scale <= 1e-6 {
-            return None;
-        }
 
-        let mut gravity_world = Vec3F64::new(
-            solution[gravity_col(0)],
-            solution[gravity_col(1)],
-            solution[gravity_col(2)],
-        );
-        let gravity_norm = gravity_world.length();
-        if !gravity_norm.is_finite() || gravity_norm < 1e-6 {
+        let gravity_world = match gravity_basis {
+            None => Vec3F64::new(
+                solution[gravity_col(0)],
+                solution[gravity_col(1)],
+                solution[gravity_col(2)],
+            ),
+            Some((b1, b2)) => {
+                gravity_dir.unwrap() * GRAVITY_MAGNITUDE
+                    + b1 * solution[gravity_col(0)]
+                    + b2 * solution[gravity_col(1)]
+            }
+        };
+        if !gravity_world.length().is_finite() || gravity_world.length() < 1e-6 {
             return None;
         }
-        gravity_world *= 9.81 / gravity_norm;
 
         let velocities_world = (0..n)
             .map(|i| {
@@ -638,11 +838,10 @@ impl Pipeline {
             })
             .collect();
 
-        Some(ImuInitResult {
-            scale,
+        Some(InertialSolveResult {
+            scale: solution[scale_col],
             gravity_world,
             velocities_world,
-            bias: self.imu_bias,
         })
     }
 
@@ -665,11 +864,20 @@ impl Pipeline {
             }
         }
 
-        if let Some(last_kf) = self.map.keyframes().iter()
-            .filter(|kf| kf.frame.idx >= start_idx).last()
+        if let Some(last_kf) = self
+            .map
+            .keyframes()
+            .iter()
+            .rfind(|kf| kf.frame.idx >= start_idx)
         {
             self.state.velocity_world = last_kf.velocity_world;
+            // Init runs right after this keyframe was accepted, so the tracker
+            // pose must follow it onto the rescaled map.
+            self.state.pose_world_to_cam = last_kf.frame.pose_world_to_cam;
         }
+        // The visual constant-velocity model predates the rescale; drop it so
+        // a fallback never composes a stale-scale step.
+        self.state.velocity = None;
         self.state.imu_initialized = true;
         self.gravity_world = init.gravity_world;
         self.imu_bias = init.bias;
@@ -683,11 +891,13 @@ impl Pipeline {
                 Some(init) => {
                     let scale = init.scale;
                     let gravity = init.gravity_world;
+                    let bg = init.bias.gyro;
                     self.apply_imu_initialization(init);
                     self.state.mode = SystemMode::Tracking;
                     self.dbg(format!(
-                        "[imu_init] accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3})",
-                        gravity.x, gravity.y, gravity.z
+                        "[imu_init] accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
+                         gyro_bias=({:.4},{:.4},{:.4})",
+                        gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
                     ));
                 }
                 None => {
@@ -699,32 +909,30 @@ impl Pipeline {
         result
     }
 
-    fn predict_pose_imu(&mut self, pose_w2c: Pose3d, vel_world: Vec3F64, gravity_world: Vec3F64, preint: &PreintegratedImu,) -> (Pose3d, Vec3F64) {
-        let dt = preint.dt;
-        
-        // Camera center and rotation in world frame
-        let cam_to_world = pose_w2c.inverse();
-        let p_i = cam_to_world.translation;     // camera center
-        let r_i = cam_to_world.rotation;        // world←camera rotation
+    /// Propagates the camera pose and body velocity through one preintegrated
+    /// IMU window. The deltas live in the body frame, so the pose round-trips
+    /// through `T_BC`: camera → body, IMU kinematics, body → camera.
+    fn predict_pose_imu(
+        &self,
+        pose_w2c: Pose3d,
+        vel_world: Vec3F64,
+        gravity_world: Vec3F64,
+        preint: &PreintegratedImu,
+    ) -> (Pose3d, Vec3F64) {
+        let body_to_world = self.body_to_world(&pose_w2c);
+        let (r_j, v_j, p_j) = preint.predict(
+            &body_to_world.rotation,
+            &vel_world,
+            &body_to_world.translation,
+            &gravity_world,
+        );
 
-        // Predicted camera center via IMU kinematics:
-        // p_j = p_i + v_i*dt + 0.5*g*dt² + R_i * Δp_imu
-        let p_j = p_i 
-            + vel_world * dt 
-            + gravity_world * 0.5 * dt * dt
-            + r_i * preint.delta_position;
-
-        // Predicted rotation: R_j = R_i * ΔR_imu
-        let r_j = r_i * preint.delta_rotation;
-
-        // Predicted velocity: v_j = v_i + g*dt + R_i * Δv_imu
-        let v_j = vel_world 
-            + gravity_world * dt 
-            + r_i * preint.delta_velocity;
-
-        // Convert back to world-to-camera convention
-        let pred_pose = Pose3d::from_rt(r_j, p_j).inverse();
-        (pred_pose, v_j)
+        let pred_body_to_world = Pose3d::from_rt(r_j, p_j);
+        let pred_cam_to_world = match &self.imu_t_bc {
+            Some(t_bc) => pred_body_to_world.compose(t_bc),
+            None => pred_body_to_world,
+        };
+        (pred_cam_to_world.inverse(), v_j)
     }
 
     fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
@@ -732,13 +940,8 @@ impl Pipeline {
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
-        let candidate_pose = if self.state.imu_initialized 
-            && prev_timestamp > 0.0 
-        {
-            let preint = self.preintegrate_pending_imu(
-                prev_timestamp, 
-                timestamp_sec
-            );
+        let candidate_pose = if self.state.imu_initialized && prev_timestamp > 0.0 {
+            let preint = self.preintegrate_window(prev_timestamp, timestamp_sec);
             if preint.dt > 0.0 {
                 let (pred_pose, pred_vel) = self.predict_pose_imu(
                     pose_before,
@@ -750,16 +953,18 @@ impl Pipeline {
                 pred_pose
             } else {
                 // IMU stalled, fall back to visual constant velocity
-                self.state.velocity
+                self.state
+                    .velocity
                     .map(|v| v.compose(&pose_before))
                     .unwrap_or(pose_before)
             }
         } else {
-            self.state.velocity
+            self.state
+                .velocity
                 .map(|v| v.compose(&pose_before))
                 .unwrap_or(pose_before)
         };
-        
+
         let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
@@ -774,22 +979,17 @@ impl Pipeline {
                 self.state.pose_world_to_cam = estimate.pose;
 
                 if self.state.imu_initialized {
-                    let cam_before = pose_before.inverse().translation;
-                    let cam_after  = estimate.pose.inverse().translation;
-
-                    let dt =
-                        timestamp_sec - prev_timestamp;
-
+                    // Refresh the body velocity from the visually corrected
+                    // poses (body centers, not camera centers: they differ by
+                    // the rotating T_BC lever arm).
+                    let body_before = self.body_to_world(&pose_before).translation;
+                    let body_after = self.body_to_world(&estimate.pose).translation;
+                    let dt = timestamp_sec - prev_timestamp;
                     if dt > 1e-6 {
-                        self.state.velocity_world =
-                            (cam_after - cam_before) / dt;
+                        self.state.velocity_world = (body_after - body_before) / dt;
                     }
                 } else {
-                    self.state.velocity =
-                        Some(Pose3d::between(
-                            &pose_before,
-                            &estimate.pose,
-                        ));
+                    self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
                 }
 
                 (
@@ -846,6 +1046,11 @@ impl Pipeline {
             self.state.consecutive_failures = 0;
         }
         self.state.last_frame_timestamp_sec = timestamp_sec;
+        // Samples older than the last keyframe can't enter any future window
+        // (the next edge and all per-frame predictions start at or after it).
+        if let Some(kf_ts) = self.last_keyframe_timestamp_sec {
+            self.prune_imu_before(kf_ts.min(timestamp_sec));
+        }
         TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
             status,
@@ -951,13 +1156,13 @@ impl Pipeline {
         ));
 
         self.map.upsert_keyframe(curr_kf);
-        if let Some(prev_kf_idx) = self.state.last_keyframe_idx {
-            if let Some(prev_ts) = self.last_keyframe_timestamp_sec {
-                let preint = self.preintegrate_pending_imu(prev_ts, timestamp_sec);
-
-                if preint.dt > 0.0 {
-                    self.map.add_imu_edge(prev_kf_idx, frame.idx, preint);
-                }
+        if let (Some(prev_kf_idx), Some(prev_ts)) = (
+            self.state.last_keyframe_idx,
+            self.last_keyframe_timestamp_sec,
+        ) {
+            let preint = self.preintegrate_window(prev_ts, timestamp_sec);
+            if preint.dt > 0.0 {
+                self.map.add_imu_edge(prev_kf_idx, frame.idx, preint);
             }
         }
 
@@ -1388,8 +1593,8 @@ fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>
     for col in 0..n {
         let mut pivot = col;
         let mut pivot_abs = a[col][col].abs();
-        for row in (col + 1)..n {
-            let value = a[row][col].abs();
+        for (row, a_row) in a.iter().enumerate().skip(col + 1) {
+            let value = a_row[col].abs();
             if value > pivot_abs {
                 pivot = row;
                 pivot_abs = value;
@@ -1404,11 +1609,12 @@ fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>
         }
 
         let diag = a[col][col];
-        for j in col..n {
-            a[col][j] /= diag;
+        for entry in a[col].iter_mut().skip(col) {
+            *entry /= diag;
         }
         b[col] /= diag;
 
+        let pivot_row = a[col].clone();
         for row in 0..n {
             if row == col {
                 continue;
@@ -1417,8 +1623,8 @@ fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>
             if factor == 0.0 {
                 continue;
             }
-            for j in col..n {
-                a[row][j] -= factor * a[col][j];
+            for (entry, &pivot_entry) in a[row].iter_mut().zip(pivot_row.iter()).skip(col) {
+                *entry -= factor * pivot_entry;
             }
             b[row] -= factor * b[col];
         }
