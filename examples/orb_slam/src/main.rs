@@ -112,6 +112,11 @@ struct EurocCmd {
     #[argh(switch)]
     stereo: bool,
 
+    /// enable IMU preintegration (mono-inertial: metric scale and gravity from
+    /// mav0/imu0; errors if the dataset has no IMU or --stereo is set)
+    #[argh(switch)]
+    imu: bool,
+
     /// after the run, align the trajectory to ground truth and report
     /// ATE/RPE/drift (writes kornia_slam_raw.csv and kornia_slam_aligned.csv)
     #[argh(switch)]
@@ -338,12 +343,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Source ─────────────────────────────────────────────────────────────
     let mut evaluate = false;
     let mut eval_out = String::from(".");
+    let mut imu_enabled = false;
     let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) = match args
         .source
     {
         SourceCmd::Euroc(e) => {
             evaluate = e.evaluate;
             eval_out = e.eval_out.clone();
+            imu_enabled = e.imu;
             let src = if e.stereo {
                 EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
             } else {
@@ -477,8 +484,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..PipelineConfig::default()
     };
     let mut system = Pipeline::new(camera.clone(), pipeline_config);
-    if let Some(t_bc) = source.imu_extrinsics() {
-        system.set_imu_extrinsics(t_bc);
+    if imu_enabled {
+        match source.imu_extrinsics() {
+            Some(t_bc) => system.set_imu_extrinsics(t_bc),
+            None => {
+                return Err(
+                    "--imu requested but the source has no usable camera-IMU extrinsic \
+                     (dataset without imu0, or --stereo: stereo-inertial is not supported yet)"
+                        .into(),
+                );
+            }
+        }
     }
 
     // ── Rerun ──────────────────────────────────────────────────────────────
@@ -516,14 +532,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             imu_samples,
         } = item;
         let image_size = gray_u8.size();
-        let imu_measurements: Vec<ImuMeasurement> = imu_samples
-            .into_iter()
-            .map(|s| ImuMeasurement {
-                timestamp: s.timestamp_sec,
-                gyro: Vec3F64::new(s.gyro[0], s.gyro[1], s.gyro[2]),
-                accel: Vec3F64::new(s.accel[0], s.accel[1], s.accel[2]),
-            })
-            .collect();
+        let imu_measurements: Vec<ImuMeasurement> = if imu_enabled {
+            imu_samples
+                .into_iter()
+                .map(|s| ImuMeasurement {
+                    timestamp: s.timestamp_sec,
+                    gyro: Vec3F64::new(s.gyro[0], s.gyro[1], s.gyro[2]),
+                    accel: Vec3F64::new(s.accel[0], s.accel[1], s.accel[2]),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Extract ORB features (on the raw image — for a fisheye source this is
         // the distorted frame; keypoints are undistorted below).
