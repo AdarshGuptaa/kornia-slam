@@ -4,6 +4,7 @@ use std::path::Path;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
+use kornia_algebra::Mat3F64;
 use kornia_io::png::read_image_png_mono8;
 
 use super::{FrameItem, FrameSource, SourceError};
@@ -129,14 +130,20 @@ impl FrameSource for EurocSource {
     }
 
     fn imu_extrinsics(&self) -> Option<Pose3d> {
-        // The raw cam0 T_BS only applies to the unrectified left frame; the
-        // rectified virtual camera differs by the (unexposed) rectifying
-        // rotation, so stereo runs without IMU pose prediction for now.
-        if !self.with_imu || self.rectifier.is_some() {
+        if !self.with_imu {
             return None;
         }
         let (rotation, translation) = self.dataset.left_calibration.body_from_camera();
-        Some(Pose3d::from_rt(rotation, translation))
+        match &self.rectifier {
+            // The rectified virtual camera is the raw cam0 rotated by the
+            // rectifying rotation (p_rect = R_rect · p_cam0), so
+            // T_B,rect = T_BS · R_rectᵀ; the translation is unchanged.
+            Some(rect) => {
+                let r_rect_t = Mat3F64(*rect.left_rectifying_rotation().transpose());
+                Some(Pose3d::from_rt(rotation * r_rect_t, translation))
+            }
+            None => Some(Pose3d::from_rt(rotation, translation)),
+        }
     }
 
     fn n_frames_hint(&self) -> Option<usize> {

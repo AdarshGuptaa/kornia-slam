@@ -183,13 +183,13 @@ impl Pipeline {
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
         if curr_frame.is_stereo() {
-            return self.bootstrap_stereo(curr_frame);
+            return self.bootstrap_stereo(curr_frame, timestamp_sec);
         }
         self.bootstrap_mono(curr_frame, timestamp_sec)
     }
 
     /// Single-frame metric initialization from stereo depth.
-    fn bootstrap_stereo(&mut self, mut curr_frame: Frame) -> TrackingResult {
+    fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Build the new map in the current odometry frame (identity at start,
         // or the recovery pose after a tracking loss).
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -238,7 +238,17 @@ impl Pipeline {
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
         self.state.velocity = None;
-        self.state.mode = SystemMode::Tracking;
+        // The map is already metric (stereo baseline), but gravity, velocities,
+        // and the gyro bias still need the inertial init before IMU prediction
+        // can run; the solve there keeps scale fixed at 1.
+        self.state.mode = if self.imu_t_bc.is_some() {
+            self.inertial_init_start_kf_idx = Some(curr_idx);
+            SystemMode::InertialInit
+        } else {
+            SystemMode::Tracking
+        };
+        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.prune_imu_before(timestamp_sec);
 
         TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
@@ -605,11 +615,19 @@ impl Pipeline {
             bias.gyro = gyro_bias;
         }
 
+        // Stereo keyframes are already metric (baseline-derived depth), so
+        // scale stays pinned at 1 and only gravity/velocities are estimated.
+        let solve_scale = !keyframes
+            .first()
+            .map(|kf| kf.frame.is_stereo())
+            .unwrap_or(false);
+
         // Free 3-DoF gravity first, then refine with ‖g‖ fixed at 9.81 and the
         // direction perturbed in its 2-DoF tangent; re-solving keeps scale and
         // velocities consistent with the constrained gravity (a post-hoc
         // normalization alone would bias the scale).
-        let first = self.solve_scale_gravity(&keyframes, &frame_to_local, &bias, None)?;
+        let first =
+            self.solve_scale_gravity(&keyframes, &frame_to_local, &bias, None, solve_scale)?;
         let mut gravity_dir = first.gravity_world;
         if !gravity_dir.length().is_finite() || gravity_dir.length() < 1e-6 {
             return None;
@@ -618,8 +636,13 @@ impl Pipeline {
 
         let mut refined = None;
         for _ in 0..2 {
-            let solved =
-                self.solve_scale_gravity(&keyframes, &frame_to_local, &bias, Some(gravity_dir))?;
+            let solved = self.solve_scale_gravity(
+                &keyframes,
+                &frame_to_local,
+                &bias,
+                Some(gravity_dir),
+                solve_scale,
+            )?;
             gravity_dir = solved.gravity_world / solved.gravity_world.length();
             refined = Some(solved);
         }
@@ -707,8 +730,10 @@ impl Pipeline {
     ///
     /// With `gravity_dir: None` gravity is a free 3-DoF unknown; with
     /// `Some(dir)` it is `9.81·dir` plus a 2-DoF perturbation in the tangent
-    /// plane of `dir`. Per edge (i, j), with body poses `T_WB = T_WC ∘ T_CB`
-    /// and visual camera centers `p̂` (arbitrary scale `s`):
+    /// plane of `dir`. With `solve_scale: false` (stereo: the map is already
+    /// metric) the scale is pinned at 1 and dropped from the unknowns. Per
+    /// edge (i, j), with body poses `T_WB = T_WC ∘ T_CB` and visual camera
+    /// centers `p̂` (scale `s`):
     ///
     ///   `v_i·dt + ½g·dt² − s·(p̂_j − p̂_i) = (R_WC_j − R_WC_i)·t_CB − R_WB_i·Δp`
     ///   `v_j − v_i − g·dt = R_WB_i·Δv`
@@ -718,6 +743,7 @@ impl Pipeline {
         frame_to_local: &std::collections::HashMap<usize, usize>,
         bias: &ImuBias,
         gravity_dir: Option<Vec3F64>,
+        solve_scale: bool,
     ) -> Option<InertialSolveResult> {
         let t_cb = self.imu_t_bc?.inverse();
         let r_cb = t_cb.rotation;
@@ -737,7 +763,7 @@ impl Pipeline {
         });
         let n_gravity_cols = if gravity_basis.is_some() { 2 } else { 3 };
 
-        let unknowns = 3 * n + n_gravity_cols + 1;
+        let unknowns = 3 * n + n_gravity_cols + usize::from(solve_scale);
         let mut rows: Vec<Vec<f64>> = Vec::new();
         let mut rhs: Vec<f64> = Vec::new();
 
@@ -772,8 +798,13 @@ impl Pipeline {
             for axis in 0..3 {
                 let mut row = vec![0.0; unknowns];
                 row[vel_col(i, axis)] = dt;
-                row[scale_col] = -vec_axis(visual_dp, axis);
                 let mut b = vec_axis(lever_dp - delta_p_world, axis);
+                if solve_scale {
+                    row[scale_col] = -vec_axis(visual_dp, axis);
+                } else {
+                    // Scale pinned at 1: the visual term is a known constant.
+                    b += vec_axis(visual_dp, axis);
+                }
                 match gravity_basis {
                     None => row[gravity_col(axis)] = 0.5 * dt * dt,
                     Some((b1, b2)) => {
@@ -839,7 +870,11 @@ impl Pipeline {
             .collect();
 
         Some(InertialSolveResult {
-            scale: solution[scale_col],
+            scale: if solve_scale {
+                solution[scale_col]
+            } else {
+                1.0
+            },
             gravity_world,
             velocities_world,
         })

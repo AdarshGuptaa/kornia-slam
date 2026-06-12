@@ -112,8 +112,8 @@ struct EurocCmd {
     #[argh(switch)]
     stereo: bool,
 
-    /// enable IMU preintegration (mono-inertial: metric scale and gravity from
-    /// mav0/imu0; errors if the dataset has no IMU or --stereo is set)
+    /// enable IMU preintegration from mav0/imu0 (mono: metric scale + gravity;
+    /// stereo: gravity + velocities, scale fixed). Errors if the dataset has no IMU
     #[argh(switch)]
     imu: bool,
 
@@ -489,8 +489,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(t_bc) => system.set_imu_extrinsics(t_bc),
             None => {
                 return Err(
-                    "--imu requested but the source has no usable camera-IMU extrinsic \
-                     (dataset without imu0, or --stereo: stereo-inertial is not supported yet)"
+                    "--imu requested but the source has no camera-IMU extrinsic or IMU samples"
                         .into(),
                 );
             }
