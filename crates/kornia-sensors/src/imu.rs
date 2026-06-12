@@ -48,6 +48,10 @@ pub struct ImuCalib {
 /// Also propagates covariance matrices tracking how uncertainty grows:
 /// - 9×9 navigation covariance in tangent space [δrot(3), δvel(3), δpos(3)]
 /// - 6×6 bias covariance [δbias_gyro(3), δbias_accel(3)] (decoupled, grows linearly)
+///
+/// Bias Jacobians (∂Δ/∂bias) are tracked alongside, so a small change in the
+/// bias estimate can be applied to the deltas to first order without
+/// re-integrating raw measurements (Forster et al. TRO 2017, eq. 70-71).
 #[derive(Debug, Clone)]
 pub struct PreintegratedImu {
     /// Accumulated rotation ∈ SO(3).
@@ -67,6 +71,16 @@ pub struct PreintegratedImu {
     /// 6×6 bias covariance [bias_gyro, bias_accel], stored column-major.
     /// Grows by σ²·dt each step (random walk).
     pub bias_covariance: [f64; 36],
+    /// ∂ΔR/∂bias_gyro (so(3) tangent perturbation per unit gyro-bias change).
+    pub d_rotation_d_bias_gyro: Mat3F64,
+    /// ∂Δv/∂bias_gyro.
+    pub d_velocity_d_bias_gyro: Mat3F64,
+    /// ∂Δv/∂bias_accel.
+    pub d_velocity_d_bias_accel: Mat3F64,
+    /// ∂Δp/∂bias_gyro.
+    pub d_position_d_bias_gyro: Mat3F64,
+    /// ∂Δp/∂bias_accel.
+    pub d_position_d_bias_accel: Mat3F64,
 }
 
 impl PreintegratedImu {
@@ -80,7 +94,38 @@ impl PreintegratedImu {
             calib,
             covariance: [0.0; 81],
             bias_covariance: [0.0; 36],
+            d_rotation_d_bias_gyro: Mat3F64::ZERO,
+            d_velocity_d_bias_gyro: Mat3F64::ZERO,
+            d_velocity_d_bias_accel: Mat3F64::ZERO,
+            d_position_d_bias_gyro: Mat3F64::ZERO,
+            d_position_d_bias_accel: Mat3F64::ZERO,
         }
+    }
+
+    /// ΔR re-expressed at a new bias estimate via the first-order correction
+    /// `ΔR · Exp(∂ΔR/∂bg · δbg)`.
+    pub fn delta_rotation_with_bias(&self, bias: &ImuBias) -> Mat3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let correction = SO3F64::exp(mat3_mul_vec3(&self.d_rotation_d_bias_gyro, &dbg)).matrix();
+        Mat3F64(self.delta_rotation.mul_mat3(&correction))
+    }
+
+    /// Δv re-expressed at a new bias estimate (first order).
+    pub fn delta_velocity_with_bias(&self, bias: &ImuBias) -> Vec3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let dba = bias.accel - self.bias.accel;
+        self.delta_velocity
+            + mat3_mul_vec3(&self.d_velocity_d_bias_gyro, &dbg)
+            + mat3_mul_vec3(&self.d_velocity_d_bias_accel, &dba)
+    }
+
+    /// Δp re-expressed at a new bias estimate (first order).
+    pub fn delta_position_with_bias(&self, bias: &ImuBias) -> Vec3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let dba = bias.accel - self.bias.accel;
+        self.delta_position
+            + mat3_mul_vec3(&self.d_position_d_bias_gyro, &dbg)
+            + mat3_mul_vec3(&self.d_position_d_bias_accel, &dba)
     }
 
     /// Integrate a single IMU measurement over time step dt.
@@ -182,6 +227,20 @@ impl PreintegratedImu {
         for i in 3..6 {
             self.bias_covariance[i + i * 6] += ba_var;
         }
+
+        // --- Bias Jacobian propagation (Forster et al. TRO 2017, eq. 70-71) ---
+        // Measurements enter bias-corrected (ω - bg, a - ba), so each step's
+        // sensitivity to the bias accumulates. Position/velocity rows must use
+        // the pre-update ∂ΔR/∂bg, so the rotation row comes last.
+        self.d_position_d_bias_gyro = self.d_position_d_bias_gyro
+            + self.d_velocity_d_bias_gyro * dt
+            + neg_dr_ah_half_dt2 * self.d_rotation_d_bias_gyro;
+        self.d_position_d_bias_accel = self.d_position_d_bias_accel
+            + self.d_velocity_d_bias_accel * dt
+            - self.delta_rotation * (0.5 * dt * dt);
+        self.d_velocity_d_bias_gyro += neg_dr_ah_dt * self.d_rotation_d_bias_gyro;
+        self.d_velocity_d_bias_accel -= self.delta_rotation * dt;
+        self.d_rotation_d_bias_gyro = d_rot_t * self.d_rotation_d_bias_gyro - jr * dt;
 
         // --- State update ---
 
