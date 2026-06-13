@@ -9,7 +9,7 @@ use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
-use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64};
+use kornia_algebra::{Mat3F64, SO3F64, Vec2F64, Vec3F64, QuatF64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
@@ -23,6 +23,30 @@ use kornia_slam::system::{
 
 const GRAVITY_MAGNITUDE: f64 = 9.81;
 
+fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
+    let cross = from.cross(to);
+    let dot = from.dot(to).clamp(-1.0, 1.0);
+
+    if dot < -1.0 + 1e-9 {
+        let perp = if from.x.abs() < 0.9 {
+            Vec3F64::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3F64::new(0.0, 1.0, 0.0)
+        };
+        let axis = from.cross(perp).normalize();
+        // 180°: w=0, xyz=axis
+        return SO3F64::from_quaternion(QuatF64::from_array([axis.x, axis.y, axis.z, 0.0]));
+    }
+
+    let w = ((1.0 + dot) / 2.0).sqrt();
+    let s = 1.0 / (2.0 * w);
+    SO3F64::from_quaternion(QuatF64::from_array([
+        cross.x * s,
+        cross.y * s,
+        cross.z * s,
+        w,
+    ]))
+}
 struct InertialInitConfig {
     min_keyframes: usize,
     min_time_sec: f64,
@@ -880,12 +904,64 @@ impl Pipeline {
         })
     }
 
+    // fn apply_imu_initialization(&mut self, init: ImuInitResult) {
+    //     let Some(start_idx) = self.inertial_init_start_kf_idx else {
+    //         return;
+    //     };
+
+    //     self.map.scale_world(init.scale);
+    //     let mut velocity_iter = init.velocities_world.into_iter();
+    //     for kf in self
+    //         .map
+    //         .keyframes_mut()
+    //         .iter_mut()
+    //         .filter(|kf| kf.frame.idx >= start_idx)
+    //     {
+    //         if let Some(velocity) = velocity_iter.next() {
+    //             kf.velocity_world = velocity;
+    //             kf.imu_bias = init.bias;
+    //         }
+    //     }
+
+    //     if let Some(last_kf) = self
+    //         .map
+    //         .keyframes()
+    //         .iter()
+    //         .rfind(|kf| kf.frame.idx >= start_idx)
+    //     {
+    //         self.state.velocity_world = last_kf.velocity_world;
+    //         // Init runs right after this keyframe was accepted, so the tracker
+    //         // pose must follow it onto the rescaled map.
+    //         self.state.pose_world_to_cam = last_kf.frame.pose_world_to_cam;
+    //     }
+    //     // The visual constant-velocity model predates the rescale; drop it so
+    //     // a fallback never composes a stale-scale step.
+    //     self.state.velocity = None;
+    //     self.state.imu_initialized = true;
+    //     self.gravity_world = init.gravity_world;
+    //     self.imu_bias = init.bias;
+    // }
     fn apply_imu_initialization(&mut self, init: ImuInitResult) {
         let Some(start_idx) = self.inertial_init_start_kf_idx else {
             return;
         };
 
         self.map.scale_world(init.scale);
+
+        // --- ADD THIS BLOCK ---
+        // Compute Rwg: rotation that aligns estimated gravity with world -Z.
+        // After this rotation the world Y-axis is "up" (or -Z depending on
+        // your convention; match whatever ORB-SLAM3's mRwg does for you).
+        let g_est = init.gravity_world;
+        let g_norm = g_est / g_est.length();
+        let g_target = Vec3F64::new(0.0, 1.0, 0.0); // world -Z = down
+
+        let rwg = rotation_from_to(g_norm, g_target); // see impl below
+        self.map.rotate_world(&rwg);
+        // gravity is now exactly (0, 0, -9.81) in the new world frame
+        let gravity_aligned = Vec3F64::new(0.0, GRAVITY_MAGNITUDE, 0.0);
+        // ----------------------
+
         let mut velocity_iter = init.velocities_world.into_iter();
         for kf in self
             .map
@@ -894,7 +970,8 @@ impl Pipeline {
             .filter(|kf| kf.frame.idx >= start_idx)
         {
             if let Some(velocity) = velocity_iter.next() {
-                kf.velocity_world = velocity;
+                // velocities were solved in the old world frame, rotate them too
+                kf.velocity_world = rwg * velocity;
                 kf.imu_bias = init.bias;
             }
         }
@@ -906,15 +983,11 @@ impl Pipeline {
             .rfind(|kf| kf.frame.idx >= start_idx)
         {
             self.state.velocity_world = last_kf.velocity_world;
-            // Init runs right after this keyframe was accepted, so the tracker
-            // pose must follow it onto the rescaled map.
             self.state.pose_world_to_cam = last_kf.frame.pose_world_to_cam;
         }
-        // The visual constant-velocity model predates the rescale; drop it so
-        // a fallback never composes a stale-scale step.
         self.state.velocity = None;
         self.state.imu_initialized = true;
-        self.gravity_world = init.gravity_world;
+        self.gravity_world = gravity_aligned;  // now canonical, not estimated
         self.imu_bias = init.bias;
     }
 

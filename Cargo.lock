@@ -3226,6 +3226,9 @@ name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+dependencies = [
+ "powerfmt",
+]
 
 [[package]]
 name = "derive_arbitrary"
@@ -5779,6 +5782,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 [[package]]
 name = "kornia-3d"
 version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
 dependencies = [
  "bincode 2.0.1",
  "faer",
@@ -5797,6 +5801,7 @@ dependencies = [
 [[package]]
 name = "kornia-algebra"
 version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
 dependencies = [
  "glam 0.33.1",
  "nalgebra 0.35.0",
@@ -5807,6 +5812,7 @@ dependencies = [
 [[package]]
 name = "kornia-image"
 version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -5817,6 +5823,7 @@ dependencies = [
 [[package]]
 name = "kornia-imgproc"
 version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -5830,6 +5837,7 @@ dependencies = [
 [[package]]
 name = "kornia-io"
 version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -5865,6 +5873,7 @@ dependencies = [
 [[package]]
 name = "kornia-tensor"
 version = "0.1.14"
+source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
 dependencies = [
  "num-traits",
  "rayon",
@@ -7502,9 +7511,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openssl"
-version = "0.10.80"
+version = "0.10.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a45fa2aa886c42762255da344f0a0d313e254066c46aad76f300c3d3da62d967"
+checksum = "77823a27f0babb03091cb9ed9ef80af3b39dbc82f97e8fa530374b7dafd87a45"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if 1.0.4",
@@ -7533,9 +7542,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.116"
+version = "0.9.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f28a22dc7140cda5f096e5e7724a6962ca81a7f8bfd2979f9b18c11af56318c4"
+checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
 dependencies = [
  "cc",
  "libc",
@@ -12177,11 +12186,12 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.48"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1aa89044e7786ffb2ec017acb22cb7de5b0be46d0f21aea2b224b8561e5db2"
+checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
+ "itoa",
  "num-conv",
  "powerfmt",
  "serde_core",
@@ -12191,15 +12201,15 @@ dependencies = [
 
 [[package]]
 name = "time-core"
-version = "0.1.9"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
+checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
 name = "time-macros"
-version = "0.2.28"
+version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d3bfe86347f0cc659f586f01e26303ccd32418f26f30c7b0309b3ca3a07d695"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
@@ -12973,9 +12983,9 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasip2"
-version = "1.0.3+wasi-0.2.9"
+version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20064672db26d7cdc89c7798c48a0fdfac8213434a1186e5ef29fd560ae223d6"
+checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
@@ -14455,18 +14465,18 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.8.2"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 dependencies = [
  "zeroize_derive",
 ]
 
 [[package]]
 name = "zeroize_derive"
-version = "1.4.3"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
 dependencies = [
  "proc-macro2",
  "quote",
