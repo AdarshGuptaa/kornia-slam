@@ -37,7 +37,7 @@ use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
-use kornia_algebra::{Mat3F64, SO3F64};
+use kornia_algebra::SO3F64;
 
 /// Preintegrated IMU measurements connecting two consecutive keyframes.
 #[derive(Debug, Clone)]
@@ -341,7 +341,7 @@ impl Map {
             let new_translation = *r * cam_to_world.translation;
             let rot_so3 = SO3F64::from_matrix(&cam_to_world.rotation);
             let new_rot_so3 = *r * rot_so3;
-            let new_rotation = Mat3F64::from(new_rot_so3.matrix());
+            let new_rotation = new_rot_so3.matrix();
             kf.frame.pose_world_to_cam =
                 Pose3d::from_rt(new_rotation, new_translation).inverse();
         }

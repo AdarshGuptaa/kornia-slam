@@ -48,8 +48,8 @@ use source::OakdSource;
 #[cfg(feature = "uvc")]
 use source::UvcSource;
 use source::{EurocSource, FrameItem, FrameSource, HiltiSource, McapSource};
-use utils::trajectory_point_from_pose;
 use std::time::{Duration, Instant};
+use utils::trajectory_point_from_pose;
 
 #[cfg(feature = "viz")]
 use utils::{
@@ -527,7 +527,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut processed: usize = 0;
 
     while let Some(item) = source.next_frame()? {
-
         let now = Instant::now();
         let elapsed = now.duration_since(last_frame_walltime);
 

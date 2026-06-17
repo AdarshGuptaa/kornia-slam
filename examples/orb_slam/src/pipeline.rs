@@ -13,8 +13,8 @@ use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
-use kornia_slam::estimation::{InertialInitConfig, InertialInitializer, MapProjectionEstimator};
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
+use kornia_slam::estimation::{InertialInitConfig, InertialInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
@@ -566,10 +566,12 @@ impl Pipeline {
             let Some(start_idx) = self.inertial_init_start_kf_idx else {
                 return result;
             };
-            match self
-                .inertial_init
-                .try_initialize(&self.map, self.imu_t_bc, self.imu_bias, start_idx)
-            {
+            match self.inertial_init.try_initialize(
+                &self.map,
+                self.imu_t_bc,
+                self.imu_bias,
+                start_idx,
+            ) {
                 Some(init) => {
                     let scale = init.scale;
                     let gravity = init.gravity_world;
