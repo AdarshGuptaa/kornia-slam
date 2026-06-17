@@ -49,6 +49,8 @@ use source::OakdSource;
 use source::UvcSource;
 use source::{EurocSource, FrameItem, FrameSource, HiltiSource, McapSource};
 use utils::trajectory_point_from_pose;
+use std::time::{Duration, Instant};
+
 #[cfg(feature = "viz")]
 use utils::{
     log_camera_to_rerun, log_frame_to_rerun, log_map_points_to_rerun, log_trajectory_to_rerun,
@@ -344,6 +346,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut evaluate = false;
     let mut eval_out = String::from(".");
     let mut imu_enabled = false;
+    let target_dt = Duration::from_secs_f64(1.0 / 30.0);
+    let mut last_frame_walltime = Instant::now();
     let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) = match args
         .source
     {
@@ -523,6 +527,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut processed: usize = 0;
 
     while let Some(item) = source.next_frame()? {
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_frame_walltime);
+
+        if elapsed < target_dt {
+            std::thread::sleep(target_dt - elapsed);
+        }
+
+        last_frame_walltime = Instant::now();
+
         let FrameItem {
             idx,
             timestamp_sec,

@@ -41,7 +41,7 @@ use kornia_algebra::{Mat3F64, SO3F64};
 
 /// Preintegrated IMU measurements connecting two consecutive keyframes.
 #[derive(Debug, Clone)]
-pub struct ImuEdge {
+pub struct ImuFactor {
     /// Index of the earlier keyframe (`Keyframe::frame.idx`).
     pub prev_kf_idx: usize,
     /// Index of the later keyframe.
@@ -284,7 +284,7 @@ pub struct InitialMapHealth {
 pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
-    imu_edges: Vec<ImuEdge>,
+    imu_edges: Vec<ImuFactor>,
 }
 
 impl Map {
@@ -310,7 +310,7 @@ impl Map {
         curr_kf_idx: usize,
         preintegrated: PreintegratedImu,
     ) {
-        self.imu_edges.push(ImuEdge {
+        self.imu_edges.push(ImuFactor {
             prev_kf_idx,
             curr_kf_idx,
             preintegrated,
@@ -318,7 +318,7 @@ impl Map {
     }
 
     /// Returns all keyframe-to-keyframe IMU edges in insertion order.
-    pub fn imu_edges(&self) -> &[ImuEdge] {
+    pub fn imu_edges(&self) -> &[ImuFactor] {
         &self.imu_edges
     }
 
