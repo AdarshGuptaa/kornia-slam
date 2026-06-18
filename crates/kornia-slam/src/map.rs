@@ -33,11 +33,11 @@ use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
+use kornia_algebra::SO3F64;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
-use kornia_algebra::SO3F64;
 
 /// Preintegrated IMU measurements connecting two consecutive keyframes.
 #[derive(Debug, Clone)]
@@ -342,8 +342,7 @@ impl Map {
             let rot_so3 = SO3F64::from_matrix(&cam_to_world.rotation);
             let new_rot_so3 = *r * rot_so3;
             let new_rotation = new_rot_so3.matrix();
-            kf.frame.pose_world_to_cam =
-                Pose3d::from_rt(new_rotation, new_translation).inverse();
+            kf.frame.pose_world_to_cam = Pose3d::from_rt(new_rotation, new_translation).inverse();
         }
 
         for mp in self.map_points_mut() {

@@ -204,7 +204,8 @@ impl InertialInitializer {
         }
 
         let mut bias = imu_bias;
-        if let Some(gyro_bias) = self.estimate_gyro_bias(map, &keyframes, &frame_to_local, imu_t_bc) {
+        if let Some(gyro_bias) = self.estimate_gyro_bias(map, &keyframes, &frame_to_local, imu_t_bc)
+        {
             bias.gyro = gyro_bias;
         }
 
@@ -286,11 +287,7 @@ impl InertialInitializer {
             }
         }
 
-        if let Some(last_kf) = map
-            .keyframes()
-            .iter()
-            .rfind(|kf| kf.frame.idx >= start_idx)
-        {
+        if let Some(last_kf) = map.keyframes().iter().rfind(|kf| kf.frame.idx >= start_idx) {
             state.velocity_world = last_kf.velocity_world;
             state.pose_world_to_cam = last_kf.frame.pose_world_to_cam;
         }
@@ -367,6 +364,7 @@ impl InertialInitializer {
         Some(bias.gyro)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn solve_scale_gravity(
         &self,
         map: &Map,
@@ -496,7 +494,11 @@ impl InertialInitializer {
             .collect();
 
         Some(InertialSolveResult {
-            scale: if solve_scale { solution[scale_col] } else { 1.0 },
+            scale: if solve_scale {
+                solution[scale_col]
+            } else {
+                1.0
+            },
             gravity_world,
             velocities_world,
         })
