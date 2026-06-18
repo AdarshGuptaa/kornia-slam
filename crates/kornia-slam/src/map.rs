@@ -284,7 +284,7 @@ pub struct InitialMapHealth {
 pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
-    imu_edges: Vec<ImuFactor>,
+    imu_factors: Vec<ImuFactor>,
 }
 
 impl Map {
@@ -304,22 +304,22 @@ impl Map {
     }
 
     /// Records preintegrated IMU measurements between two consecutive keyframes.
-    pub fn add_imu_edge(
+    pub fn add_imu_factor(
         &mut self,
         prev_kf_idx: usize,
         curr_kf_idx: usize,
         preintegrated: PreintegratedImu,
     ) {
-        self.imu_edges.push(ImuFactor {
+        self.imu_factors.push(ImuFactor {
             prev_kf_idx,
             curr_kf_idx,
             preintegrated,
         });
     }
 
-    /// Returns all keyframe-to-keyframe IMU edges in insertion order.
-    pub fn imu_edges(&self) -> &[ImuFactor] {
-        &self.imu_edges
+    /// Returns all keyframe-to-keyframe IMU factors in insertion order.
+    pub fn imu_factors(&self) -> &[ImuFactor] {
+        &self.imu_factors
     }
 
     /// Applies a metric scale to camera centers and map points.
@@ -371,7 +371,7 @@ impl Map {
     pub fn clear_active(&mut self) {
         self.keyframes.clear();
         self.map_points.clear();
-        self.imu_edges.clear();
+        self.imu_factors.clear();
     }
 
     /// Health metrics for the just-bootstrapped pair of keyframes.

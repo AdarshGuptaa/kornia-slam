@@ -11,17 +11,15 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
-use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
-use kornia_slam::estimation::{InertialInitConfig, InertialInitializer, MapProjectionEstimator};
+use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
 };
-
-const GRAVITY_MAGNITUDE: f64 = 9.81;
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
@@ -55,8 +53,8 @@ pub struct Pipeline {
     gravity_world: Vec3F64,
     bootstrap_timestamp_sec: Option<f64>,
     last_keyframe_timestamp_sec: Option<f64>,
-    inertial_init_start_kf_idx: Option<usize>,
-    inertial_init: InertialInitializer,
+    imu_init_start_kf_idx: Option<usize>,
+    imu_init: ImuInitializer,
 
     // System state
     state: SystemState,
@@ -88,8 +86,8 @@ impl Pipeline {
             gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
             bootstrap_timestamp_sec: None,
             last_keyframe_timestamp_sec: None,
-            inertial_init_start_kf_idx: None,
-            inertial_init: InertialInitializer::new(InertialInitConfig {
+            imu_init_start_kf_idx: None,
+            imu_init: ImuInitializer::new(ImuInitConfig {
                 min_keyframes: 30,
                 min_time_sec: 1.0,
                 min_motion: 0.05,
@@ -117,7 +115,7 @@ impl Pipeline {
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
-            SystemMode::InertialInit => self.inertial_init_step(frame, timestamp_sec),
+            SystemMode::ImuInit => self.imu_init_step(frame, timestamp_sec),
             SystemMode::Tracking => self.tracking_step(frame, timestamp_sec),
         }
     }
@@ -222,8 +220,8 @@ impl Pipeline {
         // and the gyro bias still need the inertial init before IMU prediction
         // can run; the solve there keeps scale fixed at 1.
         self.state.mode = if self.imu_t_bc.is_some() {
-            self.inertial_init_start_kf_idx = Some(curr_idx);
-            SystemMode::InertialInit
+            self.imu_init_start_kf_idx = Some(curr_idx);
+            SystemMode::ImuInit
         } else {
             SystemMode::Tracking
         };
@@ -387,7 +385,7 @@ impl Pipeline {
         if let Some(prev_ts) = self.bootstrap_timestamp_sec {
             let preint = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_edge(prev_idx, curr_idx, preint);
+                self.map.add_imu_factor(prev_idx, curr_idx, preint);
             }
             self.prune_imu_before(timestamp_sec);
         }
@@ -399,11 +397,11 @@ impl Pipeline {
 
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
-        // Inertial init needs the camera-to-body extrinsic to relate IMU deltas
+        // IMU init needs the camera-to-body extrinsic to relate IMU deltas
         // to camera poses; without it, run visual-only as before.
         self.state.mode = if self.imu_t_bc.is_some() {
-            self.inertial_init_start_kf_idx = Some(curr_idx);
-            SystemMode::InertialInit
+            self.imu_init_start_kf_idx = Some(curr_idx);
+            SystemMode::ImuInit
         } else {
             SystemMode::Tracking
         };
@@ -555,28 +553,24 @@ impl Pipeline {
         (pred_cam_to_world.inverse(), v_j)
     }
 
-    fn inertial_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
+    fn imu_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
         let result = self.tracking_step(frame, timestamp_sec);
 
         if result.status == TrackingStatus::KeyframeAccepted
-            && self
-                .inertial_init
-                .ready(&self.map, self.inertial_init_start_kf_idx)
+            && self.imu_init.ready(&self.map, self.imu_init_start_kf_idx)
         {
-            let Some(start_idx) = self.inertial_init_start_kf_idx else {
+            let Some(start_idx) = self.imu_init_start_kf_idx else {
                 return result;
             };
-            match self.inertial_init.try_initialize(
-                &self.map,
-                self.imu_t_bc,
-                self.imu_bias,
-                start_idx,
-            ) {
+            match self
+                .imu_init
+                .try_initialize(&self.map, self.imu_t_bc, self.imu_bias, start_idx)
+            {
                 Some(init) => {
                     let scale = init.scale;
                     let gravity = init.gravity_world;
                     let bg = init.bias.gyro;
-                    self.inertial_init.apply_initialization(
+                    self.imu_init.apply_initialization(
                         &mut self.map,
                         &mut self.state,
                         &mut self.imu_bias,
@@ -584,7 +578,7 @@ impl Pipeline {
                         init,
                         start_idx,
                     );
-                    self.inertial_init.activate_tracking(&mut self.state);
+                    self.state.mode = SystemMode::Tracking;
                     self.dbg(format!(
                         "[imu_init] accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
                          gyro_bias=({:.4},{:.4},{:.4})",
@@ -827,7 +821,7 @@ impl Pipeline {
         ) {
             let preint = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_edge(prev_kf_idx, frame.idx, preint);
+                self.map.add_imu_factor(prev_kf_idx, frame.idx, preint);
             }
         }
 

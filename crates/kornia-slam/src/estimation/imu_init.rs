@@ -2,12 +2,10 @@ use std::collections::HashMap;
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, QuatF64, SO3F64, Vec3F64};
-use kornia_sensors::imu::ImuBias;
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias};
 
 use crate::map::{Keyframe, Map};
-use crate::system::{SystemMode, SystemState};
-
-const GRAVITY_MAGNITUDE: f64 = 9.81;
+use crate::system::SystemState;
 
 fn vec_axis(v: Vec3F64, axis: usize) -> f64 {
     match axis {
@@ -113,7 +111,7 @@ fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
 
 /// Configuration for visual-inertial initialization.
 #[derive(Debug, Clone)]
-pub struct InertialInitConfig {
+pub struct ImuInitConfig {
     pub min_keyframes: usize,
     pub min_time_sec: f64,
     pub min_motion: f64,
@@ -128,19 +126,19 @@ pub struct ImuInitResult {
     pub bias: ImuBias,
 }
 
-struct InertialSolveResult {
+struct ImuSolveResult {
     scale: f64,
     gravity_world: Vec3F64,
     velocities_world: Vec<Vec3F64>,
 }
 
 /// Visual-inertial initialization helpers.
-pub struct InertialInitializer {
-    pub config: InertialInitConfig,
+pub struct ImuInitializer {
+    pub config: ImuInitConfig,
 }
 
-impl InertialInitializer {
-    pub fn new(config: InertialInitConfig) -> Self {
+impl ImuInitializer {
+    pub fn new(config: ImuInitConfig) -> Self {
         Self { config }
     }
 
@@ -159,10 +157,10 @@ impl InertialInitializer {
         }
 
         let imu_time: f64 = map
-            .imu_edges()
+            .imu_factors()
             .iter()
-            .filter(|edge| edge.curr_kf_idx >= start_idx)
-            .map(|edge| edge.preintegrated.dt)
+            .filter(|factor| factor.curr_kf_idx >= start_idx)
+            .map(|factor| factor.preintegrated.dt)
             .sum();
         if imu_time < self.config.min_time_sec {
             return false;
@@ -297,10 +295,6 @@ impl InertialInitializer {
         *imu_bias = init.bias;
     }
 
-    pub fn activate_tracking(&self, state: &mut SystemState) {
-        state.mode = SystemMode::Tracking;
-    }
-
     fn estimate_gyro_bias(
         &self,
         map: &Map,
@@ -314,25 +308,25 @@ impl InertialInitializer {
         for _ in 0..3 {
             let mut h = vec![vec![0.0f64; 3]; 3];
             let mut b = vec![0.0f64; 3];
-            let mut n_edges = 0usize;
+            let mut n_factors = 0usize;
 
-            for edge in map.imu_edges() {
-                let Some(&i) = frame_to_local.get(&edge.prev_kf_idx) else {
+            for factor in map.imu_factors() {
+                let Some(&i) = frame_to_local.get(&factor.prev_kf_idx) else {
                     continue;
                 };
-                let Some(&j) = frame_to_local.get(&edge.curr_kf_idx) else {
+                let Some(&j) = frame_to_local.get(&factor.curr_kf_idx) else {
                     continue;
                 };
-                if edge.preintegrated.dt <= 0.0 {
+                if factor.preintegrated.dt <= 0.0 {
                     continue;
                 }
 
                 let r_wb_i = keyframes[i].frame.pose_world_to_cam.inverse().rotation * r_cb;
                 let r_wb_j = keyframes[j].frame.pose_world_to_cam.inverse().rotation * r_cb;
                 let r_vis = Mat3F64(*r_wb_i.transpose()) * r_wb_j;
-                let d_rot = edge.preintegrated.delta_rotation_with_bias(&bias);
+                let d_rot = factor.preintegrated.delta_rotation_with_bias(&bias);
                 let resid = SO3F64::from_matrix(&(Mat3F64(*d_rot.transpose()) * r_vis)).log();
-                let jac = edge.preintegrated.d_rotation_d_bias_gyro.to_cols_array();
+                let jac = factor.preintegrated.d_rotation_d_bias_gyro.to_cols_array();
                 let resid = [resid.x, resid.y, resid.z];
 
                 for r in 0..3 {
@@ -345,10 +339,10 @@ impl InertialInitializer {
                         b[r] += jac[r * 3 + k] * resid[k];
                     }
                 }
-                n_edges += 1;
+                n_factors += 1;
             }
 
-            if n_edges < 2 {
+            if n_factors < 2 {
                 return None;
             }
             let delta = solve_linear_system(h, b)?;
@@ -374,7 +368,7 @@ impl InertialInitializer {
         bias: &ImuBias,
         gravity_dir: Option<Vec3F64>,
         solve_scale: bool,
-    ) -> Option<InertialSolveResult> {
+    ) -> Option<ImuSolveResult> {
         let t_cb = imu_t_bc.inverse();
         let r_cb = t_cb.rotation;
         let lever = t_cb.translation;
@@ -400,24 +394,24 @@ impl InertialInitializer {
         let gravity_col = |axis: usize| -> usize { 3 * n + axis };
         let scale_col = 3 * n + n_gravity_cols;
 
-        for edge in map.imu_edges() {
-            let Some(&i) = frame_to_local.get(&edge.prev_kf_idx) else {
+        for factor in map.imu_factors() {
+            let Some(&i) = frame_to_local.get(&factor.prev_kf_idx) else {
                 continue;
             };
-            let Some(&j) = frame_to_local.get(&edge.curr_kf_idx) else {
+            let Some(&j) = frame_to_local.get(&factor.curr_kf_idx) else {
                 continue;
             };
 
             let cam_i_world = keyframes[i].frame.pose_world_to_cam.inverse();
             let cam_j_world = keyframes[j].frame.pose_world_to_cam.inverse();
             let r_wb_i = cam_i_world.rotation * r_cb;
-            let dt = edge.preintegrated.dt;
+            let dt = factor.preintegrated.dt;
             if dt <= 0.0 {
                 continue;
             }
 
-            let delta_p_world = r_wb_i * edge.preintegrated.delta_position_with_bias(bias);
-            let delta_v_world = r_wb_i * edge.preintegrated.delta_velocity_with_bias(bias);
+            let delta_p_world = r_wb_i * factor.preintegrated.delta_position_with_bias(bias);
+            let delta_v_world = r_wb_i * factor.preintegrated.delta_velocity_with_bias(bias);
             let visual_dp = cam_j_world.translation - cam_i_world.translation;
             let lever_dp = cam_j_world.rotation * lever - cam_i_world.rotation * lever;
 
@@ -493,7 +487,7 @@ impl InertialInitializer {
             })
             .collect();
 
-        Some(InertialSolveResult {
+        Some(ImuSolveResult {
             scale: if solve_scale {
                 solution[scale_col]
             } else {

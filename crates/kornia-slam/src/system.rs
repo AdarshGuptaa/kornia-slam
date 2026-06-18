@@ -103,7 +103,7 @@ pub enum SystemMode {
     /// Bootstrap from two-view geometry before any map exists.
     Bootstrap,
     /// IMU initialization for scale and gravity
-    InertialInit,
+    ImuInit,
     /// Track against the existing map and insert keyframes when needed.
     Tracking,
 }

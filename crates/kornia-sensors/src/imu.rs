@@ -1,5 +1,8 @@
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
+/// Standard gravity magnitude in m/s².
+pub const GRAVITY_MAGNITUDE: f64 = 9.81;
+
 /// A single IMU reading: angular velocity and linear acceleration in the body frame.
 #[derive(Debug, Clone, Copy)]
 pub struct ImuMeasurement {

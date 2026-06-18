@@ -7,7 +7,7 @@ pub mod two_view;
 
 use kornia_3d::pose::Pose3d;
 
-pub use imu_init::{ImuInitResult, InertialInitConfig, InertialInitializer};
+pub use imu_init::{ImuInitConfig, ImuInitResult, ImuInitializer};
 pub use map_projection::MapProjectionEstimator;
 
 /// Successful pose estimate returned by any estimator.
