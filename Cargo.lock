@@ -5782,7 +5782,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 [[package]]
 name = "kornia-3d"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#b8da6d1ddeeb0f1ec9aa349c2107b285a1889c98"
 dependencies = [
  "bincode 2.0.1",
  "faer",
@@ -5801,7 +5801,7 @@ dependencies = [
 [[package]]
 name = "kornia-algebra"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#b8da6d1ddeeb0f1ec9aa349c2107b285a1889c98"
 dependencies = [
  "glam 0.33.1",
  "nalgebra 0.35.0",
@@ -5812,7 +5812,7 @@ dependencies = [
 [[package]]
 name = "kornia-image"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#b8da6d1ddeeb0f1ec9aa349c2107b285a1889c98"
 dependencies = [
  "kornia-tensor",
  "num-traits",
@@ -5823,7 +5823,7 @@ dependencies = [
 [[package]]
 name = "kornia-imgproc"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#b8da6d1ddeeb0f1ec9aa349c2107b285a1889c98"
 dependencies = [
  "kornia-algebra",
  "kornia-image",
@@ -5837,7 +5837,7 @@ dependencies = [
 [[package]]
 name = "kornia-io"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#b8da6d1ddeeb0f1ec9aa349c2107b285a1889c98"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -5873,7 +5873,7 @@ dependencies = [
 [[package]]
 name = "kornia-tensor"
 version = "0.1.14"
-source = "git+https://github.com/kornia/kornia-rs?branch=feat%2Fstereo-rectifier-left-rotation#36c44ee497f9f92ce827132293277353af4a5106"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#b8da6d1ddeeb0f1ec9aa349c2107b285a1889c98"
 dependencies = [
  "num-traits",
  "rayon",

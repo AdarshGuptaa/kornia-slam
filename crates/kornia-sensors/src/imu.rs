@@ -106,7 +106,7 @@ impl PreintegratedImu {
     /// `ΔR · Exp(∂ΔR/∂bg · δbg)`.
     pub fn delta_rotation_with_bias(&self, bias: &ImuBias) -> Mat3F64 {
         let dbg = bias.gyro - self.bias.gyro;
-        let correction = SO3F64::exp(mat3_mul_vec3(&self.d_rotation_d_bias_gyro, &dbg)).matrix();
+        let correction = SO3F64::exp(self.d_rotation_d_bias_gyro * dbg).matrix();
         Mat3F64(self.delta_rotation.mul_mat3(&correction))
     }
 
@@ -115,8 +115,8 @@ impl PreintegratedImu {
         let dbg = bias.gyro - self.bias.gyro;
         let dba = bias.accel - self.bias.accel;
         self.delta_velocity
-            + mat3_mul_vec3(&self.d_velocity_d_bias_gyro, &dbg)
-            + mat3_mul_vec3(&self.d_velocity_d_bias_accel, &dba)
+            + self.d_velocity_d_bias_gyro * dbg
+            + self.d_velocity_d_bias_accel * dba
     }
 
     /// Δp re-expressed at a new bias estimate (first order).
@@ -124,8 +124,8 @@ impl PreintegratedImu {
         let dbg = bias.gyro - self.bias.gyro;
         let dba = bias.accel - self.bias.accel;
         self.delta_position
-            + mat3_mul_vec3(&self.d_position_d_bias_gyro, &dbg)
-            + mat3_mul_vec3(&self.d_position_d_bias_accel, &dba)
+            + self.d_position_d_bias_gyro * dbg
+            + self.d_position_d_bias_accel * dba
     }
 
     /// Integrate a single IMU measurement over time step dt.
@@ -149,7 +149,7 @@ impl PreintegratedImu {
         let jr = SO3F64::right_jacobian(omega_dt);
 
         // Rotate acceleration by current ΔR: group action SO(3) × R³ → R³
-        let rotated_accel = mat3_mul_vec3(&self.delta_rotation, &accel);
+        let rotated_accel = self.delta_rotation * accel;
 
         // Skew-symmetric matrix of unrotated acceleration (needed for A matrix Jacobians).
         // We use hat(a) pre-multiplied by ΔR, NOT hat(ΔR·a), following Forster et al. / ORB-SLAM3.
@@ -280,11 +280,11 @@ impl PreintegratedImu {
         let r_k1 = Mat3F64(r_k.mul_mat3(&self.delta_rotation));
 
         // Predicted velocity: v_{k+1} = v_k + g·dt + R_k · Δv
-        let r_k_dv = mat3_mul_vec3(r_k, &self.delta_velocity);
+        let r_k_dv = *r_k * self.delta_velocity;
         let v_k1 = *v_k + *gravity * dt + r_k_dv;
 
         // Predicted position: p_{k+1} = p_k + v_k·dt + ½·g·dt² + R_k · Δp
-        let r_k_dp = mat3_mul_vec3(r_k, &self.delta_position);
+        let r_k_dp = *r_k * self.delta_position;
         let p_k1 = *p_k + *v_k * dt + *gravity * (0.5 * dt * dt) + r_k_dp;
 
         (r_k1, v_k1, p_k1)
@@ -317,12 +317,6 @@ fn normalize_rotation(r: &Mat3F64) -> Mat3F64 {
 
 // --- Matrix helpers ---
 // These operate on flat column-major arrays to avoid pulling in a full linear algebra crate.
-
-/// Mat3F64 × Vec3F64 helper.
-fn mat3_mul_vec3(m: &Mat3F64, v: &Vec3F64) -> Vec3F64 {
-    let dv = glam::DVec3::new(v.x, v.y, v.z);
-    Vec3F64::from(m.mul_vec3(dv))
-}
 
 /// Scalar multiply a Mat3F64.
 fn mat3_scalar(m: &Mat3F64, s: f64) -> Mat3F64 {
