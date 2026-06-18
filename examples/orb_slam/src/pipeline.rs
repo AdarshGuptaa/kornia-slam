@@ -11,9 +11,10 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
-use kornia_slam::estimation::MapProjectionEstimator;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
+use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
@@ -41,6 +42,20 @@ pub struct Pipeline {
     debug_messages: Vec<String>,
     // Map object
     map: Map,
+    // IMU states
+    imu_calib: ImuCalib,
+    imu_bias: ImuBias,
+    // Camera-to-body extrinsic T_BC (X_body = T_BC * X_cam). IMU deltas live in
+    // the body frame, so every place that mixes them with camera poses must go
+    // through this; None disables the inertial path entirely.
+    imu_t_bc: Option<Pose3d>,
+    pending_imu: Vec<ImuMeasurement>,
+    gravity_world: Vec3F64,
+    bootstrap_timestamp_sec: Option<f64>,
+    last_keyframe_timestamp_sec: Option<f64>,
+    imu_init_start_kf_idx: Option<usize>,
+    imu_init: ImuInitializer,
+
     // System state
     state: SystemState,
 }
@@ -59,17 +74,49 @@ impl Pipeline {
             debug_messages: Vec::new(),
             map: Map::new(),
             state: SystemState::new(),
+            imu_calib: ImuCalib {
+                gyro_noise: 1.6968e-4,
+                accel_noise: 2.0e-3,
+                gyro_bias_noise: 1.9393e-5,
+                accel_bias_noise: 3.0e-3,
+            },
+            imu_bias: ImuBias::default(),
+            imu_t_bc: None,
+            pending_imu: Vec::new(),
+            gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
+            bootstrap_timestamp_sec: None,
+            last_keyframe_timestamp_sec: None,
+            imu_init_start_kf_idx: None,
+            imu_init: ImuInitializer::new(ImuInitConfig {
+                min_keyframes: 30,
+                min_time_sec: 1.0,
+                min_motion: 0.05,
+            }),
         }
     }
 
+    /// Enables the inertial path by providing the camera-to-body extrinsic
+    /// `T_BC` (`X_body = T_BC * X_cam`). Without it, IMU samples are ignored.
+    pub fn set_imu_extrinsics(&mut self, t_bc: Pose3d) {
+        self.imu_t_bc = Some(t_bc);
+    }
+
     /// Processes one frame (pre-extracted features) and returns the tracking result.
-    pub fn process_frame(&mut self, mut frame: Frame) -> TrackingResult {
+    pub fn process_frame(
+        &mut self,
+        mut frame: Frame,
+        timestamp_sec: f64,
+        imu_samples: Vec<ImuMeasurement>,
+    ) -> TrackingResult {
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
         frame.ensure_undistorted(&self.camera);
+        self.pending_imu.extend(imu_samples);
+
         match self.state.mode {
-            SystemMode::Bootstrap => self.bootstrap_step(frame),
-            SystemMode::Tracking => self.tracking_step(frame),
+            SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
+            SystemMode::ImuInit => self.imu_init_step(frame, timestamp_sec),
+            SystemMode::Tracking => self.tracking_step(frame, timestamp_sec),
         }
     }
 
@@ -109,18 +156,18 @@ impl Pipeline {
         }
     }
 
-    fn bootstrap_step(&mut self, curr_frame: Frame) -> TrackingResult {
+    fn bootstrap_step(&mut self, curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Stereo frames carry metric per-keypoint depth, so we can build a
         // metric map from a single keyframe (ORB-SLAM3's StereoInitialization)
         // instead of waiting for two-view parallax.
         if curr_frame.is_stereo() {
-            return self.bootstrap_stereo(curr_frame);
+            return self.bootstrap_stereo(curr_frame, timestamp_sec);
         }
-        self.bootstrap_mono(curr_frame)
+        self.bootstrap_mono(curr_frame, timestamp_sec)
     }
 
     /// Single-frame metric initialization from stereo depth.
-    fn bootstrap_stereo(&mut self, mut curr_frame: Frame) -> TrackingResult {
+    fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Build the new map in the current odometry frame (identity at start,
         // or the recovery pose after a tracking loss).
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -169,7 +216,17 @@ impl Pipeline {
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
         self.state.velocity = None;
-        self.state.mode = SystemMode::Tracking;
+        // The map is already metric (stereo baseline), but gravity, velocities,
+        // and the gyro bias still need the inertial init before IMU prediction
+        // can run; the solve there keeps scale fixed at 1.
+        self.state.mode = if self.imu_t_bc.is_some() {
+            self.imu_init_start_kf_idx = Some(curr_idx);
+            SystemMode::ImuInit
+        } else {
+            SystemMode::Tracking
+        };
+        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+        self.prune_imu_before(timestamp_sec);
 
         TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
@@ -211,7 +268,7 @@ impl Pipeline {
         self.map.add_triangulated_points(None, curr_kf, &points)
     }
 
-    fn bootstrap_mono(&mut self, mut curr_frame: Frame) -> TrackingResult {
+    fn bootstrap_mono(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
         // Stamp frames with current odometry pose so bootstrap builds
         // the new map in the existing coordinate frame.
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -241,6 +298,9 @@ impl Pipeline {
                 curr_frame.idx,
             ));
             self.state.bootstrap_frame = Some(curr_frame);
+            self.bootstrap_timestamp_sec = Some(timestamp_sec);
+            // Samples before the reference frame can never enter an edge.
+            self.prune_imu_before(timestamp_sec);
             return TrackingResult {
                 pose_world_to_cam: self.state.pose_world_to_cam,
                 status: TrackingStatus::Skipped,
@@ -284,6 +344,7 @@ impl Pipeline {
         curr_frame.pose_world_to_cam = estimated_pose;
 
         // Promote to Keyframes
+        let prev_idx = prev_bootstrap_frame.idx;
         let reference_kf = Keyframe::from_frame(prev_bootstrap_frame);
         let current_kf = Keyframe::from_frame(curr_frame);
         let curr_idx = current_kf.frame.idx;
@@ -320,6 +381,15 @@ impl Pipeline {
         if let Some(kf) = self.map.get_keyframe(curr_idx) {
             self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
+
+        if let Some(prev_ts) = self.bootstrap_timestamp_sec {
+            let preint = self.preintegrate_window(prev_ts, timestamp_sec);
+            if preint.dt > 0.0 {
+                self.map.add_imu_factor(prev_idx, curr_idx, preint);
+            }
+            self.prune_imu_before(timestamp_sec);
+        }
+
         self.state.velocity = Some(Pose3d::between(
             &prev_pose_world_to_cam,
             &self.state.pose_world_to_cam,
@@ -327,7 +397,15 @@ impl Pipeline {
 
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
-        self.state.mode = SystemMode::Tracking;
+        // IMU init needs the camera-to-body extrinsic to relate IMU deltas
+        // to camera poses; without it, run visual-only as before.
+        self.state.mode = if self.imu_t_bc.is_some() {
+            self.imu_init_start_kf_idx = Some(curr_idx);
+            SystemMode::ImuInit
+        } else {
+            SystemMode::Tracking
+        };
+        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
 
         TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
@@ -398,20 +476,158 @@ impl Pipeline {
         added
     }
 
-    fn tracking_step(&mut self, frame: Frame) -> TrackingResult {
-        let pose_before_tracking = self.state.pose_world_to_cam;
-        let image_size = frame.image_size;
+    /// Preintegrates buffered IMU samples over `[t0, t1]` without consuming
+    /// them: the same samples serve both per-frame pose prediction and the
+    /// keyframe-to-keyframe edges. [`Self::prune_imu_before`] discards samples
+    /// once no future window can need them.
+    fn preintegrate_window(&self, t0: f64, t1: f64) -> PreintegratedImu {
+        let mut pre = PreintegratedImu::new(self.imu_bias, self.imu_calib);
 
-        let candidate_pose = if let Some(vel) = self.state.velocity {
-            vel.compose(&self.state.pose_world_to_cam)
+        let mut samples: Vec<&ImuMeasurement> = self
+            .pending_imu
+            .iter()
+            .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
+            .collect();
+        samples.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
+
+        if samples.is_empty() {
+            return pre;
+        }
+
+        let mut last_t = t0;
+        for sample in &samples {
+            let dt = sample.timestamp - last_t;
+            if dt > 0.0 {
+                pre.integrate(sample, dt);
+                last_t = sample.timestamp;
+            }
+        }
+
+        if last_t < t1
+            && let Some(last_sample) = samples.last()
+        {
+            pre.integrate(last_sample, t1 - last_t);
+        }
+
+        pre
+    }
+
+    /// Drops buffered IMU samples strictly older than `t` (typically the last
+    /// keyframe timestamp: the next edge and all per-frame windows start there).
+    fn prune_imu_before(&mut self, t: f64) {
+        self.pending_imu.retain(|m| m.timestamp >= t);
+    }
+
+    /// Body-to-world pose `T_WB` for a world-to-camera pose, via
+    /// `T_WB = T_WC ∘ T_CB`. Treats camera == body when no extrinsic is set.
+    fn body_to_world(&self, pose_w2c: &Pose3d) -> Pose3d {
+        let cam_to_world = pose_w2c.inverse();
+        match &self.imu_t_bc {
+            Some(t_bc) => cam_to_world.compose(&t_bc.inverse()),
+            None => cam_to_world,
+        }
+    }
+
+    /// Propagates the camera pose and body velocity through one preintegrated
+    /// IMU window.
+    fn predict_pose_imu(
+        &self,
+        pose_w2c: Pose3d,
+        vel_world: Vec3F64,
+        gravity_world: Vec3F64,
+        preint: &PreintegratedImu,
+    ) -> (Pose3d, Vec3F64) {
+        let body_to_world = self.body_to_world(&pose_w2c);
+        let (r_j, v_j, p_j) = preint.predict(
+            &body_to_world.rotation,
+            &vel_world,
+            &body_to_world.translation,
+            &gravity_world,
+        );
+
+        let pred_body_to_world = Pose3d::from_rt(r_j, p_j);
+        let pred_cam_to_world = match &self.imu_t_bc {
+            Some(t_bc) => pred_body_to_world.compose(t_bc),
+            None => pred_body_to_world,
+        };
+        (pred_cam_to_world.inverse(), v_j)
+    }
+
+    fn imu_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        let result = self.tracking_step(frame, timestamp_sec);
+
+        if result.status == TrackingStatus::KeyframeAccepted
+            && self.imu_init.ready(&self.map, self.imu_init_start_kf_idx)
+        {
+            let Some(start_idx) = self.imu_init_start_kf_idx else {
+                return result;
+            };
+            match self
+                .imu_init
+                .try_initialize(&self.map, self.imu_t_bc, self.imu_bias, start_idx)
+            {
+                Some(init) => {
+                    let scale = init.scale;
+                    let gravity = init.gravity_world;
+                    let bg = init.bias.gyro;
+                    self.imu_init.apply_initialization(
+                        &mut self.map,
+                        &mut self.state,
+                        &mut self.imu_bias,
+                        &mut self.gravity_world,
+                        init,
+                        start_idx,
+                    );
+                    self.state.mode = SystemMode::Tracking;
+                    self.dbg(format!(
+                        "[imu_init] accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
+                         gyro_bias=({:.4},{:.4},{:.4})",
+                        gravity.x, gravity.y, gravity.z, bg.x, bg.y, bg.z
+                    ));
+                }
+                None => {
+                    self.dbg("[imu_init] rejected: solve failed or invalid scale/gravity".into());
+                }
+            }
+        }
+
+        result
+    }
+
+    fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        let image_size = frame.image_size;
+        let pose_before = self.state.pose_world_to_cam;
+        let prev_timestamp = self.state.last_frame_timestamp_sec;
+
+        let candidate_pose = if self.state.imu_initialized && prev_timestamp > 0.0 {
+            let preint = self.preintegrate_window(prev_timestamp, timestamp_sec);
+            if preint.dt > 0.0 {
+                let (pred_pose, pred_vel) = self.predict_pose_imu(
+                    pose_before,
+                    self.state.velocity_world,
+                    self.gravity_world,
+                    &preint,
+                );
+                self.state.velocity_world = pred_vel; // propagate for next frame
+                pred_pose
+            } else {
+                // IMU stalled, fall back to visual constant velocity
+                self.state
+                    .velocity
+                    .map(|v| v.compose(&pose_before))
+                    .unwrap_or(pose_before)
+            }
         } else {
-            self.state.pose_world_to_cam
+            self.state
+                .velocity
+                .map(|v| v.compose(&pose_before))
+                .unwrap_or(pose_before)
         };
 
         let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
-            &pose_before_tracking,
+            &pose_before,
             &self.map,
             &self.camera,
             self.state.current_keyframe_idx,
@@ -419,8 +635,22 @@ impl Pipeline {
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
             Ok(estimate) => {
-                self.state.velocity = Some(Pose3d::between(&pose_before_tracking, &estimate.pose));
                 self.state.pose_world_to_cam = estimate.pose;
+
+                if self.state.imu_initialized {
+                    // Refresh the body velocity from the visually corrected
+                    // poses (body centers, not camera centers: they differ by
+                    // the rotating T_BC lever arm).
+                    let body_before = self.body_to_world(&pose_before).translation;
+                    let body_after = self.body_to_world(&estimate.pose).translation;
+                    let dt = timestamp_sec - prev_timestamp;
+                    if dt > 1e-6 {
+                        self.state.velocity_world = (body_after - body_before) / dt;
+                    }
+                } else {
+                    self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
+                }
+
                 (
                     TrackingStatus::Tracked,
                     estimate.matches,
@@ -460,7 +690,7 @@ impl Pipeline {
             );
             self.map.update_observation_counts(&visible, &matches);
 
-            if self.try_insert_keyframe(&frame, tracked_inliers, &matches) {
+            if self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches) {
                 status = TrackingStatus::KeyframeAccepted;
             }
         }
@@ -469,12 +699,17 @@ impl Pipeline {
             self.state.consecutive_failures += 1;
             if self.state.consecutive_failures >= self.state.max_consecutive_failures {
                 self.state.reset();
-                return self.bootstrap_step(frame);
+                return self.bootstrap_step(frame, timestamp_sec);
             }
         } else {
             self.state.consecutive_failures = 0;
         }
-
+        self.state.last_frame_timestamp_sec = timestamp_sec;
+        // Samples older than the last keyframe can't enter any future window
+        // (the next edge and all per-frame predictions start at or after it).
+        if let Some(kf_ts) = self.last_keyframe_timestamp_sec {
+            self.prune_imu_before(kf_ts.min(timestamp_sec));
+        }
         TrackingResult {
             pose_world_to_cam: self.state.pose_world_to_cam,
             status,
@@ -484,6 +719,7 @@ impl Pipeline {
     fn try_insert_keyframe(
         &mut self,
         frame: &Frame,
+        timestamp_sec: f64,
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> bool {
@@ -579,6 +815,18 @@ impl Pipeline {
         ));
 
         self.map.upsert_keyframe(curr_kf);
+        if let (Some(prev_kf_idx), Some(prev_ts)) = (
+            self.state.last_keyframe_idx,
+            self.last_keyframe_timestamp_sec,
+        ) {
+            let preint = self.preintegrate_window(prev_ts, timestamp_sec);
+            if preint.dt > 0.0 {
+                self.map.add_imu_factor(prev_kf_idx, frame.idx, preint);
+            }
+        }
+
+        self.last_keyframe_timestamp_sec = Some(timestamp_sec);
+
         self.state.current_keyframe_idx = Some(frame.idx);
         self.state.last_keyframe_idx = Some(frame.idx);
 

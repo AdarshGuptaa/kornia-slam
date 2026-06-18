@@ -1,11 +1,13 @@
 //! Pose estimation algorithms and estimator modules.
 
+pub mod imu_init;
 pub mod map_projection;
 pub mod pnp;
 pub mod two_view;
 
 use kornia_3d::pose::Pose3d;
 
+pub use imu_init::{ImuInitConfig, ImuInitResult, ImuInitializer};
 pub use map_projection::MapProjectionEstimator;
 
 /// Successful pose estimate returned by any estimator.

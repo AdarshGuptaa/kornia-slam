@@ -27,16 +27,28 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::frame::Frame;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::bundle_adjust_schur;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
+use kornia_algebra::SO3F64;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
+use kornia_sensors::imu::{ImuBias, PreintegratedImu};
 
-use crate::frame::Frame;
+/// Preintegrated IMU measurements connecting two consecutive keyframes.
+#[derive(Debug, Clone)]
+pub struct ImuFactor {
+    /// Index of the earlier keyframe (`Keyframe::frame.idx`).
+    pub prev_kf_idx: usize,
+    /// Index of the later keyframe.
+    pub curr_kf_idx: usize,
+    /// IMU deltas integrated over the interval between the two keyframes.
+    pub preintegrated: PreintegratedImu,
+}
 
 /// A frame promoted into the map, with descriptor-to-map-point associations.
 #[derive(Debug, Clone)]
@@ -44,6 +56,10 @@ pub struct Keyframe {
     pub frame: Frame,
     /// For each descriptor index in `frame.features`, associated map-point index.
     pub map_point_by_desc_idx: Vec<Option<usize>>,
+    /// Metric linear velocity in world frame, initialized by visual-inertial bootstrap.
+    pub velocity_world: Vec3F64,
+    /// IMU bias estimate associated with this keyframe.
+    pub imu_bias: ImuBias,
 }
 
 impl Keyframe {
@@ -53,6 +69,8 @@ impl Keyframe {
         Self {
             frame,
             map_point_by_desc_idx,
+            velocity_world: Vec3F64::ZERO,
+            imu_bias: ImuBias::default(),
         }
     }
 
@@ -266,6 +284,7 @@ pub struct InitialMapHealth {
 pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
+    imu_factors: Vec<ImuFactor>,
 }
 
 impl Map {
@@ -277,6 +296,60 @@ impl Map {
     /// Returns all keyframes.
     pub fn keyframes(&self) -> &[Keyframe] {
         &self.keyframes
+    }
+
+    /// Returns mutable access to all keyframes.
+    pub fn keyframes_mut(&mut self) -> &mut [Keyframe] {
+        &mut self.keyframes
+    }
+
+    /// Records preintegrated IMU measurements between two consecutive keyframes.
+    pub fn add_imu_factor(
+        &mut self,
+        prev_kf_idx: usize,
+        curr_kf_idx: usize,
+        preintegrated: PreintegratedImu,
+    ) {
+        self.imu_factors.push(ImuFactor {
+            prev_kf_idx,
+            curr_kf_idx,
+            preintegrated,
+        });
+    }
+
+    /// Returns all keyframe-to-keyframe IMU factors in insertion order.
+    pub fn imu_factors(&self) -> &[ImuFactor] {
+        &self.imu_factors
+    }
+
+    /// Applies a metric scale to camera centers and map points.
+    pub fn scale_world(&mut self, scale: f64) {
+        for kf in &mut self.keyframes {
+            let mut cam_to_world = kf.frame.pose_world_to_cam.inverse();
+            cam_to_world.translation *= scale;
+            kf.frame.pose_world_to_cam = cam_to_world.inverse();
+        }
+
+        for mp in &mut self.map_points {
+            mp.position *= scale;
+        }
+    }
+
+    pub fn rotate_world(&mut self, r: &SO3F64) {
+        for kf in self.keyframes_mut() {
+            let cam_to_world = kf.frame.pose_world_to_cam.inverse();
+            let new_translation = *r * cam_to_world.translation;
+            let rot_so3 = SO3F64::from_matrix(&cam_to_world.rotation);
+            let new_rot_so3 = *r * rot_so3;
+            let new_rotation = new_rot_so3.matrix();
+            kf.frame.pose_world_to_cam = Pose3d::from_rt(new_rotation, new_translation).inverse();
+        }
+
+        for mp in self.map_points_mut() {
+            if !mp.culled {
+                mp.position = *r * mp.position;
+            }
+        }
     }
 
     /// Returns all map points.
@@ -298,6 +371,7 @@ impl Map {
     pub fn clear_active(&mut self) {
         self.keyframes.clear();
         self.map_points.clear();
+        self.imu_factors.clear();
     }
 
     /// Health metrics for the just-bootstrapped pair of keyframes.

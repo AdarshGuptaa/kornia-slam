@@ -6,4 +6,4 @@ description = "Physical sensor processing for kornia: IMU preintegration, noise 
 
 [dependencies]
 kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
-glam = "0.30"
+glam = "0.33"

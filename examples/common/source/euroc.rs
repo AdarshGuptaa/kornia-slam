@@ -3,11 +3,13 @@
 use std::path::Path;
 
 use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
+use kornia_algebra::Mat3F64;
 use kornia_io::png::read_image_png_mono8;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::EurocDataset;
-use crate::datasets::euroc::GroundTruthPose;
+use crate::datasets::euroc::{GroundTruthPose, ImuSample};
 use crate::datasets::{StereoRectifier, rectifier_from_euroc};
 /// Reads left-camera (and optionally rectified left+right) PNG frames from an
 /// EuRoC dataset in order.
@@ -18,6 +20,8 @@ pub struct EurocSource {
     end: usize,
     /// When `Some`, the source rectifies the left+right pair and yields stereo.
     rectifier: Option<StereoRectifier>,
+    with_imu: bool,
+    imu_cursor: usize,
 }
 
 impl EurocSource {
@@ -76,12 +80,30 @@ impl EurocSource {
             None
         };
 
+        // IMU samples are yielded whenever the dataset ships them (`imu0`);
+        // skip those preceding the first yielded camera frame.
+        let with_imu = dataset.is_imu();
+        let imu_cursor = if with_imu && start > 0 {
+            let boundary_ts = dataset
+                .left_samples
+                .get(start - 1)
+                .map(|sample| sample.timestamp_sec)
+                .unwrap_or(f64::INFINITY);
+            dataset
+                .imu_samples
+                .partition_point(|sample| sample.timestamp_sec <= boundary_ts)
+        } else {
+            0
+        };
+
         Ok(Self {
             dataset,
             cursor: start,
             start,
             end,
             rectifier,
+            with_imu,
+            imu_cursor,
         })
     }
 
@@ -105,6 +127,23 @@ impl FrameSource for EurocSource {
 
     fn stereo_bf(&self) -> Option<f64> {
         self.rectifier.as_ref().map(|r| r.bf())
+    }
+
+    fn imu_extrinsics(&self) -> Option<Pose3d> {
+        if !self.with_imu {
+            return None;
+        }
+        let (rotation, translation) = self.dataset.left_calibration.body_from_camera();
+        match &self.rectifier {
+            // The rectified virtual camera is the raw cam0 rotated by the
+            // rectifying rotation (p_rect = R_rect · p_cam0), so
+            // T_B,rect = T_BS · R_rectᵀ; the translation is unchanged.
+            Some(rect) => {
+                let r_rect_t = Mat3F64(*rect.left_rectifying_rotation().transpose());
+                Some(Pose3d::from_rt(rotation * r_rect_t, translation))
+            }
+            None => Some(Pose3d::from_rt(rotation, translation)),
+        }
     }
 
     fn n_frames_hint(&self) -> Option<usize> {
@@ -135,6 +174,7 @@ impl FrameSource for EurocSource {
             }
             None => (left_raw, None),
         };
+        let imu_samples = self.imu_samples_until(timestamp_sec);
 
         self.cursor += 1;
         Ok(Some(FrameItem {
@@ -142,6 +182,22 @@ impl FrameSource for EurocSource {
             timestamp_sec,
             image,
             right_image,
+            imu_samples,
         }))
+    }
+}
+
+impl EurocSource {
+    fn imu_samples_until(&mut self, timestamp_sec: f64) -> Vec<ImuSample> {
+        if !self.with_imu {
+            return Vec::new();
+        }
+
+        let start = self.imu_cursor;
+        let rel_end = self.dataset.imu_samples[start..]
+            .partition_point(|sample| sample.timestamp_sec <= timestamp_sec);
+        let end = start + rel_end;
+        self.imu_cursor = end;
+        self.dataset.imu_samples[start..end].to_vec()
     }
 }

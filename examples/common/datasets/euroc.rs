@@ -33,6 +33,18 @@ pub struct DatasetSample {
     pub image_path: PathBuf,
 }
 
+/// One IMU sample from `imu0/data.csv`.
+#[derive(Debug, Clone)]
+pub struct ImuSample {
+    /// Timestamp in seconds.
+    #[allow(dead_code)]
+    pub timestamp_sec: f64,
+    /// Angular velocity in body frame (rad/s).
+    pub gyro: [f64; 3],
+    /// Linear acceleration in body frame (m/s^2).
+    pub accel: [f64; 3],
+}
+
 /// One ground-truth pose from `state_groundtruth_estimate0/data.csv`.
 #[derive(Debug, Clone, Copy)]
 pub struct GroundTruthPose {
@@ -91,6 +103,12 @@ pub struct EurocCameraCalibration {
 }
 
 impl EurocCameraCalibration {
+    /// Camera-to-body extrinsic `T_BS` as rotation + translation
+    /// (`X_body = R * X_cam + t`). On EuRoC the body frame is `imu0`.
+    pub fn body_from_camera(&self) -> (Mat3F64, Vec3F64) {
+        decompose_t_bs(&self.t_bs)
+    }
+
     /// Converts the parsed EuRoC calibration into a `PinholeCamera`.
     pub fn to_pinhole_camera(self) -> PinholeCamera {
         PinholeCamera {
@@ -203,6 +221,8 @@ pub struct EurocDataset {
     /// Ground-truth poses (empty if GT file not present).
     #[allow(dead_code)]
     pub ground_truth: Vec<GroundTruthPose>,
+    /// IMU samples
+    pub imu_samples: Vec<ImuSample>,
 }
 
 impl EurocDataset {
@@ -225,6 +245,7 @@ impl EurocDataset {
         };
 
         let ground_truth = Self::load_ground_truth(&root);
+        let imu_samples = Self::load_imu_samples(&root)?;
 
         Ok(Self {
             root,
@@ -233,7 +254,68 @@ impl EurocDataset {
             right_samples,
             right_calibration,
             ground_truth,
+            imu_samples,
         })
+    }
+
+    /// Loads the IMU samples (`imu0`); empty when the dataset ships none.
+    fn load_imu_samples(root: &Path) -> Result<Vec<ImuSample>, DatasetError> {
+        let csv = root.join("mav0").join("imu0").join("data.csv");
+        if !csv.exists() {
+            return Ok(Vec::new());
+        }
+
+        let file = File::open(&csv)?;
+        let reader = BufReader::new(file);
+        let mut samples = Vec::new();
+
+        for (line_idx, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() < 7 {
+                return Err(DatasetError::Parse(format!(
+                    "invalid imu sample at line {}: expected 7 columns",
+                    line_idx + 1
+                )));
+            }
+
+            let ts_ns = cols[0].trim().parse::<u64>().map_err(|e| {
+                DatasetError::Parse(format!("invalid timestamp at line {}: {e}", line_idx + 1))
+            })?;
+            let gyro = [
+                cols[1].trim().parse::<f64>().map_err(|e| {
+                    DatasetError::Parse(format!("invalid gyro x at line {}: {e}", line_idx + 1))
+                })?,
+                cols[2].trim().parse::<f64>().map_err(|e| {
+                    DatasetError::Parse(format!("invalid gyro y at line {}: {e}", line_idx + 1))
+                })?,
+                cols[3].trim().parse::<f64>().map_err(|e| {
+                    DatasetError::Parse(format!("invalid gyro z at line {}: {e}", line_idx + 1))
+                })?,
+            ];
+            let accel = [
+                cols[4].trim().parse::<f64>().map_err(|e| {
+                    DatasetError::Parse(format!("invalid accel x at line {}: {e}", line_idx + 1))
+                })?,
+                cols[5].trim().parse::<f64>().map_err(|e| {
+                    DatasetError::Parse(format!("invalid accel y at line {}: {e}", line_idx + 1))
+                })?,
+                cols[6].trim().parse::<f64>().map_err(|e| {
+                    DatasetError::Parse(format!("invalid accel z at line {}: {e}", line_idx + 1))
+                })?,
+            ];
+
+            samples.push(ImuSample {
+                timestamp_sec: ts_ns as f64 * 1e-9,
+                gyro,
+                accel,
+            });
+        }
+
+        Ok(samples)
     }
 
     /// Loads the ordered image samples for a given camera (`cam0` / `cam1`).
@@ -286,6 +368,11 @@ impl EurocDataset {
     /// Whether the dataset has a usable right camera (calibration + samples).
     pub fn is_stereo(&self) -> bool {
         self.right_calibration.is_some() && !self.right_samples.is_empty()
+    }
+
+    /// Whether the dataset has IMU samples
+    pub fn is_imu(&self) -> bool {
+        !self.imu_samples.is_empty()
     }
 
     /// Returns the left-camera model.

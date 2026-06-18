@@ -1,5 +1,8 @@
 use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
+/// Standard gravity magnitude in m/s².
+pub const GRAVITY_MAGNITUDE: f64 = 9.81;
+
 /// A single IMU reading: angular velocity and linear acceleration in the body frame.
 #[derive(Debug, Clone, Copy)]
 pub struct ImuMeasurement {
@@ -48,6 +51,11 @@ pub struct ImuCalib {
 /// Also propagates covariance matrices tracking how uncertainty grows:
 /// - 9×9 navigation covariance in tangent space [δrot(3), δvel(3), δpos(3)]
 /// - 6×6 bias covariance [δbias_gyro(3), δbias_accel(3)] (decoupled, grows linearly)
+///
+/// Bias Jacobians (∂Δ/∂bias) are tracked alongside, so a small change in the
+/// bias estimate can be applied to the deltas to first order without
+/// re-integrating raw measurements (Forster et al. TRO 2017, eq. 70-71).
+#[derive(Debug, Clone)]
 pub struct PreintegratedImu {
     /// Accumulated rotation ∈ SO(3).
     pub delta_rotation: Mat3F64,
@@ -66,6 +74,16 @@ pub struct PreintegratedImu {
     /// 6×6 bias covariance [bias_gyro, bias_accel], stored column-major.
     /// Grows by σ²·dt each step (random walk).
     pub bias_covariance: [f64; 36],
+    /// ∂ΔR/∂bias_gyro (so(3) tangent perturbation per unit gyro-bias change).
+    pub d_rotation_d_bias_gyro: Mat3F64,
+    /// ∂Δv/∂bias_gyro.
+    pub d_velocity_d_bias_gyro: Mat3F64,
+    /// ∂Δv/∂bias_accel.
+    pub d_velocity_d_bias_accel: Mat3F64,
+    /// ∂Δp/∂bias_gyro.
+    pub d_position_d_bias_gyro: Mat3F64,
+    /// ∂Δp/∂bias_accel.
+    pub d_position_d_bias_accel: Mat3F64,
 }
 
 impl PreintegratedImu {
@@ -79,7 +97,34 @@ impl PreintegratedImu {
             calib,
             covariance: [0.0; 81],
             bias_covariance: [0.0; 36],
+            d_rotation_d_bias_gyro: Mat3F64::ZERO,
+            d_velocity_d_bias_gyro: Mat3F64::ZERO,
+            d_velocity_d_bias_accel: Mat3F64::ZERO,
+            d_position_d_bias_gyro: Mat3F64::ZERO,
+            d_position_d_bias_accel: Mat3F64::ZERO,
         }
+    }
+
+    /// ΔR re-expressed at a new bias estimate via the first-order correction
+    /// `ΔR · Exp(∂ΔR/∂bg · δbg)`.
+    pub fn delta_rotation_with_bias(&self, bias: &ImuBias) -> Mat3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let correction = SO3F64::exp(self.d_rotation_d_bias_gyro * dbg).matrix();
+        Mat3F64(self.delta_rotation.mul_mat3(&correction))
+    }
+
+    /// Δv re-expressed at a new bias estimate (first order).
+    pub fn delta_velocity_with_bias(&self, bias: &ImuBias) -> Vec3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let dba = bias.accel - self.bias.accel;
+        self.delta_velocity + self.d_velocity_d_bias_gyro * dbg + self.d_velocity_d_bias_accel * dba
+    }
+
+    /// Δp re-expressed at a new bias estimate (first order).
+    pub fn delta_position_with_bias(&self, bias: &ImuBias) -> Vec3F64 {
+        let dbg = bias.gyro - self.bias.gyro;
+        let dba = bias.accel - self.bias.accel;
+        self.delta_position + self.d_position_d_bias_gyro * dbg + self.d_position_d_bias_accel * dba
     }
 
     /// Integrate a single IMU measurement over time step dt.
@@ -103,7 +148,7 @@ impl PreintegratedImu {
         let jr = SO3F64::right_jacobian(omega_dt);
 
         // Rotate acceleration by current ΔR: group action SO(3) × R³ → R³
-        let rotated_accel = mat3_mul_vec3(&self.delta_rotation, &accel);
+        let rotated_accel = self.delta_rotation * accel;
 
         // Skew-symmetric matrix of unrotated acceleration (needed for A matrix Jacobians).
         // We use hat(a) pre-multiplied by ΔR, NOT hat(ΔR·a), following Forster et al. / ORB-SLAM3.
@@ -182,6 +227,20 @@ impl PreintegratedImu {
             self.bias_covariance[i + i * 6] += ba_var;
         }
 
+        // --- Bias Jacobian propagation (Forster et al. TRO 2017, eq. 70-71) ---
+        // Measurements enter bias-corrected (ω - bg, a - ba), so each step's
+        // sensitivity to the bias accumulates. Position/velocity rows must use
+        // the pre-update ∂ΔR/∂bg, so the rotation row comes last.
+        self.d_position_d_bias_gyro = self.d_position_d_bias_gyro
+            + self.d_velocity_d_bias_gyro * dt
+            + neg_dr_ah_half_dt2 * self.d_rotation_d_bias_gyro;
+        self.d_position_d_bias_accel = self.d_position_d_bias_accel
+            + self.d_velocity_d_bias_accel * dt
+            - self.delta_rotation * (0.5 * dt * dt);
+        self.d_velocity_d_bias_gyro += neg_dr_ah_dt * self.d_rotation_d_bias_gyro;
+        self.d_velocity_d_bias_accel -= self.delta_rotation * dt;
+        self.d_rotation_d_bias_gyro = d_rot_t * self.d_rotation_d_bias_gyro - jr * dt;
+
         // --- State update ---
 
         // 1. Position (uses old Δv and ΔR)
@@ -220,11 +279,11 @@ impl PreintegratedImu {
         let r_k1 = Mat3F64(r_k.mul_mat3(&self.delta_rotation));
 
         // Predicted velocity: v_{k+1} = v_k + g·dt + R_k · Δv
-        let r_k_dv = mat3_mul_vec3(r_k, &self.delta_velocity);
+        let r_k_dv = *r_k * self.delta_velocity;
         let v_k1 = *v_k + *gravity * dt + r_k_dv;
 
         // Predicted position: p_{k+1} = p_k + v_k·dt + ½·g·dt² + R_k · Δp
-        let r_k_dp = mat3_mul_vec3(r_k, &self.delta_position);
+        let r_k_dp = *r_k * self.delta_position;
         let p_k1 = *p_k + *v_k * dt + *gravity * (0.5 * dt * dt) + r_k_dp;
 
         (r_k1, v_k1, p_k1)
@@ -257,12 +316,6 @@ fn normalize_rotation(r: &Mat3F64) -> Mat3F64 {
 
 // --- Matrix helpers ---
 // These operate on flat column-major arrays to avoid pulling in a full linear algebra crate.
-
-/// Mat3F64 × Vec3F64 helper.
-fn mat3_mul_vec3(m: &Mat3F64, v: &Vec3F64) -> Vec3F64 {
-    let dv = glam::DVec3::new(v.x, v.y, v.z);
-    Vec3F64::from(m.mul_vec3(dv))
-}
 
 /// Scalar multiply a Mat3F64.
 fn mat3_scalar(m: &Mat3F64, s: f64) -> Mat3F64 {

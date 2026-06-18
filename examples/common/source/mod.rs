@@ -13,9 +13,12 @@ pub mod oakd;
 pub mod uvc;
 
 use kornia_3d::camera::PinholeCamera;
+use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_imgproc::features::OrbFeatures;
 use kornia_tensor::CpuAllocator;
+
+use crate::datasets::euroc::ImuSample;
 
 pub use euroc::EurocSource;
 pub use hilti::HiltiSource;
@@ -36,6 +39,9 @@ pub struct FrameItem {
     pub image: Image<u8, 1, CpuAllocator>,
     /// Rectified right view, when the source provides a stereo pair.
     pub right_image: Option<Image<u8, 1, CpuAllocator>>,
+    /// IMU samples between the previous yielded camera frame and this one.
+    #[allow(dead_code)]
+    pub imu_samples: Vec<ImuSample>,
 }
 
 /// Pull-based interface for monocular SLAM frame producers.
@@ -51,6 +57,16 @@ pub trait FrameSource {
     /// Stereo baseline `bf = focal * baseline` in pixel·metre units, when the
     /// source yields rectified stereo pairs. `None` for monocular sources.
     fn stereo_bf(&self) -> Option<f64> {
+        None
+    }
+
+    /// Camera-to-body (IMU) extrinsic `T_BC` (`X_body = T_BC * X_cam`), in the
+    /// coordinate frame implied by [`Self::camera`]. `None` when the source has
+    /// no IMU, or when its IMU samples cannot be related to the camera frame
+    /// (e.g. rectified stereo, where the extrinsic of the virtual rectified
+    /// camera is not exposed yet). IMU samples without this extrinsic are
+    /// ignored by the pipeline.
+    fn imu_extrinsics(&self) -> Option<Pose3d> {
         None
     }
 

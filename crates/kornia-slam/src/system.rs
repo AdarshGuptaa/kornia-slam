@@ -3,6 +3,7 @@
 use kornia_3d::pose::Pose3d;
 
 use crate::frame::Frame;
+use kornia_algebra::Vec3F64;
 
 /// Keyframe insertion heuristics.
 #[derive(Debug, Clone)]
@@ -80,6 +81,13 @@ pub struct TrackingResult {
 pub struct SystemState {
     pub pose_world_to_cam: Pose3d,
     pub velocity: Option<Pose3d>,
+    /// Metric body velocity in the world frame (m/s); valid once `imu_initialized`.
+    pub velocity_world: Vec3F64,
+    /// Timestamp of the previous processed frame, bounding the per-frame
+    /// preintegration window.
+    pub last_frame_timestamp_sec: f64,
+    /// Whether visual-inertial initialization succeeded (gates IMU pose prediction).
+    pub imu_initialized: bool,
     pub current_keyframe_idx: Option<usize>,
     pub last_keyframe_idx: Option<usize>,
     pub consecutive_failures: usize,
@@ -94,6 +102,8 @@ pub struct SystemState {
 pub enum SystemMode {
     /// Bootstrap from two-view geometry before any map exists.
     Bootstrap,
+    /// IMU initialization for scale and gravity
+    ImuInit,
     /// Track against the existing map and insert keyframes when needed.
     Tracking,
 }
@@ -103,11 +113,14 @@ impl SystemState {
         Self {
             pose_world_to_cam: Pose3d::IDENTITY,
             velocity: None,
+            velocity_world: Vec3F64::ZERO,
             current_keyframe_idx: None,
             last_keyframe_idx: None,
             consecutive_failures: 0,
             max_consecutive_failures: 15,
             bootstrap_frame: None,
+            imu_initialized: false,
+            last_frame_timestamp_sec: 0.0,
             mode: SystemMode::Bootstrap,
         }
     }
@@ -119,6 +132,10 @@ impl SystemState {
         self.velocity = None;
         self.consecutive_failures = 0;
         self.bootstrap_frame = None;
+        // The new map starts at an unknown monocular scale, so the metric
+        // IMU state no longer applies until inertial init runs again.
+        self.imu_initialized = false;
+        self.velocity_world = Vec3F64::ZERO;
     }
 }
 
