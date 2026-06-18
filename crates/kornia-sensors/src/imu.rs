@@ -114,18 +114,14 @@ impl PreintegratedImu {
     pub fn delta_velocity_with_bias(&self, bias: &ImuBias) -> Vec3F64 {
         let dbg = bias.gyro - self.bias.gyro;
         let dba = bias.accel - self.bias.accel;
-        self.delta_velocity
-            + self.d_velocity_d_bias_gyro * dbg
-            + self.d_velocity_d_bias_accel * dba
+        self.delta_velocity + self.d_velocity_d_bias_gyro * dbg + self.d_velocity_d_bias_accel * dba
     }
 
     /// Δp re-expressed at a new bias estimate (first order).
     pub fn delta_position_with_bias(&self, bias: &ImuBias) -> Vec3F64 {
         let dbg = bias.gyro - self.bias.gyro;
         let dba = bias.accel - self.bias.accel;
-        self.delta_position
-            + self.d_position_d_bias_gyro * dbg
-            + self.d_position_d_bias_accel * dba
+        self.delta_position + self.d_position_d_bias_gyro * dbg + self.d_position_d_bias_accel * dba
     }
 
     /// Integrate a single IMU measurement over time step dt.
