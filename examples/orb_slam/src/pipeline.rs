@@ -11,7 +11,7 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
-use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
@@ -20,6 +20,8 @@ use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
 };
+
+const GRAVITY_MAGNITUDE: f64 = 9.81;
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
@@ -53,8 +55,8 @@ pub struct Pipeline {
     gravity_world: Vec3F64,
     bootstrap_timestamp_sec: Option<f64>,
     last_keyframe_timestamp_sec: Option<f64>,
-    imu_init_start_kf_idx: Option<usize>,
-    imu_init: ImuInitializer,
+    inertial_init_start_kf_idx: Option<usize>,
+    inertial_init: ImuInitializer,
 
     // System state
     state: SystemState,
@@ -86,10 +88,10 @@ impl Pipeline {
             gravity_world: Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE),
             bootstrap_timestamp_sec: None,
             last_keyframe_timestamp_sec: None,
-            imu_init_start_kf_idx: None,
-            imu_init: ImuInitializer::new(ImuInitConfig {
+            inertial_init_start_kf_idx: None,
+            inertial_init: ImuInitializer::new(ImuInitConfig {
                 min_keyframes: 30,
-                min_time_sec: 1.0,
+                min_time_sec: 15.0,
                 min_motion: 0.05,
             }),
         }
@@ -115,7 +117,7 @@ impl Pipeline {
 
         match self.state.mode {
             SystemMode::Bootstrap => self.bootstrap_step(frame, timestamp_sec),
-            SystemMode::ImuInit => self.imu_init_step(frame, timestamp_sec),
+            SystemMode::ImuInit => self.inertial_init_step(frame, timestamp_sec),
             SystemMode::Tracking => self.tracking_step(frame, timestamp_sec),
         }
     }
@@ -220,7 +222,7 @@ impl Pipeline {
         // and the gyro bias still need the inertial init before IMU prediction
         // can run; the solve there keeps scale fixed at 1.
         self.state.mode = if self.imu_t_bc.is_some() {
-            self.imu_init_start_kf_idx = Some(curr_idx);
+            self.inertial_init_start_kf_idx = Some(curr_idx);
             SystemMode::ImuInit
         } else {
             SystemMode::Tracking
@@ -397,10 +399,10 @@ impl Pipeline {
 
         self.state.current_keyframe_idx = Some(curr_idx);
         self.state.last_keyframe_idx = Some(curr_idx);
-        // IMU init needs the camera-to-body extrinsic to relate IMU deltas
+        // Inertial init needs the camera-to-body extrinsic to relate IMU deltas
         // to camera poses; without it, run visual-only as before.
         self.state.mode = if self.imu_t_bc.is_some() {
-            self.imu_init_start_kf_idx = Some(curr_idx);
+            self.inertial_init_start_kf_idx = Some(curr_idx);
             SystemMode::ImuInit
         } else {
             SystemMode::Tracking
@@ -553,24 +555,28 @@ impl Pipeline {
         (pred_cam_to_world.inverse(), v_j)
     }
 
-    fn imu_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
+    fn inertial_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
         let result = self.tracking_step(frame, timestamp_sec);
 
         if result.status == TrackingStatus::KeyframeAccepted
-            && self.imu_init.ready(&self.map, self.imu_init_start_kf_idx)
+            && self
+                .inertial_init
+                .ready(&self.map, self.inertial_init_start_kf_idx)
         {
-            let Some(start_idx) = self.imu_init_start_kf_idx else {
+            let Some(start_idx) = self.inertial_init_start_kf_idx else {
                 return result;
             };
-            match self
-                .imu_init
-                .try_initialize(&self.map, self.imu_t_bc, self.imu_bias, start_idx)
-            {
+            match self.inertial_init.try_initialize(
+                &self.map,
+                self.imu_t_bc,
+                self.imu_bias,
+                start_idx,
+            ) {
                 Some(init) => {
                     let scale = init.scale;
                     let gravity = init.gravity_world;
                     let bg = init.bias.gyro;
-                    self.imu_init.apply_initialization(
+                    self.inertial_init.apply_initialization(
                         &mut self.map,
                         &mut self.state,
                         &mut self.imu_bias,
@@ -638,15 +644,12 @@ impl Pipeline {
                 self.state.pose_world_to_cam = estimate.pose;
 
                 if self.state.imu_initialized {
-                    // Refresh the body velocity from the visually corrected
-                    // poses (body centers, not camera centers: they differ by
-                    // the rotating T_BC lever arm).
-                    let body_before = self.body_to_world(&pose_before).translation;
-                    let body_after = self.body_to_world(&estimate.pose).translation;
-                    let dt = timestamp_sec - prev_timestamp;
-                    if dt > 1e-6 {
-                        self.state.velocity_world = (body_after - body_before) / dt;
-                    }
+                    // velocity_world was already updated by IMU preintegration
+                    // (predict_pose_imu → pred_vel) before PnP ran. Don't
+                    // overwrite it with a visual finite-difference: at 30 fps
+                    // the inter-frame displacement is noise-dominated during
+                    // low-translation segments, which collapses velocity to
+                    // zero and permanently freezes the IMU pose prediction.
                 } else {
                     self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
                 }
@@ -795,6 +798,7 @@ impl Pipeline {
             .collect();
 
         let enable_local_ba = self.enable_local_ba;
+        let imu_initialized = self.state.imu_initialized;
         let match_config = self.two_view_init_config.match_config;
         let triangulation_config = self.two_view_init_config.triangulation_config.clone();
 
@@ -837,7 +841,11 @@ impl Pipeline {
         self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
 
         if enable_local_ba {
-            self.map.run_local_ba(&self.camera);
+            if imu_initialized {
+                self.map.run_local_inertial_ba(&self.camera);
+            } else {
+                self.map.run_local_ba(&self.camera);
+            }
             if let Some(newest_kf) = self.map.keyframes().last() {
                 self.state.pose_world_to_cam = newest_kf.frame.pose_world_to_cam;
             }

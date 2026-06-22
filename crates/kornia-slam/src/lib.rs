@@ -1,5 +1,7 @@
 //! Visual odometry and SLAM building blocks for kornia-rs.
 
+pub mod ba_schur;
+pub mod vi_ba_schur;
 pub mod estimation;
 pub mod frame;
 pub mod map;

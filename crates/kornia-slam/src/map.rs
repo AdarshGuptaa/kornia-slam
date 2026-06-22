@@ -1095,6 +1095,144 @@ impl Map {
             self.update_map_point_geometry(global_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
         }
     }
+
+    pub fn run_local_inertial_ba(&mut self, camera: &PinholeCamera) {
+        use crate::vi_ba_schur::{ImuEdge, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust};
+
+        const MAX_ACTIVE_KFS: usize = 3;
+        const MIN_OBSERVATIONS: usize = 8;
+
+        let n_kfs = self.keyframes.len();
+        if n_kfs < 2 {
+            return;
+        }
+
+        let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+
+        let mut mp_set: HashSet<usize> = HashSet::new();
+        for kf in &self.keyframes[active_start..] {
+            for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+                if let Some(mp) = self.map_points.get(*mp_idx)
+                    && !mp.culled
+                {
+                    mp_set.insert(*mp_idx);
+                }
+            }
+        }
+        if mp_set.is_empty() {
+            return;
+        }
+
+        let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
+        mp_global_indices.sort_unstable();
+
+        let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| (global, local))
+            .collect();
+
+        let points: Vec<Vec3F64> = mp_global_indices
+            .iter()
+            .map(|&idx| self.map_points[idx].position)
+            .collect();
+
+        // Build VI-BA keyframes (all KFs; fixed flag controls which are optimised).
+        let vi_keyframes: Vec<ViBaKeyframe> = self
+            .keyframes
+            .iter()
+            .enumerate()
+            .map(|(kf_idx, kf)| ViBaKeyframe {
+                pose: kf.frame.pose_world_to_cam,
+                velocity: kf.velocity_world,
+                bias: kf.imu_bias,
+                fixed: kf_idx < active_start,
+            })
+            .collect();
+
+        let mut observations = Vec::new();
+        for (kf_idx, kf) in self.keyframes.iter().enumerate() {
+            let is_fixed = kf_idx < active_start;
+            for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
+                if let Some(mp_idx) = mp_opt {
+                    let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
+                        continue;
+                    };
+                    if let Some(p) = kf.frame.undistorted_xy(desc_idx, camera) {
+                        let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
+                        observations.push(BaObservation {
+                            pose_idx: kf_idx,
+                            point_idx,
+                            pixel: p,
+                            fixed_pose: is_fixed,
+                            fixed_point: false,
+                            depth_meas,
+                            depth_sigma,
+                        });
+                    }
+                }
+            }
+        }
+
+        if observations.len() < MIN_OBSERVATIONS {
+            return;
+        }
+
+        // Map global frame.idx → local keyframe slot (0..n_kfs).
+        let frame_idx_to_slot: HashMap<usize, usize> = self
+            .keyframes
+            .iter()
+            .enumerate()
+            .map(|(slot, kf)| (kf.frame.idx, slot))
+            .collect();
+
+        // Build IMU edges; include only edges where at least one endpoint is active.
+        let imu_edges: Vec<ImuEdge> = self
+            .imu_factors
+            .iter()
+            .filter_map(|f| {
+                let from = *frame_idx_to_slot.get(&f.prev_kf_idx)?;
+                let to = *frame_idx_to_slot.get(&f.curr_kf_idx)?;
+                if from < active_start && to < active_start {
+                    return None;
+                }
+                Some(ImuEdge {
+                    from_idx: from,
+                    to_idx: to,
+                    preintegrated: f.preintegrated.clone(),
+                })
+            })
+            .collect();
+
+        let vi_result = match visual_inertial_bundle_adjust(
+            &vi_keyframes,
+            &points,
+            &observations,
+            &imu_edges,
+            camera,
+            &ViBaParams::default(),
+        ) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        // Write back optimised poses, velocities, and biases for active keyframes.
+        for kf_idx in active_start..n_kfs {
+            let vi_kf = &vi_result.keyframes[kf_idx];
+            self.keyframes[kf_idx].frame.pose_world_to_cam = vi_kf.pose;
+            self.keyframes[kf_idx].velocity_world = vi_kf.velocity;
+            self.keyframes[kf_idx].imu_bias = vi_kf.bias;
+        }
+
+        for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
+            if let Some(mp) = self.map_points.get_mut(global_idx) {
+                mp.position = vi_result.points[local_idx];
+            }
+        }
+        for &global_idx in &mp_global_indices {
+            self.update_map_point_geometry(global_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        }
+    }
 }
 
 /// Depth measurement + sigma for a BA observation at `desc_idx` of `kf`.
