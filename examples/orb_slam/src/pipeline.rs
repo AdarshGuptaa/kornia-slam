@@ -762,6 +762,13 @@ impl Pipeline {
             depth: frame.depth.clone(),
             keypoints_undist: frame.keypoints_undist.clone(),
         });
+        // Seed the new keyframe with the IMU-propagated velocity and current bias
+        // estimate so that VI-BA starts from a reasonable linearisation point rather
+        // than zero, which would produce huge residuals on the newest IMU edge.
+        if self.state.imu_initialized {
+            curr_kf.velocity_world = self.state.velocity_world;
+            curr_kf.imu_bias = self.imu_bias;
+        }
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
             self.map.register_observation(mp_idx, &curr_kf, curr_idx);
@@ -842,12 +849,18 @@ impl Pipeline {
 
         if enable_local_ba {
             if imu_initialized {
-                self.map.run_local_inertial_ba(&self.camera);
+                self.map.run_local_inertial_ba(&self.camera, self.imu_t_bc, self.gravity_world);
             } else {
                 self.map.run_local_ba(&self.camera);
             }
             if let Some(newest_kf) = self.map.keyframes().last() {
                 self.state.pose_world_to_cam = newest_kf.frame.pose_world_to_cam;
+                // Pull BA-corrected velocity and bias back so the next keyframe is
+                // seeded from the post-BA state, not the stale pre-BA propagation.
+                if imu_initialized {
+                    self.state.velocity_world = newest_kf.velocity_world;
+                    self.imu_bias = newest_kf.imu_bias;
+                }
             }
         }
 

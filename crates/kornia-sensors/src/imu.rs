@@ -196,11 +196,12 @@ impl PreintegratedImu {
             [Mat3F64::ZERO, dr_half_dt2],
         ]);
 
-        // N is the 6×6 diagonal noise covariance:
-        //   N = diag(σ_gyro², σ_accel²)
-        // Following ORB-SLAM3 convention where σ is the discrete noise per measurement.
-        let ng = self.calib.gyro_noise * self.calib.gyro_noise;
-        let na = self.calib.accel_noise * self.calib.accel_noise;
+        // N is the 6×6 discrete-time noise covariance per sample.
+        // σ_gyro and σ_accel are continuous-time spectral densities [units/√Hz].
+        // Discrete variance per sample = σ²_continuous / dt (PSD × sampling rate).
+        // With B already carrying dt factors: B·(σ²/dt)·Bᵀ = correct σ²·dt covariance growth.
+        let ng = self.calib.gyro_noise * self.calib.gyro_noise / dt;
+        let na = self.calib.accel_noise * self.calib.accel_noise / dt;
         let n = diag_6x6(ng, na);
 
         // C' = A·C·Aᵀ + B·N·Bᵀ
@@ -214,12 +215,11 @@ impl PreintegratedImu {
 
         self.covariance = mat9_add(&acat, &bnbt);
 
-        // Bias covariance: grows each step (random walk).
-        // The bias itself doesn't change (we assume it's constant during integration),
-        // but our uncertainty about it grows because it could be drifting.
-        // Following ORB-SLAM3 convention: add σ² per step.
-        let bg_var = self.calib.gyro_bias_noise * self.calib.gyro_bias_noise;
-        let ba_var = self.calib.accel_bias_noise * self.calib.accel_bias_noise;
+        // Bias random-walk covariance: each step adds σ_rw² · dt (continuous PSD × step size).
+        // σ_gyro_bias_noise and σ_accel_bias_noise are in [units/s/√Hz]; their squared product
+        // with dt gives the variance of the bias increment Δβ ~ N(0, σ_rw²·dt) per step.
+        let bg_var = self.calib.gyro_bias_noise * self.calib.gyro_bias_noise * dt;
+        let ba_var = self.calib.accel_bias_noise * self.calib.accel_bias_noise * dt;
         for i in 0..3 {
             self.bias_covariance[i + i * 6] += bg_var;
         }

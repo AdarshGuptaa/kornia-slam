@@ -10,3 +10,5 @@ kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" 
 kornia-image = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-sensors = { path = "../kornia-sensors" }
+faer = "0.22"
+thiserror = "1"

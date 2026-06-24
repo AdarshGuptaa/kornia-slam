@@ -120,15 +120,32 @@ pub struct ViBaParams {
     pub cost_tolerance: f64,
     /// Gravity vector in world frame, e.g. [0, 0, -9.81].
     pub gravity: Vec3F64,
+    /// Camera-to-body (IMU) extrinsic: `X_body = T_BC * X_cam`.
+    /// `None` means camera frame == body frame (identity T_BC).
+    pub imu_t_bc: Option<Pose3d>,
+    /// Global scale applied to every IMU information matrix.
+    /// Use 1.0 normally; lower (e.g. 0.01) to debug without IMU dominance.
+    pub imu_weight: f64,
+    /// Chi-square threshold for Huber robustification of IMU nav residuals
+    /// (9-DOF: rotation + velocity + position). Edges with chi2 > this value
+    /// are down-weighted by sqrt(huber_imu_chi2 / chi2). The 9-DOF chi-square
+    /// at 95 % confidence is 16.92. At sensor-noise level the nav chi2 is
+    /// typically ~10–15, so the Huber kernel is inactive once converged
+    /// (weight = 1.0, full metric constraint) but strongly suppresses the
+    /// large residuals that arise from rough post-init velocity estimates.
+    pub huber_imu_chi2: f64,
 }
 
 impl Default for ViBaParams {
     fn default() -> Self {
         Self {
             max_iterations: 20,
-            initial_lambda: 1e-4,
+            initial_lambda: 1.0,
             cost_tolerance: 1e-6,
-            gravity: Vec3F64::new(0.0, 0.0, -9.81),
+            gravity: Vec3F64::new(0.0, 9.81, 0.0), // OpenCV Y-down: gravity = +Y
+            imu_t_bc: None,
+            imu_weight: 1.0,
+            huber_imu_chi2: 16.9, // 9-DOF chi-square at 95 %
         }
     }
 }
@@ -286,6 +303,32 @@ fn residual_and_jacobians(
 
     (r, j_pose, j_point)
 }
+/// Converts a camera-frame world-to-cam pose to body-frame world-to-body rotation and
+/// world-frame body position, applying the camera-to-body extrinsic T_BC when provided.
+///
+/// Returns `(R_bw, twb)` where `R_bw` maps world vectors into the body frame and
+/// `twb` is the body origin in world coordinates.
+fn body_frame(cam_pose: &Pose3d, t_bc: Option<&Pose3d>) -> (Mat3F64, Vec3F64) {
+    let r_cw = &cam_pose.rotation;
+    let t_cw = &cam_pose.translation;
+    match t_bc {
+        None => {
+            let twb = -(Mat3F64(*r_cw.transpose()) * *t_cw);
+            (*r_cw, twb)
+        }
+        Some(t_bc) => {
+            let r_bc = &t_bc.rotation;
+            // T_bw = T_bc · T_cw:  R_bw = R_bc · R_cw
+            let r_bw = mat3_mul(r_bc, r_cw);
+            // t_bw = R_bc · t_cw + t_bc
+            let t_bw = *r_bc * *t_cw + t_bc.translation;
+            // twb = -R_bw^T · t_bw
+            let twb = -(Mat3F64(*r_bw.transpose()) * t_bw);
+            (r_bw, twb)
+        }
+    }
+}
+
 /// Computes the 15-DOF IMU residual and its Jacobians wrt the two keyframe states.
 ///
 /// Returns:
@@ -300,44 +343,46 @@ fn imu_residual_and_jacobians(
     kf_j: &ViBaKeyframe,
     pim: &PreintegratedImu,
     gravity: &Vec3F64,
+    imu_t_bc: Option<&Pose3d>,
 ) -> ([f64; 15], [f64; 225], [f64; 225]) {
     let dt = pim.dt;
 
-    // Extracting state
-    let r_i = &kf_i.pose.rotation;  // world <- body
-    let p_i = &kf_i.pose.translation;
+    // kf.pose = T_cw (world→cam). IMU dynamics live in the body frame.
+    // If T_BC is provided (X_body = T_BC · X_cam):
+    //   T_bw = T_bc · T_cw  →  R_bw = R_bc · R_cw,  t_bw = R_bc · t_cw + t_bc
+    // Otherwise camera == body and R_bw = R_cw.
+    // World-frame body position: twb = -R_bw^T · t_bw.
+    //
+    // Key property: right-SE3 perturbation of T_cw = same right-SE3 perturbation
+    // of T_bw (since T_bc is fixed), so Jacobian column layout is unchanged.
+    let (r_bw_i, twb_i) = body_frame(&kf_i.pose, imu_t_bc);
+    let (r_bw_j, twb_j) = body_frame(&kf_j.pose, imu_t_bc);
+    let r_wb_j = Mat3F64(*r_bw_j.transpose()); // R_wb_j = R_bw_j^T (body→world rotation at j)
+
     let v_i = &kf_i.velocity;
-    let bg_i = &kf_i.bias.gyro;
-    let ba_i = &kf_i.bias.accel;
-
-    let r_j = &kf_j.pose.rotation;
-    let p_j = &kf_j.pose.translation;
     let v_j = &kf_j.velocity;
-    let bg_j = &kf_j.bias.gyro;
-    let ba_j = &kf_j.bias.accel;
 
-    // First Order bias corrections
+    // Bias-corrected preintegrated measurements.
     let dr_corrected = pim.delta_rotation_with_bias(&kf_i.bias);
     let dv_corrected = pim.delta_velocity_with_bias(&kf_i.bias);
     let dp_corrected = pim.delta_position_with_bias(&kf_i.bias);
 
-    // Rotation Residuals r_R = Log(ΔR^T · R_i^T · R_j)
-    let r_i_t = Mat3F64(*r_i.transpose());
+    // r_R = Log(ΔR^T · R_bw_i · R_bw_j^T)
     let dr_t = Mat3F64(*dr_corrected.transpose());
-    let lhs_r = Mat3F64(dr_t.mul_mat3(&r_i_t.mul_mat3(r_j)));
+    let lhs_r = Mat3F64(dr_t.mul_mat3(&mat3_mul(&r_bw_i, &r_wb_j)));
     let r_rot = SO3F64::from_matrix(&lhs_r).log();
 
-    // Velocity Residuals r_v = R_i^T·(v_j - v_i - g·dt) - Δv
+    // r_v = R_bw_i · (v_j - v_i - g·dt) - Δv
     let dv_world = *v_j - *v_i - *gravity * dt;
-    let r_vel = r_i_t * dv_world - dv_corrected;
+    let r_vel = r_bw_i * dv_world - dv_corrected;
 
-    // Position Residuals r_p = R_i^T·(p_j - p_i - v_i·dt - ½g·dt²) - Δp
-    let dp_world = *p_j - *p_i - *v_i * dt - *gravity * (0.5 * dt * dt);
-    let r_pos = r_i_t * dp_world - dp_corrected;
+    // r_p = R_bw_i · (twb_j - twb_i - v_i·dt - ½g·dt²) - Δp
+    let dp_world = twb_j - twb_i - *v_i * dt - *gravity * (0.5 * dt * dt);
+    let r_pos = r_bw_i * dp_world - dp_corrected;
 
-    // Bias random-walk residuals
-    let r_bg = *bg_j - *bg_i;
-    let r_ba = *ba_j - *ba_i;
+    // Bias random-walk residuals.
+    let r_bg = kf_j.bias.gyro - kf_i.bias.gyro;
+    let r_ba = kf_j.bias.accel - kf_i.bias.accel;
 
     let mut residual = [0.0f64; 15];
     residual[0..3].copy_from_slice(&[r_rot.x, r_rot.y, r_rot.z]);
@@ -346,83 +391,61 @@ fn imu_residual_and_jacobians(
     residual[9..12].copy_from_slice(&[r_bg.x, r_bg.y, r_bg.z]);
     residual[12..15].copy_from_slice(&[r_ba.x, r_ba.y, r_ba.z]);
 
-
-
     // Jacobians
-    // State layout: [ω(3) | ρ(3) | v(3) | bg(3) | ba(3)]  ← note ω first
-    // to match the Lie group convention; map to your [ρ|ω] layout at end.
-    // J_i is 15×15, J_j is 15×15, all zeros initially.
+    // State layout: [upsilon(0-2) | ω(3-5) | v(6-8) | bg(9-11) | ba(12-14)]
+    // Right-SE3 perturbation: T_cw_new = T_cw · Exp([upsilon, ω])
+    //   R_cw_new ≈ R_cw · (I + [ω]×)
+    //   twb_new  ≈ twb - upsilon + [twb]× · ω
+    // Velocity / bias DOFs: additive.
 
     let mut j_i = [0.0f64; 225];
     let mut j_j = [0.0f64; 225];
 
-    let r_it_mat = r_i_t; // R_i^T
-    let dp_hat = SO3F64::hat(dp_world); // skew symmetric matrix
-    let dv_hat = SO3F64::hat(dv_world);
-
     let jr_inv = SO3F64::right_jacobian(r_rot).inverse();
 
-    // ∂r_R / ∂ω_i = -J_r^{-1} · R_j^T · R_i
-    // (perturbation of R_i via right-multiply exp(δω))
-    let r_j_t = Mat3F64(*r_j.transpose());
-    let neg_jr_inv_rjt_ri = mat3_neg(mat3_mul(&jr_inv, &mat3_mul(&r_j_t, r_i)));
-    set_block_15x15(&mut j_i, 0, 0, &neg_jr_inv_rjt_ri);
+    // ── rotation residual ────────────────────────────────────────────────
+    // ∂r_R/∂ω_i = +J_r^{-1} · R_bw_j
+    let jr_inv_rbwj = mat3_mul(&jr_inv, &r_bw_j);
+    set_block_15x15(&mut j_i, 0, 3, &jr_inv_rbwj);
 
-    // ∂r_R / ∂bg_i = -J_r^{-1} · ΔR^T_corrected · J_r(ΔR) · ∂ΔR/∂bg
-    // From Forster eq 9d: ∂r_R/∂bg_i = -J_r^{-1} · (ΔR_corrected)^{-T} · Jr · d_R_d_bg
-    let d_r_bg = &pim.d_rotation_d_bias_gyro;
-    let neg_jr_inv_dr_bg = mat3_neg(mat3_mul(&jr_inv, d_r_bg));
-    set_block_15x15(&mut j_i, 0, 9, &neg_jr_inv_dr_bg);
+    // ∂r_R/∂bg_i = -J_r^{-1} · eR^T · JRg  (eR = ΔR^T · R_bw_i · R_wb_j = lhs_r)
+    let er_t = Mat3F64(*lhs_r.transpose());
+    set_block_15x15(&mut j_i, 0, 9, &mat3_neg(mat3_mul(&mat3_mul(&jr_inv, &er_t), &pim.d_rotation_d_bias_gyro)));
 
-    // ∂r_R / ∂ω_j = J_r^{-1}
-    set_block_15x15(&mut j_j, 0, 0, &jr_inv);
+    // ∂r_R/∂ω_j = -J_r^{-1} · R_bw_j
+    set_block_15x15(&mut j_j, 0, 3, &mat3_neg(jr_inv_rbwj));
 
-    // ∂r_v / ∂ω_i = R_i^T · [v_j - v_i - g·dt]×
-    let dr_vel_domega_i = mat3_mul(&r_it_mat, &dv_hat);
-    set_block_15x15(&mut j_i, 3, 0, &dr_vel_domega_i);
+    // ── velocity residual ────────────────────────────────────────────────
+    // ∂r_v/∂ω_i = -R_bw_i · [dv_world]×
+    set_block_15x15(&mut j_i, 3, 3, &mat3_neg(mat3_mul(&r_bw_i, &SO3F64::hat(dv_world))));
 
-    // ∂r_v / ∂v_i = -R_i^T
-    let neg_ri_t = mat3_neg(r_it_mat);
-    set_block_15x15(&mut j_i, 3, 3, &neg_ri_t);
+    let neg_r_bw_i = mat3_neg(r_bw_i);
+    set_block_15x15(&mut j_i, 3, 6, &neg_r_bw_i);                              // ∂r_v/∂v_i = -R_bw_i
+    set_block_15x15(&mut j_i, 3, 9,  &mat3_neg(pim.d_velocity_d_bias_gyro));   // ∂r_v/∂bg_i
+    set_block_15x15(&mut j_i, 3, 12, &mat3_neg(pim.d_velocity_d_bias_accel));  // ∂r_v/∂ba_i
+    set_block_15x15(&mut j_j, 3, 6, &r_bw_i);                                  // ∂r_v/∂v_j = +R_bw_i
 
-    // ∂r_v / ∂bg_i = -∂Δv/∂bg
-    let neg_dv_dba = mat3_neg(pim.d_velocity_d_bias_accel);
-    set_block_15x15(&mut j_i, 3, 12, &neg_dv_dba);
+    // ── position residual ────────────────────────────────────────────────
+    // Under upsilon_i: twb_i shifts by -upsilon → r_p gains R_bw_i · upsilon
+    set_block_15x15(&mut j_i, 6, 0, &r_bw_i);                                  // ∂r_p/∂ρ_i = +R_bw_i
 
-    let neg_dv_dbg = mat3_neg(pim.d_velocity_d_bias_gyro);
-    set_block_15x15(&mut j_i, 3, 9, &neg_dv_dbg);
+    // Under ω_i: R_bw_i rotates and twb_i shifts. Combined: -R_bw_i · [twb_j - v_i·dt - ½g·dt²]×
+    let dp_omega_world = twb_j - *v_i * dt - *gravity * (0.5 * dt * dt);
+    set_block_15x15(&mut j_i, 6, 3, &mat3_neg(mat3_mul(&r_bw_i, &SO3F64::hat(dp_omega_world))));
 
-    // ∂r_v / ∂v_j = R_i^T
-    set_block_15x15(&mut j_j, 3, 3, &r_it_mat);
+    set_block_15x15(&mut j_i, 6, 6, &mat3_scalar_f64(&r_bw_i, -dt));          // ∂r_p/∂v_i = -R_bw_i·dt
+    set_block_15x15(&mut j_i, 6, 9,  &mat3_neg(pim.d_position_d_bias_gyro));  // ∂r_p/∂bg_i
+    set_block_15x15(&mut j_i, 6, 12, &mat3_neg(pim.d_position_d_bias_accel)); // ∂r_p/∂ba_i
 
-    // ∂r_p / ∂ω_i = R_i^T · [p_j - p_i - v_i·dt - ½g·dt²]×
-    let dr_pos_domega_i = mat3_mul(&r_it_mat, &dp_hat);
-    set_block_15x15(&mut j_i, 6, 0, &dr_pos_domega_i);
+    // Under upsilon_j: twb_j shifts by -upsilon → r_p loses R_bw_i · upsilon
+    set_block_15x15(&mut j_j, 6, 0, &neg_r_bw_i);                             // ∂r_p/∂ρ_j = -R_bw_i
 
-    // ∂r_p / ∂v_i = -R_i^T · dt
-    let neg_ri_t_dt = mat3_scalar_f64(&r_it_mat, -dt);
-    set_block_15x15(&mut j_i, 6, 3, &neg_ri_t_dt);
+    // Under ω_j: twb_j_new = twb_j + [twb_j]× · ω → r_p gains R_bw_i · [twb_j]× · ω
+    set_block_15x15(&mut j_j, 6, 3, &mat3_mul(&r_bw_i, &SO3F64::hat(twb_j))); // ∂r_p/∂ω_j
 
-    // ∂r_p / ∂bg_i = -∂Δp/∂bg
-    let neg_dp_dbg = mat3_neg(pim.d_position_d_bias_gyro);
-    set_block_15x15(&mut j_i, 6, 9, &neg_dp_dbg);
-
-    // ∂r_p / ∂ba_i = -∂Δp/∂ba
-    let neg_dp_dba = mat3_neg(pim.d_position_d_bias_accel);
-    set_block_15x15(&mut j_i, 6, 12, &neg_dp_dba);
-
-    // ── ∂r_p / ∂ω_j = 0, ∂r_p / ∂v_j = 0 (no coupling via position) ───
-    // ∂r_p / ∂t_j — wait, p_j IS the translation of pose_j, so:
-    // ∂r_p / ∂ρ_j (translation part) = R_i^T
-    // This goes in cols 3-5 of j_j (ρ = [upsilon|omega], upsilon cols 3-5)
-    // NOTE: adjust col offset to match your [ρ|ω] = [upsilon(3)|omega(3)] layout
-    set_block_15x15(&mut j_j, 6, 3, &r_it_mat); // ∂r_p/∂p_j = R_i^T (via translation)
-
-    // ── ∂r_bg / ∂bg_i = -I, ∂r_bg / ∂bg_j = +I ─────────────────────────
+    // ── bias random-walk residuals ───────────────────────────────────────
     set_block_15x15(&mut j_i, 9, 9, &mat3_neg(Mat3F64::IDENTITY));
     set_block_15x15(&mut j_j, 9, 9, &Mat3F64::IDENTITY);
-
-    // ── ∂r_ba / ∂ba_i = -I, ∂r_ba / ∂ba_j = +I ─────────────────────────
     set_block_15x15(&mut j_i, 12, 12, &mat3_neg(Mat3F64::IDENTITY));
     set_block_15x15(&mut j_j, 12, 12, &Mat3F64::IDENTITY);
 
@@ -469,23 +492,108 @@ fn accum_jt_omega_j(
     }
 }
 
+/// Huber weight for one IMU edge based on the 9-dim nav residual's Mahalanobis distance.
+///
+/// chi2_nav = r_nav^T · Ω_nav · r_nav  (rows/cols 0–8 of the 15-dim system).
+/// Returns 1.0 when chi2_nav ≤ threshold (inlier), sqrt(threshold / chi2_nav) otherwise.
+/// The caller multiplies the full 15×15 omega by this weight before accumulating.
+fn huber_imu_weight(res: &[f64; 15], omega: &[f64; 225], chi2_threshold: f64) -> f64 {
+    // omega is 15×15 column-major: element (row r, col c) at index c*15+r.
+    let mut chi2 = 0.0f64;
+    for i in 0..9 {
+        for j in 0..9 {
+            chi2 += res[i] * omega[j * 15 + i] * res[j];
+        }
+    }
+    if chi2 <= chi2_threshold || chi2 < 1e-12 {
+        1.0
+    } else {
+        (chi2_threshold / chi2).sqrt()
+    }
+}
+
 /// Diagonal information matrix from preintegrated IMU covariances.
 /// Uses diagonal approximation (off-diagonal terms ignored).
 /// Replace with full 15×15 inversion once FD tests pass.
-fn imu_information_matrix(pim: &PreintegratedImu) -> [f64; 225] {
+fn imu_information_matrix(pim: &PreintegratedImu, weight: f64) -> [f64; 225] {
     let mut omega = [0.0f64; 225];
-    // Nav block (9×9) from pim.covariance (column-major [f64;81]).
-    // Diagonal of column-major: element [i,i] is at index i + i*9.
-    for i in 0..9 {
-        let var = pim.covariance[i + i*9];
-        omega[i*15+i] = if var > 1e-20 { 1.0/var } else { 1e6 };
+
+    // Full 9×9 nav block inverse (pim.covariance is column-major).
+    // Diagonal-only inversion is incorrect because preintegration correlates
+    // rotation, velocity, and position errors (gyro drives all three; accel
+    // drives velocity and position).
+    if let Some(nav_inv) = invert_9x9_f64(&pim.covariance) {
+        for c in 0..9 {
+            for r in 0..9 {
+                omega[c * 15 + r] = weight * nav_inv[c * 9 + r];
+            }
+        }
+    } else {
+        // Degenerate covariance — fall back to diagonal with a log warning.
+        eprintln!("[vi_ba] WARNING: 9×9 IMU covariance singular, using diagonal fallback");
+        for i in 0..9 {
+            let var = pim.covariance[i * 10]; // diagonal: col-major index i*9+i
+            omega[i * 15 + i] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
+        }
     }
-    // Bias block (6×6) from pim.bias_covariance (column-major [f64;36]).
+
+    // Bias random-walk block (6×6): uncorrelated, diagonal is exact.
     for i in 0..6 {
-        let var = pim.bias_covariance[i + i*6];
-        omega[(9+i)*15+(9+i)] = if var > 1e-20 { 1.0/var } else { 1e6 };
+        let var = pim.bias_covariance[i * 7]; // diagonal: col-major index i*6+i
+        omega[(9 + i) * 15 + (9 + i)] = weight * if var > 1e-20 { 1.0 / var } else { 1e6 };
     }
     omega
+}
+
+/// Invert a column-major 9×9 matrix via Gauss-Jordan elimination with partial pivoting.
+fn invert_9x9_f64(cm: &[f64; 81]) -> Option<[f64; 81]> {
+    // Work in row-major internally.
+    let mut a = [0.0f64; 81];
+    let mut inv = [0.0f64; 81];
+    for r in 0..9 {
+        for c in 0..9 {
+            a[r * 9 + c] = cm[c * 9 + r]; // column-major → row-major
+        }
+        inv[r * 9 + r] = 1.0;
+    }
+    for col in 0..9 {
+        let mut max_val = a[col * 9 + col].abs();
+        let mut max_row = col;
+        for row in col + 1..9 {
+            let v = a[row * 9 + col].abs();
+            if v > max_val { max_val = v; max_row = row; }
+        }
+        if max_val < 1e-20 { return None; }
+        if max_row != col {
+            for c in 0..9 {
+                a.swap(col * 9 + c, max_row * 9 + c);
+                inv.swap(col * 9 + c, max_row * 9 + c);
+            }
+        }
+        let pivot = a[col * 9 + col];
+        for c in 0..9 {
+            a[col * 9 + c] /= pivot;
+            inv[col * 9 + c] /= pivot;
+        }
+        for row in 0..9 {
+            if row == col { continue; }
+            let factor = a[row * 9 + col];
+            for c in 0..9 {
+                let da = a[col * 9 + c];
+                let di = inv[col * 9 + c];
+                a[row * 9 + c] -= factor * da;
+                inv[row * 9 + c] -= factor * di;
+            }
+        }
+    }
+    // Row-major result → column-major output.
+    let mut result = [0.0f64; 81];
+    for r in 0..9 {
+        for c in 0..9 {
+            result[c * 9 + r] = inv[r * 9 + c];
+        }
+    }
+    Some(result)
 }
 
 /// f64 version of invert_3x3 (the existing one uses f32).
@@ -1511,6 +1619,8 @@ pub fn bundle_adjust_schur_with_priors(
 
         for _iter in 0..params.max_iterations {
             iters_done += 1;
+            let is_first_iter = iters_done == 1;
+
             // ── 1. Schur blocks for visual residuals ─────────────────────────
             // These are exactly the a_blocks / c_blocks / b_by_point / g_pose /
             // g_point from bundle_adjust_schur_with_priors, but a_blocks are
@@ -1650,9 +1760,35 @@ pub fn bundle_adjust_schur_with_priors(
 
                 let (res, ji, jj) = imu_residual_and_jacobians(
                     &kfs[i], &kfs[j], &edge.preintegrated, &params.gravity,
+                    params.imu_t_bc.as_ref(),
                 );
 
-                let omega = imu_information_matrix(&edge.preintegrated);
+                let omega_raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+                // Huber robustification: down-weight edges whose nav-block Mahalanobis
+                // chi2 exceeds the threshold. This handles large residuals from rough
+                // post-init velocity estimates without a fixed weight compromise.
+                let hw = huber_imu_weight(&res, &omega_raw, params.huber_imu_chi2);
+                let omega: [f64; 225] = {
+                    let mut o = omega_raw;
+                    for x in o.iter_mut() { *x *= hw; }
+                    o
+                };
+
+                if is_first_iter {
+                    let nr = (res[0]*res[0]+res[1]*res[1]+res[2]*res[2]).sqrt();
+                    let nv = (res[3]*res[3]+res[4]*res[4]+res[5]*res[5]).sqrt();
+                    let np = (res[6]*res[6]+res[7]*res[7]+res[8]*res[8]).sqrt();
+                    let nbg = (res[9]*res[9]+res[10]*res[10]+res[11]*res[11]).sqrt();
+                    let nba = (res[12]*res[12]+res[13]*res[13]+res[14]*res[14]).sqrt();
+                    let om_min = omega_raw.iter().cloned().filter(|&x| x > 0.0).fold(f64::MAX, f64::min);
+                    let om_max = omega_raw.iter().cloned().fold(f64::MIN, f64::max);
+                    eprintln!(
+                        "[vi_ba] edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
+                         |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
+                         Ω∈[{om_min:.2e},{om_max:.2e}]  hw={hw:.4}",
+                        edge.preintegrated.dt,
+                    );
+                }
 
                 // Cost: ½ rᵀ Ω r.
                 let mut omega_r = [0.0f64; 15];
@@ -1794,11 +1930,15 @@ pub fn bundle_adjust_schur_with_priors(
                 if kf_local[i] < 0 && kf_local[j] < 0 { continue; }
                 let (res, _, _) = imu_residual_and_jacobians(
                     &kfs_trial[i], &kfs_trial[j], &edge.preintegrated, &params.gravity,
+                    params.imu_t_bc.as_ref(),
                 );
-                let omega = imu_information_matrix(&edge.preintegrated);
+                let omega_raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+                let hw = huber_imu_weight(&res, &omega_raw, params.huber_imu_chi2);
                 let mut omega_r = [0.0f64; 15];
-                for r in 0..15 { for k in 0..15 { omega_r[r] += omega[r*15+k]*res[k]; }}
-                for k in 0..15 { new_cost_imu += 0.5 * res[k] * omega_r[k]; }
+                for r in 0..15 {
+                    for k in 0..15 { omega_r[r] += omega_raw[r*15+k]*res[k]; }
+                }
+                for k in 0..15 { new_cost_imu += 0.5 * hw * res[k] * omega_r[k]; }
             }
             let new_cost = (new_cost_vis + new_cost_imu) as f32;
 
@@ -1818,6 +1958,28 @@ pub fn bundle_adjust_schur_with_priors(
                 lambda *= 10.0;
                 if lambda > 1e10 { break; }
             }
+        }
+
+        // ── Post-convergence residual diagnostic ──────────────────────────────
+        for edge in imu_edges {
+            let i = edge.from_idx;
+            let j = edge.to_idx;
+            if kf_local[i] < 0 && kf_local[j] < 0 { continue; }
+            let (res, _, _) = imu_residual_and_jacobians(
+                &kfs[i], &kfs[j], &edge.preintegrated, &params.gravity,
+                params.imu_t_bc.as_ref(),
+            );
+            let nr = (res[0]*res[0]+res[1]*res[1]+res[2]*res[2]).sqrt();
+            let nv = (res[3]*res[3]+res[4]*res[4]+res[5]*res[5]).sqrt();
+            let np = (res[6]*res[6]+res[7]*res[7]+res[8]*res[8]).sqrt();
+            let nbg = (res[9]*res[9]+res[10]*res[10]+res[11]*res[11]).sqrt();
+            let nba = (res[12]*res[12]+res[13]*res[13]+res[14]*res[14]).sqrt();
+            eprintln!(
+                "[vi_ba] FINAL edge {i}→{j}  dt={:.3}s  |r_R|={nr:.4e}  |r_v|={nv:.4e}  \
+                 |r_p|={np:.4e}  |r_bg|={nbg:.4e}  |r_ba|={nba:.4e}  \
+                 (iters={iters_done} conv={converged})",
+                edge.preintegrated.dt,
+            );
         }
 
          // ── Pack output ───────────────────────────────────────────────────────

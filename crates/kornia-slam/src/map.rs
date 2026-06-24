@@ -1096,7 +1096,12 @@ impl Map {
         }
     }
 
-    pub fn run_local_inertial_ba(&mut self, camera: &PinholeCamera) {
+    pub fn run_local_inertial_ba(
+        &mut self,
+        camera: &PinholeCamera,
+        imu_t_bc: Option<Pose3d>,
+        gravity_world: Vec3F64,
+    ) {
         use crate::vi_ba_schur::{ImuEdge, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust};
 
         const MAX_ACTIVE_KFS: usize = 3;
@@ -1210,7 +1215,7 @@ impl Map {
             &observations,
             &imu_edges,
             camera,
-            &ViBaParams::default(),
+            &ViBaParams { imu_t_bc, gravity: gravity_world, ..ViBaParams::default() },
         ) {
             Ok(r) => r,
             Err(_) => return,
