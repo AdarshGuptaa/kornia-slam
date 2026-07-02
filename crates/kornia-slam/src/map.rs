@@ -1209,13 +1209,26 @@ impl Map {
             })
             .collect();
 
+        // 15-DOF-per-keyframe state (pose+velocity+bias) with information
+        // entries spanning many more orders of magnitude than the pure
+        // visual 6-DOF problem (see the Marquardt-damping note in
+        // visual_inertial_bundle_adjust) converges more slowly to the same
+        // strict cost_tolerance: over half of non-converged calls were
+        // hitting the default max_iterations=20 cap while still making
+        // small, steady progress (final residuals *smaller* than many calls
+        // that did converge), not diverging. Give it more room.
         let vi_result = match visual_inertial_bundle_adjust(
             &vi_keyframes,
             &points,
             &observations,
             &imu_edges,
             camera,
-            &ViBaParams { imu_t_bc, gravity: gravity_world, ..ViBaParams::default() },
+            &ViBaParams {
+                imu_t_bc,
+                gravity: gravity_world,
+                max_iterations: 50,
+                ..ViBaParams::default()
+            },
         ) {
             Ok(r) => r,
             Err(_) => return,

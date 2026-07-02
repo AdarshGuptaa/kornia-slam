@@ -585,6 +585,7 @@ impl Pipeline {
                         start_idx,
                     );
                     self.state.mode = SystemMode::Tracking;
+                    self.state.imu_init_timestamp_sec = Some(timestamp_sec);
                     self.dbg(format!(
                         "[imu_init] accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
                          gyro_bias=({:.4},{:.4},{:.4})",
@@ -630,6 +631,22 @@ impl Pipeline {
                 .unwrap_or(pose_before)
         };
 
+        // Widen the search/PnP-prior gates in proportion to how long we've
+        // already been failing to track: a pose predicted by compounding
+        // IMU/constant-velocity integration over several seconds of loss
+        // carries far more uncertainty than a single-frame prediction, and
+        // the narrow gates sized for the latter would otherwise starve PnP
+        // of correspondences for the entire recently-lost grace period,
+        // making a longer grace period actively counterproductive.
+        const SEARCH_WIDEN_PER_SEC: f32 = 1.0;
+        const MAX_SEARCH_SCALE: f32 = 4.0;
+        let currently_lost_for = self
+            .state
+            .lost_since_sec
+            .map_or(0.0, |t0| timestamp_sec - t0);
+        let search_scale =
+            (1.0 + currently_lost_for as f32 * SEARCH_WIDEN_PER_SEC).min(MAX_SEARCH_SCALE);
+
         let result = self.estimator.estimate_pose(
             &frame,
             &candidate_pose,
@@ -637,6 +654,7 @@ impl Pipeline {
             &self.map,
             &self.camera,
             self.state.current_keyframe_idx,
+            search_scale,
         );
 
         let (mut status, matches, tracked_inliers, reject_reason) = match result {
@@ -661,7 +679,18 @@ impl Pipeline {
                     None,
                 )
             }
-            Err(reason) => (TrackingStatus::Skipped, Vec::new(), 0, Some(reason)),
+            Err(reason) => {
+                // Carry the predicted pose forward instead of freezing at
+                // pose_before. state.velocity_world was already advanced by
+                // predict_pose_imu above regardless of visual outcome, so
+                // anchoring the next frame's prediction on a stale position
+                // would desync position/rotation from velocity: every
+                // subsequent frame's candidate pose would drift further from
+                // reality, making the projection search miss again and
+                // compounding a single bad frame into a full tracking loss.
+                self.state.pose_world_to_cam = candidate_pose;
+                (TrackingStatus::Skipped, Vec::new(), 0, Some(reason))
+            }
         };
         if self.debug {
             let msg = match reject_reason {
@@ -699,13 +728,50 @@ impl Pipeline {
         }
 
         if status == TrackingStatus::Skipped {
-            self.state.consecutive_failures += 1;
-            if self.state.consecutive_failures >= self.state.max_consecutive_failures {
+            // Recently-lost grace period (mirrors ORB-SLAM3's RECENTLY_LOST
+            // vs LOST distinction), bridging brief interruptions (motion
+            // blur, a few dropped/occluded frames) without throwing the map
+            // away. Deliberately short, unlike ORB-SLAM3's ~5s: our PnP has
+            // no RANSAC/robust loss, so the projection search and the PnP
+            // prior-reprojection gate both key off the same predicted pose.
+            // Once genuinely lost (not a brief blip), that pose keeps
+            // compounding IMU/constant-velocity drift every extra frame we
+            // wait, which does not improve recovery odds (verified against
+            // EuRoC V101 frames ~600-770, a sustained-loss segment: granting
+            // several seconds of patience there only delayed the same
+            // eventual reset, it never let tracking resume early). A map
+            // that's too young, or an inertial state that hasn't settled
+            // yet, gets no grace at all.
+            const MIN_KEYFRAMES_FOR_GRACE: usize = 10;
+            const RECENTLY_LOST_TIMEOUT_IMU_SEC: f64 = 1.0;
+            const RECENTLY_LOST_TIMEOUT_VISUAL_SEC: f64 = 0.5;
+            const MIN_IMU_CONFIDENCE_SEC: f64 = 2.0;
+
+            let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
+            let recently_lost_for = timestamp_sec - lost_since;
+
+            let imu_confident = self.state.imu_initialized
+                && self
+                    .state
+                    .imu_init_timestamp_sec
+                    .is_some_and(|t0| timestamp_sec - t0 >= MIN_IMU_CONFIDENCE_SEC);
+            let grace_period_sec = if imu_confident {
+                RECENTLY_LOST_TIMEOUT_IMU_SEC
+            } else {
+                RECENTLY_LOST_TIMEOUT_VISUAL_SEC
+            };
+            let map_established = self.map.keyframes().len() > MIN_KEYFRAMES_FOR_GRACE;
+
+            if !map_established || recently_lost_for >= grace_period_sec {
+                self.dbg(format!(
+                    "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
+                    frame.idx, recently_lost_for, map_established,
+                ));
                 self.state.reset();
                 return self.bootstrap_step(frame, timestamp_sec);
             }
         } else {
-            self.state.consecutive_failures = 0;
+            self.state.lost_since_sec = None;
         }
         self.state.last_frame_timestamp_sec = timestamp_sec;
         // Samples older than the last keyframe can't enter any future window

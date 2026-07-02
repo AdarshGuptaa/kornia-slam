@@ -303,6 +303,59 @@ fn residual_and_jacobians(
 
     (r, j_pose, j_point)
 }
+/// Depth (stereo Z) residual and Jacobian, in f64, w.r.t. pose (SE3 tangent
+/// `[ρ|ω]`) and world point. Mirrors the rotation-row-2 algebra in
+/// [`residual_and_jacobians`] (see there for the `S = -R·skew(p_w)`
+/// derivation) applied to the scalar predicted-depth observation
+/// `BaObservation::depth_meas` carries for stereo keyframes.
+///
+/// `visual_inertial_bundle_adjust` previously ignored `depth_meas` entirely
+/// (unlike the plain-visual [`bundle_adjust_schur_with_priors`], which
+/// honours it), so stereo+IMU local BA had nothing anchoring absolute scale
+/// beyond the IMU factor's gravity magnitude in a 3-keyframe window — while
+/// stereo-only BA (which does use this term) stayed scale-consistent. That
+/// asymmetry is the reason stereo+IMU accumulated ~25% scale drift where
+/// stereo-only and mono+IMU (which never had depth to anchor with anyway)
+/// did not.
+fn depth_residual_and_jacobian(
+    pose: &SE3F32,
+    point_w: &Vec3F64,
+    d_meas: f64,
+    sigma: f64,
+) -> (f64, [f64; 6], [f64; 3]) {
+    let pw = Vec3AF32::new(point_w.x as f32, point_w.y as f32, point_w.z as f32);
+    let pc = *pose * pw;
+    let z_pred = if pc.z.abs() < MIN_Z {
+        if pc.z >= 0.0 { MIN_Z } else { -MIN_Z }
+    } else {
+        pc.z
+    } as f64;
+
+    let inv_sigma = 1.0 / sigma;
+    let r_z = (z_pred - d_meas) * inv_sigma;
+
+    let rm = pose.r.matrix();
+    let r20 = rm.col(0).z as f64;
+    let r21 = rm.col(1).z as f64;
+    let r22 = rm.col(2).z as f64;
+    let (px, py, pz) = (point_w.x, point_w.y, point_w.z);
+    // Row 2 of S = -R · skew(p_w).
+    let s20 = -pz * r21 + py * r22;
+    let s21 = pz * r20 - px * r22;
+    let s22 = -py * r20 + px * r21;
+
+    let j_pose = [
+        0.0,
+        0.0,
+        inv_sigma,
+        s20 * inv_sigma,
+        s21 * inv_sigma,
+        s22 * inv_sigma,
+    ];
+    let j_point = [r20 * inv_sigma, r21 * inv_sigma, r22 * inv_sigma];
+    (r_z, j_pose, j_point)
+}
+
 /// Converts a camera-frame world-to-cam pose to body-frame world-to-body rotation and
 /// world-frame body position, applying the camera-to-body extrinsic T_BC when provided.
 ///
@@ -1689,6 +1742,40 @@ pub fn bundle_adjust_schur_with_priors(
                     b_by_point[xli as usize].push((pli as usize, b));
                 }
 
+                // Depth residual (stereo metric anchor) — see
+                // depth_residual_and_jacobian for why this matters here.
+                if let Some(d_meas) = obs.depth_meas {
+                    let sigma = (obs.depth_sigma as f64).max(1e-6);
+                    let (r_z, jpd, jxd) =
+                        depth_residual_and_jacobian(pose, point, d_meas as f64, sigma);
+                    cost_vis += 0.5 * r_z * r_z;
+
+                    if pli >= 0 {
+                        let p = pli as usize;
+                        let ab = &mut a_blocks[p];
+                        for i in 0..6 { for k in 0..6 {
+                            ab[i*6+k] += jpd[i]*jpd[k];
+                        }}
+                        let gp = &mut g_pose[p];
+                        for i in 0..6 { gp[i] -= jpd[i]*r_z; }
+                    }
+                    if xli >= 0 {
+                        let x = xli as usize;
+                        let cb = &mut c_blocks[x];
+                        for i in 0..3 { for k in 0..3 {
+                            cb[i*3+k] += jxd[i]*jxd[k];
+                        }}
+                        let gx = &mut g_point[x];
+                        for i in 0..3 { gx[i] -= jxd[i]*r_z; }
+                    }
+                    if pli >= 0 && xli >= 0 {
+                        let mut b = [0.0f64; 18];
+                        for i in 0..6 { for k in 0..3 {
+                            b[i*3+k] += jpd[i]*jxd[k];
+                        }}
+                        b_by_point[xli as usize].push((pli as usize, b));
+                    }
+                }
             }
 
             // ── 2. Invert C blocks, build Schur-reduced system ───────────────
@@ -1823,10 +1910,26 @@ pub fn bundle_adjust_schur_with_priors(
             let cost = (cost_vis + cost_imu) as f32;
 
             // ── 4. LM damping on full 15P system, then Cholesky ──────────────
-            // Damping goes on AFTER IMU terms so all 15 diagonal entries are
-            // regularised uniformly. Do NOT damp a_blocks separately.
+            // Damping goes on AFTER IMU terms so every diagonal entry sees it.
+            // Scale it by each diagonal's own magnitude (the classic Marquardt
+            // variant) rather than adding a bare `lambda`: this system mixes
+            // pixel-space visual curvature (~1e2-1e4) with IMU information
+            // entries spanning several more orders of magnitude — bias blocks
+            // in particular land around ~1e9-1e10 here, since
+            // imu_information_matrix inverts a bias-random-walk covariance
+            // that's tiny over a single ~0.1-0.4s keyframe interval. A fixed
+            // additive lambda is negligible next to a ~1e9 diagonal but can
+            // dominate a ~1e2 one, so no single value can regularize both
+            // regimes — this was leaving every VI-BA call unable to converge
+            // within the iteration budget (observed 0/2319 conv=true across a
+            // full EuRoC run). Scaling by the diagonal itself keeps damping
+            // proportionate regardless of a DOF's native units; the floor
+            // guards DOFs an untouched free keyframe leaves at exactly zero
+            // (e.g. velocity/bias when it has no IMU edge in this window).
+            const MIN_DAMPING_FLOOR: f64 = 1e-6;
             for d in 0..dim {
-                m_mat[(d, d)] += lambda;
+                let diag = m_mat[(d, d)].max(MIN_DAMPING_FLOOR);
+                m_mat[(d, d)] += lambda * diag;
             }
 
             // Symmetrize (should already be symmetric to roundoff).
@@ -1922,6 +2025,14 @@ pub fn bundle_adjust_schur_with_priors(
                     &se3s_trial[obs.pose_idx], &xyz_trial[obs.point_idx], obs.pixel, camera,
                 );
                 new_cost_vis += 0.5 * (r_f32[0]*r_f32[0] + r_f32[1]*r_f32[1]) as f64;
+
+                if let Some(d_meas) = obs.depth_meas {
+                    let sigma = (obs.depth_sigma as f64).max(1e-6);
+                    let (r_z, _, _) = depth_residual_and_jacobian(
+                        &se3s_trial[obs.pose_idx], &xyz_trial[obs.point_idx], d_meas as f64, sigma,
+                    );
+                    new_cost_vis += 0.5 * r_z * r_z;
+                }
             }
             let mut new_cost_imu = 0.0f64;
             for edge in imu_edges {

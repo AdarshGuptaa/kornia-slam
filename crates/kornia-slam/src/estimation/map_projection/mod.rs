@@ -129,6 +129,17 @@ impl MapProjectionEstimator {
     }
 
     /// Estimate the pose of `frame` against the map.
+    ///
+    /// `search_scale` widens the projection search radius and the PnP prior
+    /// reprojection gate by this factor (1.0 = normal). The caller should
+    /// grow it with time-since-last-successful-track: a pose predicted by
+    /// compounding IMU/constant-velocity integration over a multi-second
+    /// tracking loss carries much more uncertainty than a single-frame
+    /// prediction, and the fixed narrow gates below are sized for the
+    /// latter. Without this, `solve_pnp`'s coarse prior-reprojection filter
+    /// collapses to near-zero correspondences as the prior drifts, so a
+    /// longer recently-lost grace period only delays giving up without
+    /// improving the odds of recovery.
     pub fn estimate_pose(
         &self,
         frame: &Frame,
@@ -137,6 +148,7 @@ impl MapProjectionEstimator {
         map: &Map,
         camera: &PinholeCamera,
         current_keyframe_idx: Option<usize>,
+        search_scale: f32,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
 
@@ -147,8 +159,14 @@ impl MapProjectionEstimator {
         let current_kf = current_keyframe_idx.and_then(|ki| map.get_keyframe(ki));
         let local_indices = map.build_local_map_point_indices(&[], current_kf);
 
-        let (projection_matches, curr_keypoints_undist, grid) =
-            self.match_map_to_frame(map, &local_indices, frame, candidate_pose, camera);
+        let (projection_matches, curr_keypoints_undist, grid) = self.match_map_to_frame(
+            map,
+            &local_indices,
+            frame,
+            candidate_pose,
+            camera,
+            search_scale,
+        );
 
         // Shared logic: try_track → refine_pose → Estimate, or propagate rejection.
         let try_track_and_refine = |correspondences: Vec<(usize, usize)>,
@@ -161,6 +179,7 @@ impl MapProjectionEstimator {
                     &curr_keypoints_undist,
                     camera,
                     pose_init,
+                    search_scale,
                 )
                 .ok_or(MapProjectionRejectReason::PnpFailed)?;
             if inliers < pnp.min_inliers_early {
@@ -178,6 +197,7 @@ impl MapProjectionEstimator {
                 frame.image_size,
                 camera,
                 &pose,
+                search_scale,
             ) {
                 matches = local.matches;
                 if local.inliers >= self.config.pnp.min_inliers {
@@ -249,6 +269,7 @@ impl MapProjectionEstimator {
         image_size: ImageSize,
         camera: &PinholeCamera,
         pose_init: &Pose3d,
+        search_scale: f32,
     ) -> Option<Estimate> {
         let current_kf = current_kf_idx.and_then(|ki| map.get_keyframe(ki));
         let local_indices = map.build_local_map_point_indices(tracked_matches, current_kf);
@@ -257,6 +278,10 @@ impl MapProjectionEstimator {
             return None;
         }
 
+        let local_config = ProjectionMatchConfig {
+            search_radius: self.config.local_projection.search_radius * search_scale,
+            ..self.config.local_projection
+        };
         let global_matches = self.match_by_projection(
             map.map_points(),
             &local_indices,
@@ -267,7 +292,7 @@ impl MapProjectionEstimator {
             camera,
             pose_init,
             image_size,
-            self.config.local_projection,
+            local_config,
         );
         if global_matches.len() < min_corr {
             return None;
@@ -279,6 +304,7 @@ impl MapProjectionEstimator {
             curr_keypoints_undist,
             camera,
             pose_init,
+            search_scale,
         )?;
         Some(Estimate {
             pose: new_pose,
@@ -288,6 +314,11 @@ impl MapProjectionEstimator {
     }
 
     /// Gather 3D-2D correspondences from map points and keypoints, then solve PnP.
+    ///
+    /// `search_scale` widens the coarse prior-reprojection gate (see
+    /// [`Self::estimate_pose`]) so a drifted `pose_init` doesn't starve the
+    /// LM solve of correspondences; the tight final-inlier threshold that
+    /// actually accepts the solution is unaffected.
     fn solve_pnp(
         &self,
         map_points: &[MapPoint],
@@ -295,6 +326,7 @@ impl MapProjectionEstimator {
         keypoints_undist: &[[f32; 2]],
         camera: &PinholeCamera,
         pose_init: &Pose3d,
+        search_scale: f32,
     ) -> Option<(Pose3d, usize)> {
         let mut points_world = Vec::with_capacity(correspondences.len());
         let mut points_image = Vec::with_capacity(correspondences.len());
@@ -304,13 +336,16 @@ impl MapProjectionEstimator {
                 points_image.push(Vec2F32::new(kp[0], kp[1]));
             }
         }
-        pnp::solve_pnp(
-            &points_world,
-            &points_image,
-            camera,
-            pose_init,
-            &self.config.pnp,
-        )
+        let pnp_config = if search_scale > 1.0 {
+            PnpConfig {
+                prior_reproj_threshold_px: self.config.pnp.prior_reproj_threshold_px
+                    * search_scale as f64,
+                ..self.config.pnp.clone()
+            }
+        } else {
+            self.config.pnp.clone()
+        };
+        pnp::solve_pnp(&points_world, &points_image, camera, pose_init, &pnp_config)
     }
 
     /// Undistorts keypoints, builds a spatial grid, and runs projection matching
@@ -322,6 +357,7 @@ impl MapProjectionEstimator {
         frame: &Frame,
         pose: &Pose3d,
         camera: &PinholeCamera,
+        search_scale: f32,
     ) -> (Vec<(usize, usize)>, Vec<[f32; 2]>, KeypointGrid) {
         const KEYPOINT_GRID_CELL_SIZE: f32 = 64.0;
         const MIN_MATCHES_BEFORE_WIDE: usize = 20;
@@ -351,7 +387,10 @@ impl MapProjectionEstimator {
             KEYPOINT_GRID_CELL_SIZE,
         );
 
-        let config = self.config.projection;
+        let config = ProjectionMatchConfig {
+            search_radius: self.config.projection.search_radius * search_scale,
+            ..self.config.projection
+        };
         let mut matches = self.match_by_projection(
             map.map_points(),
             candidates,
