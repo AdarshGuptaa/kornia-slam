@@ -1011,6 +1011,9 @@ impl Pipeline {
                 if imu_initialized {
                     self.state.velocity_world = newest_kf.velocity_world;
                     self.imu_bias = newest_kf.imu_bias;
+                    println!("kf accel bias: {:3}, {:3}, {:3}", self.imu_bias.accel.x, self.imu_bias.accel.y, self.imu_bias.accel.z);
+                    println!("kf gyro bias: {:3}, {:3}, {:3}", self.imu_bias.gyro.x, self.imu_bias.gyro.y, self.imu_bias.gyro.z);
+
                 }
             }
         }

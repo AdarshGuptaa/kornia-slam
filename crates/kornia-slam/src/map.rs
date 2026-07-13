@@ -1104,7 +1104,7 @@ impl Map {
     ) {
         use crate::vi_ba_schur::{ImuEdge, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust};
 
-        const MAX_ACTIVE_KFS: usize = 3;
+        const MAX_ACTIVE_KFS: usize = 6;
         const MIN_OBSERVATIONS: usize = 8;
 
         let n_kfs = self.keyframes.len();

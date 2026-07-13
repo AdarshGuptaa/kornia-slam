@@ -134,6 +134,28 @@ pub struct ViBaParams {
     /// (weight = 1.0, full metric constraint) but strongly suppresses the
     /// large residuals that arise from rough post-init velocity estimates.
     pub huber_imu_chi2: f64,
+    /// Scale applied to the IMU edge whose "from" endpoint is a permanently-fixed
+    /// keyframe (the one boundary edge linking the active window to the frozen
+    /// past). Full-strength coupling to a value that can never be corrected again
+    /// lets local estimation noise/systematic error accumulate directionally
+    /// across successive windows. ORB-SLAM3 applies the same 1e-2 downweight to
+    /// this edge (`Optimizer::LocalInertialBA`, "to avoid accumulating error due
+    /// to fixing variables").
+    pub boundary_imu_info_scale: f64,
+    /// Information weight (1/sigma²) of a zero-mean Gaussian prior pulling each
+    /// free keyframe's accel bias toward zero, applied every iteration
+    /// independent of Huber down-weighting (unlike the IMU-edge terms, this
+    /// unary factor is never scaled by `huber_imu_weight`, so it stays a solid
+    /// floor even in windows where a large nav residual would otherwise
+    /// suppress the bias-random-walk constraint too).
+    ///
+    /// A single IMU edge cannot distinguish a constant accel-bias offset from
+    /// a gravity-magnitude/direction error, since gravity is held fixed for
+    /// the duration of this call (only corrected periodically elsewhere).
+    /// Without this prior, a windowed local BA has nowhere else to put
+    /// leftover gravity error and will explain it away as bias — set to 0.0
+    /// to disable and reproduce the old behaviour.
+    pub accel_bias_prior_weight: f64,
 }
 
 impl Default for ViBaParams {
@@ -146,6 +168,15 @@ impl Default for ViBaParams {
             imu_t_bc: None,
             imu_weight: 1.0,
             huber_imu_chi2: 16.9, // 9-DOF chi-square at 95 %
+            boundary_imu_info_scale: 1e-2,
+            // sigma = 0.1 m/s²: comfortably above real MEMS accel-bias
+            // magnitude, so it's a floor that only bites once the
+            // bias-random-walk edges have been Huber-suppressed or a value
+            // is drifting well past a physically plausible range — not a
+            // constraint that fights legitimate, well-observed bias updates
+            // (those edges carry ~1e9 information when nav residuals are
+            // healthy, per the LM-damping note below).
+            accel_bias_prior_weight: 1e2,
         }
     }
 }
@@ -1850,7 +1881,13 @@ pub fn visual_inertial_bundle_adjust(
                 params.imu_t_bc.as_ref(),
             );
 
-            let omega_raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+            let mut omega_raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+            // Boundary edge (from a permanently-fixed KF into the active window):
+            // downweight so this window's estimate can't accumulate error onto a
+            // value that will never be revisited. See `boundary_imu_info_scale` doc.
+            if li < 0 && lj >= 0 {
+                for x in omega_raw.iter_mut() { *x *= params.boundary_imu_info_scale; }
+            }
             // Huber robustification: down-weight edges whose nav-block Mahalanobis
             // chi2 exceeds the threshold. This handles large residuals from rough
             // post-init velocity estimates without a fixed weight compromise.
@@ -1907,7 +1944,27 @@ pub fn visual_inertial_bundle_adjust(
             }
         }
 
-        let cost = (cost_vis + cost_imu) as f32;
+        // ── 3b. Accel-bias magnitude prior (unary, per free keyframe) ────────
+        // See ViBaParams::accel_bias_prior_weight doc. Deliberately not scaled
+        // by any Huber weight — this is the one bias regularizer that must
+        // hold even when nav residuals are bad.
+        let mut cost_bias_prior = 0.0f64;
+        if params.accel_bias_prior_weight > 0.0 {
+            let w = params.accel_bias_prior_weight;
+            for (i, kf) in kfs.iter().enumerate() {
+                let li = kf_local[i];
+                if li < 0 { continue; }
+                let base = li as usize * KF_DOF;
+                let ba = [kf.bias.accel.x, kf.bias.accel.y, kf.bias.accel.z];
+                for d in 0..3 {
+                    m_mat[(base + 12 + d, base + 12 + d)] += w;
+                    m_vec[base + 12 + d] -= w * ba[d];
+                    cost_bias_prior += 0.5 * w * ba[d] * ba[d];
+                }
+            }
+        }
+
+        let cost = (cost_vis + cost_imu + cost_bias_prior) as f32;
 
         // ── 4. LM damping on full 15P system, then Cholesky ──────────────
         // Damping goes on AFTER IMU terms so every diagonal entry sees it.
@@ -2043,7 +2100,10 @@ pub fn visual_inertial_bundle_adjust(
                 &kfs_trial[i], &kfs_trial[j], &edge.preintegrated, &params.gravity,
                 params.imu_t_bc.as_ref(),
             );
-            let omega_raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+            let mut omega_raw = imu_information_matrix(&edge.preintegrated, params.imu_weight);
+            if kf_local[i] < 0 && kf_local[j] >= 0 {
+                for x in omega_raw.iter_mut() { *x *= params.boundary_imu_info_scale; }
+            }
             let hw = huber_imu_weight(&res, &omega_raw, params.huber_imu_chi2);
             let mut omega_r = [0.0f64; 15];
             for r in 0..15 {
@@ -2051,7 +2111,16 @@ pub fn visual_inertial_bundle_adjust(
             }
             for k in 0..15 { new_cost_imu += 0.5 * hw * res[k] * omega_r[k]; }
         }
-        let new_cost = (new_cost_vis + new_cost_imu) as f32;
+        let mut new_cost_bias_prior = 0.0f64;
+        if params.accel_bias_prior_weight > 0.0 {
+            let w = params.accel_bias_prior_weight;
+            for (i, kf) in kfs_trial.iter().enumerate() {
+                if kf_local[i] < 0 { continue; }
+                let ba = &kf.bias.accel;
+                new_cost_bias_prior += 0.5 * w * (ba.x*ba.x + ba.y*ba.y + ba.z*ba.z);
+            }
+        }
+        let new_cost = (new_cost_vis + new_cost_imu + new_cost_bias_prior) as f32;
 
         // ── 8. LM accept / reject ─────────────────────────────────────────
         if new_cost < cost {
