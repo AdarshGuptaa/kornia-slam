@@ -413,9 +413,9 @@ impl Pipeline {
         }
 
         if let Some(prev_ts) = self.bootstrap_timestamp_sec {
-            let preint = self.preintegrate_window(prev_ts, timestamp_sec);
+            let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_factor(prev_idx, curr_idx, preint);
+                self.map.add_imu_factor(prev_idx, curr_idx, preint, raw_samples, prev_ts, timestamp_sec);
             }
             self.prune_imu_before(timestamp_sec);
         }
@@ -513,36 +513,20 @@ impl Pipeline {
     /// them: the same samples serve both per-frame pose prediction and the
     /// keyframe-to-keyframe edges. [`Self::prune_imu_before`] discards samples
     /// once no future window can need them.
-    fn preintegrate_window(&self, t0: f64, t1: f64) -> PreintegratedImu {
-        let mut pre = PreintegratedImu::new(self.imu_bias, self.imu_calib);
-
-        let mut samples: Vec<&ImuMeasurement> = self
+    /// Preintegrates over `[t0, t1]` and also returns the raw samples used,
+    /// so the caller can hand them to `Map::add_imu_factor` for later
+    /// repropagation (see `PreintegratedImu::from_measurements` doc) — once
+    /// this returns, `prune_imu_before` is free to drop them from
+    /// `self.pending_imu`, since the edge now carries its own copy.
+    fn preintegrate_window(&self, t0: f64, t1: f64) -> (PreintegratedImu, Vec<ImuMeasurement>) {
+        let samples: Vec<ImuMeasurement> = self
             .pending_imu
             .iter()
             .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
+            .copied()
             .collect();
-        samples.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
-
-        if samples.is_empty() {
-            return pre;
-        }
-
-        let mut last_t = t0;
-        for sample in &samples {
-            let dt = sample.timestamp - last_t;
-            if dt > 0.0 {
-                pre.integrate(sample, dt);
-                last_t = sample.timestamp;
-            }
-        }
-
-        if last_t < t1
-            && let Some(last_sample) = samples.last()
-        {
-            pre.integrate(last_sample, t1 - last_t);
-        }
-
-        pre
+        let pre = PreintegratedImu::from_measurements(self.imu_bias, self.imu_calib, &samples, t0, t1);
+        (pre, samples)
     }
 
     /// Drops buffered IMU samples strictly older than `t` (typically the last
@@ -692,7 +676,7 @@ impl Pipeline {
         let prev_timestamp = self.state.last_frame_timestamp_sec;
 
         let candidate_pose = if self.state.imu_initialized && prev_timestamp > 0.0 {
-            let preint = self.preintegrate_window(prev_timestamp, timestamp_sec);
+            let (preint, _) = self.preintegrate_window(prev_timestamp, timestamp_sec);
             if preint.dt > 0.0 {
                 let (pred_pose, pred_vel) = self.predict_pose_imu(
                     pose_before,
@@ -981,9 +965,9 @@ impl Pipeline {
             self.state.last_keyframe_idx,
             self.last_keyframe_timestamp_sec,
         ) {
-            let preint = self.preintegrate_window(prev_ts, timestamp_sec);
+            let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_factor(prev_kf_idx, frame.idx, preint);
+                self.map.add_imu_factor(prev_kf_idx, frame.idx, preint, raw_samples, prev_ts, timestamp_sec);
             }
         }
 

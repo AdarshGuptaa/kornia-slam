@@ -105,6 +105,54 @@ impl PreintegratedImu {
         }
     }
 
+    /// Builds a preintegrated factor from raw measurements covering `[t0, t1]`,
+    /// linearized fresh at `bias` — i.e. full re-integration rather than the
+    /// first-order `delta_*_with_bias` correction.
+    ///
+    /// That correction is only valid for small `Δbias` from the bias this
+    /// factor was originally integrated at. A caller that keeps re-optimizing
+    /// the same edge across many windows while bias is still moving (e.g. a
+    /// sliding-window BA) needs to call this again once `Δbias` grows past a
+    /// few sensor-noise widths, or the correction itself becomes the dominant
+    /// source of residual — a purely numerical error that the optimizer can't
+    /// tell apart from real signal, so it keeps pushing bias to explain it.
+    pub fn from_measurements(
+        bias: ImuBias,
+        calib: ImuCalib,
+        samples: &[ImuMeasurement],
+        t0: f64,
+        t1: f64,
+    ) -> Self {
+        let mut pre = Self::new(bias, calib);
+
+        let mut sorted: Vec<&ImuMeasurement> = samples
+            .iter()
+            .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
+            .collect();
+        sorted.sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
+
+        if sorted.is_empty() {
+            return pre;
+        }
+
+        let mut last_t = t0;
+        for sample in &sorted {
+            let dt = sample.timestamp - last_t;
+            if dt > 0.0 {
+                pre.integrate(sample, dt);
+                last_t = sample.timestamp;
+            }
+        }
+
+        if last_t < t1
+            && let Some(last_sample) = sorted.last()
+        {
+            pre.integrate(last_sample, t1 - last_t);
+        }
+
+        pre
+    }
+
     /// ΔR re-expressed at a new bias estimate via the first-order correction
     /// `ΔR · Exp(∂ΔR/∂bg · δbg)`.
     pub fn delta_rotation_with_bias(&self, bias: &ImuBias) -> Mat3F64 {

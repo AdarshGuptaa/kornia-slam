@@ -1891,10 +1891,18 @@ pub fn visual_inertial_bundle_adjust(
             // Huber robustification: down-weight edges whose nav-block Mahalanobis
             // chi2 exceeds the threshold. This handles large residuals from rough
             // post-init velocity estimates without a fixed weight compromise.
+            //
+            // Only the nav 9×9 sub-block (rows/cols 0-8) is scaled by `hw` — the
+            // bias-random-walk 6×6 sub-block (rows/cols 9-14) is a separate,
+            // uncorrelated measurement (see `imu_information_matrix`) that ORB-SLAM3
+            // robustifies independently (EdgeInertial vs EdgeGyroRW/EdgeAccRW are
+            // distinct g2o edges). Scaling it by the *nav* residual's outlier-ness
+            // was silencing the one thing meant to resist a bad nav window explaining
+            // itself away through bias, in exactly the windows where that matters.
             let hw = huber_imu_weight(&res, &omega_raw, params.huber_imu_chi2);
             let omega: [f64; 225] = {
                 let mut o = omega_raw;
-                for x in o.iter_mut() { *x *= hw; }
+                for c in 0..9 { for r in 0..9 { o[c * 15 + r] *= hw; } }
                 o
             };
 
@@ -2105,11 +2113,23 @@ pub fn visual_inertial_bundle_adjust(
                 for x in omega_raw.iter_mut() { *x *= params.boundary_imu_info_scale; }
             }
             let hw = huber_imu_weight(&res, &omega_raw, params.huber_imu_chi2);
-            let mut omega_r = [0.0f64; 15];
-            for r in 0..15 {
-                for k in 0..15 { omega_r[r] += omega_raw[r*15+k]*res[k]; }
+            // Mirrors the block-split in the main Hessian build: `hw` only applies to
+            // the nav 9×9 sub-block, the bias-random-walk 6×6 sub-block stays at full
+            // weight. Kept as separate accumulators since `omega_raw` is block-diagonal
+            // (no nav/bias cross terms — see `imu_information_matrix`).
+            let mut omega_r_nav = [0.0f64; 9];
+            for r in 0..9 {
+                for k in 0..9 { omega_r_nav[r] += omega_raw[r*15+k]*res[k]; }
             }
-            for k in 0..15 { new_cost_imu += 0.5 * hw * res[k] * omega_r[k]; }
+            let mut nav_cost = 0.0f64;
+            for k in 0..9 { nav_cost += 0.5 * res[k] * omega_r_nav[k]; }
+            let mut omega_r_bias = [0.0f64; 6];
+            for r in 0..6 {
+                for k in 0..6 { omega_r_bias[r] += omega_raw[(9+r)*15+(9+k)]*res[9+k]; }
+            }
+            let mut bias_cost = 0.0f64;
+            for k in 0..6 { bias_cost += 0.5 * res[9+k] * omega_r_bias[k]; }
+            new_cost_imu += hw * nav_cost + bias_cost;
         }
         let mut new_cost_bias_prior = 0.0f64;
         if params.accel_bias_prior_weight > 0.0 {

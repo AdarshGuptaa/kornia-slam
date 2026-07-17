@@ -389,6 +389,17 @@ impl ImuInitializer {
         // used internally — do not reuse rwg_out assuming any other convention.
         let gravity_world = rwg_out * Vec3F64::new(0.0, 0.0, -GRAVITY_MAGNITUDE);
 
+        // NOTE: a hard gravity-misalignment gate was tried here and reverted.
+        // VIBA0's own bootstrap (the `!already_initialized` branch above) is a
+        // crude, unweighted-sum estimate that does NOT reliably converge with a
+        // larger window — on V101 it got *worse* the longer `ready()` retried it
+        // (23°  →  27° over the full sequence), because gating VIBA0 on
+        // misalignment prevents `state.imu_initialized` from ever becoming true,
+        // which starves VIBA1/VIBA2 (`refine_inertial_init`, gated on that same
+        // flag) of the chance to run at all. VIBA1/VIBA2 are what actually fix
+        // VIBA0's roughness — confirmed on the same V101 sequence pre-gate:
+        // VIBA0 23.0° → VIBA1 1.13° → VIBA2 0.78°, all within the first 15s of
+        // IMU time. Trust that chain; don't gate its entry point.
         println!(
             "[imu_init] accepted  scale={:.4}  gravity=({:.3},{:.3},{:.3})  bg=({:.5},{:.5},{:.5})  ba=({:.6},{:.6},{:.6})",
             scale_out, gravity_world.x, gravity_world.y, gravity_world.z, bg_out.x, bg_out.y, bg_out.z, ba_out.x, ba_out.y, ba_out.z,
@@ -1041,7 +1052,7 @@ mod tests{
                     t - kf_dt, t, imu_rate, gravity_true,
                     bias_gyro_true, bias_accel_true, calib,
                 );
-                map.add_imu_factor(k - 1, k, pim);
+                map.add_imu_factor(k - 1, k, pim, Vec::new(), t - kf_dt, t);
             }
         }
 
