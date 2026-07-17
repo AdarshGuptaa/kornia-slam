@@ -37,9 +37,9 @@
 //! gauge (motion-only BA). Robust kernels and full LM-with-backtracking
 //! are TODO.
 
-use faer::prelude::Solve;
 use faer::Mat;
-use kornia_algebra::{Mat3AF32, Mat3F64, Vec3AF32, Vec3F64, SE3F32, SO3F32};
+use faer::prelude::Solve;
+use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, Vec3AF32, Vec3F64};
 use thiserror::Error;
 
 use kornia_3d::ba::{BaError, BaObservation, BaParams, BaPosePrior, BaResult};
@@ -64,7 +64,6 @@ pub enum SchurBaError {
     Ba(#[from] BaError),
 }
 
-
 /// Errors specific to VI-BA.
 #[derive(Debug, Error)]
 pub enum ViBaError {
@@ -77,7 +76,6 @@ pub enum ViBaError {
     #[error(transparent)]
     Ba(#[from] BaError),
 }
-
 
 /// A single keyframe state for VI-BA.
 ///
@@ -108,7 +106,6 @@ pub struct ImuEdge {
     /// Preintegrated measurements between the two keyframes.
     pub preintegrated: PreintegratedImu,
 }
-
 
 /// Parameters for VI-BA.
 #[derive(Debug, Clone)]
@@ -212,11 +209,7 @@ fn residual_and_jacobians(
     let pw = Vec3AF32::new(point_w.x as f32, point_w.y as f32, point_w.z as f32);
     let pc = *pose * pw;
     let z = if pc.z.abs() < MIN_Z {
-        if pc.z >= 0.0 {
-            MIN_Z
-        } else {
-            -MIN_Z
-        }
+        if pc.z >= 0.0 { MIN_Z } else { -MIN_Z }
     } else {
         pc.z
     };
@@ -471,14 +464,14 @@ pub fn bundle_adjust_schur_with_priors(
     pose_priors: Option<&[Option<BaPosePrior>]>,
 ) -> Result<BaResult, SchurBaError> {
     // Validate prior slice length matches poses.
-    if let Some(pp) = pose_priors {
-        if pp.len() != poses.len() {
-            return Err(SchurBaError::Ba(BaError::InvalidInput(format!(
-                "pose_priors length {} != poses length {}",
-                pp.len(),
-                poses.len()
-            ))));
-        }
+    if let Some(pp) = pose_priors
+        && pp.len() != poses.len()
+    {
+        return Err(SchurBaError::Ba(BaError::InvalidInput(format!(
+            "pose_priors length {} != poses length {}",
+            pp.len(),
+            poses.len()
+        ))));
     }
     let p_total = poses.len();
     let n_total = points.len();
@@ -645,11 +638,7 @@ pub fn bundle_adjust_schur_with_priors(
                 let pw = Vec3AF32::new(point.x as f32, point.y as f32, point.z as f32);
                 let pc = *pose * pw;
                 let z_pred = if pc.z.abs() < MIN_Z {
-                    if pc.z >= 0.0 {
-                        MIN_Z
-                    } else {
-                        -MIN_Z
-                    }
+                    if pc.z >= 0.0 { MIN_Z } else { -MIN_Z }
                 } else {
                     pc.z
                 };
@@ -1062,11 +1051,7 @@ pub fn bundle_adjust_schur_with_priors(
                 let pw = Vec3AF32::new(point.x as f32, point.y as f32, point.z as f32);
                 let pc = *pose * pw;
                 let z_pred = if pc.z.abs() < MIN_Z {
-                    if pc.z >= 0.0 {
-                        MIN_Z
-                    } else {
-                        -MIN_Z
-                    }
+                    if pc.z >= 0.0 { MIN_Z } else { -MIN_Z }
                 } else {
                     pc.z
                 };

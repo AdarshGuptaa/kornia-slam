@@ -11,17 +11,16 @@ use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
 use kornia_algebra::{Mat3F64, Vec2F64, Vec3F64};
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
-use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
+use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
-    KeyframePolicy, SystemMode, SystemState, TrackingResult, TrackingStatus,
+    KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
+    TrackingStatus,
 };
-
-const GRAVITY_MAGNITUDE: f64 = 9.81;
 
 /// Top-level ORB-SLAM pipeline: orchestrates tracking, mapping, and state transitions.
 pub struct Pipeline {
@@ -33,6 +32,8 @@ pub struct Pipeline {
     two_view_init_config: TwoViewInitConfig,
     // Keyframe insertion policy
     keyframe_policy: KeyframePolicy,
+    // Recently-lost grace period policy
+    tracking_loss_recovery: TrackingLossRecoveryPolicy,
     // Enable local bundle adjustment after keyframe insertion
     enable_local_ba: bool,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
@@ -66,8 +67,9 @@ pub struct Pipeline {
     inertial_init_last_attempt_sec: Option<f64>,
     // Timestamp the current inertial-init window started (first keyframe at
     // or after `inertial_init_start_kf_idx`). Mirrors ORB-SLAM3's `mFirstTs`
-    // / `mTinit` — used to gate the VIBA1 (mTinit>5s) / VIBA2 (mTinit>15s)
-    // progressive refinement passes at LocalMapping.cc:200-228.
+    // / `mTinit` — used to gate the VIBA1/VIBA2 progressive visual-inertial
+    // BA refinement passes (mTinit>5s / mTinit>15s respectively, after the
+    // initial VIBA0 solve) at LocalMapping.cc:200-228.
     imu_init_window_start_sec: Option<f64>,
     // VIBA1/VIBA2 fire at most once each, mirroring
     // Map::GetIniertialBA1()/GetIniertialBA2() latching in ORB-SLAM3.
@@ -86,6 +88,7 @@ impl Pipeline {
             estimator: MapProjectionEstimator::new(config.map_projection),
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
+            tracking_loss_recovery: config.tracking_loss_recovery,
             enable_local_ba: config.enable_local_ba,
             stereo_close_depth: config.stereo_close_depth_m,
             debug: config.debug,
@@ -415,7 +418,14 @@ impl Pipeline {
         if let Some(prev_ts) = self.bootstrap_timestamp_sec {
             let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_factor(prev_idx, curr_idx, preint, raw_samples, prev_ts, timestamp_sec);
+                self.map.add_imu_factor(
+                    prev_idx,
+                    curr_idx,
+                    preint,
+                    raw_samples,
+                    prev_ts,
+                    timestamp_sec,
+                );
             }
             self.prune_imu_before(timestamp_sec);
         }
@@ -525,7 +535,8 @@ impl Pipeline {
             .filter(|m| m.timestamp >= t0 && m.timestamp <= t1)
             .copied()
             .collect();
-        let pre = PreintegratedImu::from_measurements(self.imu_bias, self.imu_calib, &samples, t0, t1);
+        let pre =
+            PreintegratedImu::from_measurements(self.imu_bias, self.imu_calib, &samples, t0, t1);
         (pre, samples)
     }
 
@@ -573,28 +584,42 @@ impl Pipeline {
     fn inertial_init_step(&mut self, frame: Frame, timestamp_sec: f64) -> TrackingResult {
         let result = self.tracking_step(frame, timestamp_sec);
 
-        if result.status == TrackingStatus::KeyframeAccepted {
-            if let Some(start_idx) = self.inertial_init_start_kf_idx {
-                let kfs: Vec<_> = self.map.keyframes().iter().filter(|kf| kf.frame.idx >= start_idx).collect();
-                let imu_time: f64 = self.map.imu_factors().iter()
-                    .filter(|f| f.curr_kf_idx >= start_idx)
-                    .map(|f| f.preintegrated.dt).sum();
-                let motion = if let (Some(first), Some(last)) = (kfs.first(), kfs.last()) {
-                    let t0 = first.frame.pose_world_to_cam.inverse().translation;
-                    let t1 = last.frame.pose_world_to_cam.inverse().translation;
-                    Some((t0, t1, (t1 - t0).length()))
-                } else {
-                    None
-                };
-                println!(
-                    "[imu_init_gate] start_idx={start_idx} first_idx={:?} last_idx={:?} kfs={}/{} imu_time={:.2}/{:.1}s motion={:?}",
-                    kfs.first().map(|kf| kf.frame.idx),
-                    kfs.last().map(|kf| kf.frame.idx),
-                    kfs.len(), self.inertial_init.config.min_keyframes,
-                    imu_time, self.inertial_init.config.min_time_sec,
-                    motion.map(|(t0, t1, d)| format!("t0={t0:?} t1={t1:?} dist={d:.4}/{:.2}", self.inertial_init.config.min_motion)),
-                );
-            }
+        if result.status == TrackingStatus::KeyframeAccepted
+            && let Some(start_idx) = self.inertial_init_start_kf_idx
+        {
+            let kfs: Vec<_> = self
+                .map
+                .keyframes()
+                .iter()
+                .filter(|kf| kf.frame.idx >= start_idx)
+                .collect();
+            let imu_time: f64 = self
+                .map
+                .imu_factors()
+                .iter()
+                .filter(|f| f.curr_kf_idx >= start_idx)
+                .map(|f| f.preintegrated.dt)
+                .sum();
+            let motion = if let (Some(first), Some(last)) = (kfs.first(), kfs.last()) {
+                let t0 = first.frame.pose_world_to_cam.inverse().translation;
+                let t1 = last.frame.pose_world_to_cam.inverse().translation;
+                Some((t0, t1, (t1 - t0).length()))
+            } else {
+                None
+            };
+            println!(
+                "[imu_init_gate] start_idx={start_idx} first_idx={:?} last_idx={:?} kfs={}/{} imu_time={:.2}/{:.1}s motion={:?}",
+                kfs.first().map(|kf| kf.frame.idx),
+                kfs.last().map(|kf| kf.frame.idx),
+                kfs.len(),
+                self.inertial_init.config.min_keyframes,
+                imu_time,
+                self.inertial_init.config.min_time_sec,
+                motion.map(|(t0, t1, d)| format!(
+                    "t0={t0:?} t1={t1:?} dist={d:.4}/{:.2}",
+                    self.inertial_init.config.min_motion
+                )),
+            );
         }
 
         // Throttle retries: without this, once `ready()` is true, a rejected
@@ -622,7 +647,10 @@ impl Pipeline {
             // (LocalMapping.cc:183-186) — heavily-regularized, mono suppresses
             // accel bias almost entirely (priorA=1e10) since a short/early
             // window can't yet observe it; stereo uses priorA=1e5.
-            let is_mono = !self.map.keyframes().iter()
+            let is_mono = !self
+                .map
+                .keyframes()
+                .iter()
                 .find(|kf| kf.frame.idx >= start_idx)
                 .map(|kf| kf.frame.is_stereo())
                 .unwrap_or(false);
@@ -700,21 +728,11 @@ impl Pipeline {
                 .unwrap_or(pose_before)
         };
 
-        // Widen the search/PnP-prior gates in proportion to how long we've
-        // already been failing to track: a pose predicted by compounding
-        // IMU/constant-velocity integration over several seconds of loss
-        // carries far more uncertainty than a single-frame prediction, and
-        // the narrow gates sized for the latter would otherwise starve PnP
-        // of correspondences for the entire recently-lost grace period,
-        // making a longer grace period actively counterproductive.
-        const SEARCH_WIDEN_PER_SEC: f32 = 1.0;
-        const MAX_SEARCH_SCALE: f32 = 4.0;
         let currently_lost_for = self
             .state
             .lost_since_sec
             .map_or(0.0, |t0| timestamp_sec - t0);
-        let search_scale =
-            (1.0 + currently_lost_for as f32 * SEARCH_WIDEN_PER_SEC).min(MAX_SEARCH_SCALE);
+        let search_scale = self.estimator.config().search_scale_for(currently_lost_for);
 
         let result = self.estimator.estimate_pose(
             &frame,
@@ -730,14 +748,13 @@ impl Pipeline {
             Ok(estimate) => {
                 self.state.pose_world_to_cam = estimate.pose;
 
-                if self.state.imu_initialized {
-                    // velocity_world was already updated by IMU preintegration
-                    // (predict_pose_imu → pred_vel) before PnP ran. Don't
-                    // overwrite it with a visual finite-difference: at 30 fps
-                    // the inter-frame displacement is noise-dominated during
-                    // low-translation segments, which collapses velocity to
-                    // zero and permanently freezes the IMU pose prediction.
-                } else {
+                // When IMU-initialized, velocity_world was already updated by IMU
+                // preintegration (predict_pose_imu → pred_vel) before PnP ran; don't
+                // overwrite it with a visual finite-difference, since at 30 fps the
+                // inter-frame displacement is noise-dominated during low-translation
+                // segments, which would collapse velocity to zero and permanently
+                // freeze the IMU pose prediction.
+                if !self.state.imu_initialized {
                     self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
                 }
 
@@ -797,24 +814,7 @@ impl Pipeline {
         }
 
         if status == TrackingStatus::Skipped {
-            // Recently-lost grace period (mirrors ORB-SLAM3's RECENTLY_LOST
-            // vs LOST distinction), bridging brief interruptions (motion
-            // blur, a few dropped/occluded frames) without throwing the map
-            // away. Deliberately short, unlike ORB-SLAM3's ~5s: our PnP has
-            // no RANSAC/robust loss, so the projection search and the PnP
-            // prior-reprojection gate both key off the same predicted pose.
-            // Once genuinely lost (not a brief blip), that pose keeps
-            // compounding IMU/constant-velocity drift every extra frame we
-            // wait, which does not improve recovery odds (verified against
-            // EuRoC V101 frames ~600-770, a sustained-loss segment: granting
-            // several seconds of patience there only delayed the same
-            // eventual reset, it never let tracking resume early). A map
-            // that's too young, or an inertial state that hasn't settled
-            // yet, gets no grace at all.
-            const MIN_KEYFRAMES_FOR_GRACE: usize = 10;
-            const RECENTLY_LOST_TIMEOUT_IMU_SEC: f64 = 1.0;
-            const RECENTLY_LOST_TIMEOUT_VISUAL_SEC: f64 = 0.5;
-            const MIN_IMU_CONFIDENCE_SEC: f64 = 2.0;
+            let policy = &self.tracking_loss_recovery;
 
             let lost_since = *self.state.lost_since_sec.get_or_insert(timestamp_sec);
             let recently_lost_for = timestamp_sec - lost_since;
@@ -823,13 +823,9 @@ impl Pipeline {
                 && self
                     .state
                     .imu_init_timestamp_sec
-                    .is_some_and(|t0| timestamp_sec - t0 >= MIN_IMU_CONFIDENCE_SEC);
-            let grace_period_sec = if imu_confident {
-                RECENTLY_LOST_TIMEOUT_IMU_SEC
-            } else {
-                RECENTLY_LOST_TIMEOUT_VISUAL_SEC
-            };
-            let map_established = self.map.keyframes().len() > MIN_KEYFRAMES_FOR_GRACE;
+                    .is_some_and(|t0| timestamp_sec - t0 >= policy.min_imu_confidence_sec);
+            let grace_period_sec = policy.grace_period_sec(imu_confident);
+            let map_established = self.map.keyframes().len() > policy.min_keyframes_for_grace;
 
             if !map_established || recently_lost_for >= grace_period_sec {
                 self.dbg(format!(
@@ -967,7 +963,14 @@ impl Pipeline {
         ) {
             let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_factor(prev_kf_idx, frame.idx, preint, raw_samples, prev_ts, timestamp_sec);
+                self.map.add_imu_factor(
+                    prev_kf_idx,
+                    frame.idx,
+                    preint,
+                    raw_samples,
+                    prev_ts,
+                    timestamp_sec,
+                );
             }
         }
 
@@ -984,7 +987,8 @@ impl Pipeline {
 
         if enable_local_ba {
             if imu_initialized {
-                self.map.run_local_inertial_ba(&self.camera, self.imu_t_bc, self.gravity_world);
+                self.map
+                    .run_local_inertial_ba(&self.camera, self.imu_t_bc, self.gravity_world);
             } else {
                 self.map.run_local_ba(&self.camera);
             }
@@ -995,9 +999,14 @@ impl Pipeline {
                 if imu_initialized {
                     self.state.velocity_world = newest_kf.velocity_world;
                     self.imu_bias = newest_kf.imu_bias;
-                    println!("kf accel bias: {:3}, {:3}, {:3}", self.imu_bias.accel.x, self.imu_bias.accel.y, self.imu_bias.accel.z);
-                    println!("kf gyro bias: {:3}, {:3}, {:3}", self.imu_bias.gyro.x, self.imu_bias.gyro.y, self.imu_bias.gyro.z);
-
+                    println!(
+                        "kf accel bias: {:3}, {:3}, {:3}",
+                        self.imu_bias.accel.x, self.imu_bias.accel.y, self.imu_bias.accel.z
+                    );
+                    println!(
+                        "kf gyro bias: {:3}, {:3}, {:3}",
+                        self.imu_bias.gyro.x, self.imu_bias.gyro.y, self.imu_bias.gyro.z
+                    );
                 }
             }
         }
@@ -1017,9 +1026,10 @@ impl Pipeline {
     /// result by the time these get a chance to fire, so a rejection here
     /// just means "try again never" for that stage, not a tracking failure.
     fn refine_inertial_init(&mut self, timestamp_sec: f64) {
-        let (Some(start_idx), Some(window_start_sec)) =
-            (self.inertial_init_start_kf_idx, self.imu_init_window_start_sec)
-        else {
+        let (Some(start_idx), Some(window_start_sec)) = (
+            self.inertial_init_start_kf_idx,
+            self.imu_init_window_start_sec,
+        ) else {
             return;
         };
         let mtinit = timestamp_sec - window_start_sec;
@@ -1061,7 +1071,9 @@ impl Pipeline {
                 ));
             }
             None => {
-                self.dbg(format!("[imu_init] {stage} rejected: solve failed or invalid scale"));
+                self.dbg(format!(
+                    "[imu_init] {stage} rejected: solve failed or invalid scale"
+                ));
             }
         }
 

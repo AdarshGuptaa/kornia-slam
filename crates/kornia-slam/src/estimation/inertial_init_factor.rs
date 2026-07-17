@@ -85,7 +85,15 @@ impl InertialInitFactor {
     pub fn new(kf_i: KfConst, kf_j: KfConst, pim: PreintegratedImu, is_mono: bool) -> Self {
         let sqrt_info = sqrt_information_9x9(&pim.covariance);
         let dt = pim.dt;
-        Self { kf_i, kf_j, dt, pim, sqrt_info, is_mono, fixed_bias_vel: false }
+        Self {
+            kf_i,
+            kf_j,
+            dt,
+            pim,
+            sqrt_info,
+            is_mono,
+            fixed_bias_vel: false,
+        }
     }
 
     /// See `ScaleRefinement` doc on `fixed_bias_vel`.
@@ -102,7 +110,10 @@ impl Factor for InertialInitFactor {
         compute_jacobian: bool,
     ) -> FactorResult<LinearizationResult> {
         if params.len() != 6 {
-            return Err(FactorError::DimensionMismatch { expected: 6, actual: params.len() });
+            return Err(FactorError::DimensionMismatch {
+                expected: 6,
+                actual: params.len(),
+            });
         }
         let v_i = vec3_from_f32(params[0])?;
         let v_j = vec3_from_f32(params[1])?;
@@ -110,11 +121,18 @@ impl Factor for InertialInitFactor {
         let ba = vec3_from_f32(params[3])?;
         let gdir_arr = quat_array_from_f32(params[4])?;
         if params[5].is_empty() {
-            return Err(FactorError::DimensionMismatch { expected: 1, actual: 0 });
+            return Err(FactorError::DimensionMismatch {
+                expected: 1,
+                actual: 0,
+            });
         }
         // Stereo: scale is metric already (s=1), regardless of whatever the
         // "scale" variable currently holds — see `is_mono` doc comment.
-        let scale = if self.is_mono { params[5][0] as f64 } else { 1.0 };
+        let scale = if self.is_mono {
+            params[5][0] as f64
+        } else {
+            1.0
+        };
 
         let dt = self.dt;
         let r_bw_i = self.kf_i.r_bw;
@@ -123,7 +141,10 @@ impl Factor for InertialInitFactor {
         // Bias-corrected preintegrated deltas (first-order correction around
         // the preintegration's own linearization bias — same helper the rest
         // of imu_init.rs / vi_ba_schur.rs already use).
-        let bias = ImuBias { gyro: bg, accel: ba };
+        let bias = ImuBias {
+            gyro: bg,
+            accel: ba,
+        };
         let d_rot = self.pim.delta_rotation_with_bias(&bias);
         let d_vel = self.pim.delta_velocity_with_bias(&bias);
         let d_pos = self.pim.delta_position_with_bias(&bias);
@@ -145,9 +166,8 @@ impl Factor for InertialInitFactor {
         let dp_world = scale * (self.kf_j.twb - self.kf_i.twb - v_i * dt) - g * (0.5 * dt * dt);
         let ep = r_bw_i * dp_world - d_pos;
 
-        let residual = DVecF64::from_vec(vec![
-            er.x, er.y, er.z, ev.x, ev.y, ev.z, ep.x, ep.y, ep.z,
-        ]);
+        let residual =
+            DVecF64::from_vec(vec![er.x, er.y, er.z, ev.x, ev.y, ev.z, ep.x, ep.y, ep.z]);
 
         // ── Jacobian (9 x 16), zero unless set below ────────────────────
         let jacobian = if compute_jacobian {
@@ -161,7 +181,8 @@ impl Factor for InertialInitFactor {
             // column below.
             if !self.fixed_bias_vel {
                 // ∂er/∂bg   (cols 6..9)
-                let d_er_d_bg = (jr_inv * e_r_mat.transpose() * self.pim.d_rotation_d_bias_gyro) * -1.0;
+                let d_er_d_bg =
+                    (jr_inv * e_r_mat.transpose() * self.pim.d_rotation_d_bias_gyro) * -1.0;
                 set_block3(&mut jac, 0, 6, d_er_d_bg);
 
                 // ∂ev/∂v_i, ∂ev/∂v_j   (cols 0..3, 3..6)
@@ -183,7 +204,12 @@ impl Factor for InertialInitFactor {
             // see the derivation in the previous message.
             let d_g_d_theta = (rwg * SO3F64::hat(g_i)) * -1.0;
             set_block3(&mut jac, 3, 12, (r_bw_i * d_g_d_theta) * dt * -1.0);
-            set_block3(&mut jac, 6, 12, (r_bw_i * d_g_d_theta) * (0.5 * dt * dt) * -1.0);
+            set_block3(
+                &mut jac,
+                6,
+                12,
+                (r_bw_i * d_g_d_theta) * (0.5 * dt * dt) * -1.0,
+            );
 
             // scale column (col 15) — left at zero for stereo, pinning it
             // at its seed value of 1.0 under LM (see `is_mono` doc comment).
@@ -256,11 +282,7 @@ impl Factor for WeightedZeroPrior {
         let w = self.sqrt_weight as f32;
         let residual = vec![params[0][0] * w, params[0][1] * w, params[0][2] * w];
         let jacobian = if compute_jacobian {
-            Some(vec![
-                w, 0.0, 0.0,
-                0.0, w, 0.0,
-                0.0, 0.0, w,
-            ])
+            Some(vec![w, 0.0, 0.0, 0.0, w, 0.0, 0.0, 0.0, w])
         } else {
             None
         };
@@ -286,14 +308,20 @@ impl Factor for WeightedZeroPrior {
 
 fn vec3_from_f32(s: &[f32]) -> FactorResult<Vec3F64> {
     if s.len() < 3 {
-        return Err(FactorError::DimensionMismatch { expected: 3, actual: s.len() });
+        return Err(FactorError::DimensionMismatch {
+            expected: 3,
+            actual: s.len(),
+        });
     }
     Ok(Vec3F64::new(s[0] as f64, s[1] as f64, s[2] as f64))
 }
 
 fn quat_array_from_f32(s: &[f32]) -> FactorResult<[f64; 4]> {
     if s.len() < 4 {
-        return Err(FactorError::DimensionMismatch { expected: 4, actual: s.len() });
+        return Err(FactorError::DimensionMismatch {
+            expected: 4,
+            actual: s.len(),
+        });
     }
     Ok([s[0] as f64, s[1] as f64, s[2] as f64, s[3] as f64])
 }
@@ -327,7 +355,9 @@ fn set_col3(jac: &mut DMatF64, row0: usize, col0: usize, v: Vec3F64) {
 fn sqrt_information_9x9(cov_col_major: &[f64; 81]) -> DMatF64 {
     let cov = DMatF64::from_column_slice(9, 9, cov_col_major);
     let cov_sym = (cov.clone() + cov.transpose()) * 0.5;
-    let info = cov_sym.try_inverse().unwrap_or_else(|| DMatF64::identity(9, 9));
+    let info = cov_sym
+        .try_inverse()
+        .unwrap_or_else(|| DMatF64::identity(9, 9));
     let info_sym = (info.clone() + info.transpose()) * 0.5;
     match info_sym.cholesky() {
         Some(c) => c.l(),

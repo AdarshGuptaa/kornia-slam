@@ -1,12 +1,13 @@
 use kornia_slam::estimation::map_projection::MapProjectionConfig;
 use kornia_slam::estimation::two_view::TwoViewInitConfig;
-use kornia_slam::system::KeyframePolicy;
+use kornia_slam::system::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// Example-local pipeline preset used by the standalone ORB-SLAM binary.
 pub struct PipelineConfig {
     pub two_view_init: TwoViewInitConfig,
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
+    pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
     pub enable_local_ba: bool,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
     /// keyframe back-projects its unassociated "close" (`z < threshold`) stereo
@@ -28,6 +29,7 @@ impl Default for PipelineConfig {
             two_view_init,
             map_projection: MapProjectionConfig::default(),
             keyframe_policy: KeyframePolicy::default(),
+            tracking_loss_recovery: TrackingLossRecoveryPolicy::default(),
             enable_local_ba: true,
             stereo_close_depth_m: None,
             debug: false,

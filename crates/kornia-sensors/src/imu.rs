@@ -244,10 +244,9 @@ impl PreintegratedImu {
             [Mat3F64::ZERO, dr_half_dt2],
         ]);
 
-        // N is the 6×6 discrete-time noise covariance per sample.
-        // σ_gyro and σ_accel are continuous-time spectral densities [units/√Hz].
-        // Discrete variance per sample = σ²_continuous / dt (PSD × sampling rate).
-        // With B already carrying dt factors: B·(σ²/dt)·Bᵀ = correct σ²·dt covariance growth.
+        // gyro_noise/accel_noise are continuous-time spectral densities [units/√Hz]
+        // (datasheet convention), so the discrete per-sample variance is density²/dt
+        // — same discretization ORB-SLAM3 uses when loading IMU calibration.
         let ng = self.calib.gyro_noise * self.calib.gyro_noise / dt;
         let na = self.calib.accel_noise * self.calib.accel_noise / dt;
         let n = diag_6x6(ng, na);
@@ -263,9 +262,10 @@ impl PreintegratedImu {
 
         self.covariance = mat9_add(&acat, &bnbt);
 
-        // Bias random-walk covariance: each step adds σ_rw² · dt (continuous PSD × step size).
-        // σ_gyro_bias_noise and σ_accel_bias_noise are in [units/s/√Hz]; their squared product
-        // with dt gives the variance of the bias increment Δβ ~ N(0, σ_rw²·dt) per step.
+        // Bias random walk: gyro_bias_noise/accel_bias_noise are continuous-time
+        // densities [units/s/√Hz], so each step's bias increment has variance
+        // density²·dt (inverse discretization of the /dt above, since here dt
+        // scales up a rate rather than scaling down a per-sample reading).
         let bg_var = self.calib.gyro_bias_noise * self.calib.gyro_bias_noise * dt;
         let ba_var = self.calib.accel_bias_noise * self.calib.accel_bias_noise * dt;
         for i in 0..3 {

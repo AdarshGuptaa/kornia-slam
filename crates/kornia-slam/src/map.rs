@@ -1117,7 +1117,9 @@ impl Map {
         imu_t_bc: Option<Pose3d>,
         gravity_world: Vec3F64,
     ) {
-        use crate::vi_ba_schur::{ImuEdge, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust};
+        use crate::vi_ba_schur::{
+            ImuFactor as ViBaImuFactor, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust,
+        };
 
         const MAX_ACTIVE_KFS: usize = 3;
         const MIN_OBSERVATIONS: usize = 8;
@@ -1215,8 +1217,12 @@ impl Map {
         // loop independent of whatever real motion originally nudged bias.
         const REPROPAGATE_BIAS_THRESHOLD: f64 = 0.02;
         for factor in self.imu_factors.iter_mut() {
-            let Some(&from) = frame_idx_to_slot.get(&factor.prev_kf_idx) else { continue; };
-            let Some(&to) = frame_idx_to_slot.get(&factor.curr_kf_idx) else { continue; };
+            let Some(&from) = frame_idx_to_slot.get(&factor.prev_kf_idx) else {
+                continue;
+            };
+            let Some(&to) = frame_idx_to_slot.get(&factor.curr_kf_idx) else {
+                continue;
+            };
             if from < active_start && to < active_start {
                 continue;
             }
@@ -1235,7 +1241,7 @@ impl Map {
         }
 
         // Build IMU edges; include only edges where at least one endpoint is active.
-        let imu_edges: Vec<ImuEdge> = self
+        let imu_edges: Vec<ViBaImuFactor> = self
             .imu_factors
             .iter()
             .filter_map(|f| {
@@ -1244,7 +1250,7 @@ impl Map {
                 if from < active_start && to < active_start {
                     return None;
                 }
-                Some(ImuEdge {
+                Some(ViBaImuFactor {
                     from_idx: from,
                     to_idx: to,
                     preintegrated: f.preintegrated.clone(),

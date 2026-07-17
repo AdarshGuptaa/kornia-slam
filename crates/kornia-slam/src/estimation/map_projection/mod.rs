@@ -74,6 +74,11 @@ pub struct MapProjectionConfig {
     pub projection: ProjectionMatchConfig,
     /// Projection matching config for local-map refinement (wider search).
     pub local_projection: ProjectionMatchConfig,
+    /// Growth in `search_scale` per second spent failing to track (see
+    /// `search_scale_for`).
+    pub search_widen_per_sec: f32,
+    /// Upper bound on `search_scale` (see `search_scale_for`).
+    pub max_search_scale: f32,
 }
 
 impl Default for MapProjectionConfig {
@@ -92,7 +97,25 @@ impl Default for MapProjectionConfig {
                 max_hamming: 60,
                 ..ProjectionMatchConfig::default()
             },
+            search_widen_per_sec: 1.0,
+            max_search_scale: 4.0,
         }
+    }
+}
+
+impl MapProjectionConfig {
+    /// `search_scale` to pass to `MapProjectionEstimator::estimate_pose` given
+    /// how long tracking has been failing.
+    ///
+    /// Widens the search/PnP-prior gates in proportion to how long we've
+    /// already been failing to track: a pose predicted by compounding
+    /// IMU/constant-velocity integration over several seconds of loss carries
+    /// far more uncertainty than a single-frame prediction, and the narrow
+    /// gates sized for the latter would otherwise starve PnP of
+    /// correspondences for the entire recently-lost grace period, making a
+    /// longer grace period actively counterproductive.
+    pub fn search_scale_for(&self, currently_lost_for_sec: f64) -> f32 {
+        (1.0 + currently_lost_for_sec as f32 * self.search_widen_per_sec).min(self.max_search_scale)
     }
 }
 
@@ -129,17 +152,7 @@ impl MapProjectionEstimator {
     }
 
     /// Estimate the pose of `frame` against the map.
-    ///
-    /// `search_scale` widens the projection search radius and the PnP prior
-    /// reprojection gate by this factor (1.0 = normal). The caller should
-    /// grow it with time-since-last-successful-track: a pose predicted by
-    /// compounding IMU/constant-velocity integration over a multi-second
-    /// tracking loss carries much more uncertainty than a single-frame
-    /// prediction, and the fixed narrow gates below are sized for the
-    /// latter. Without this, `solve_pnp`'s coarse prior-reprojection filter
-    /// collapses to near-zero correspondences as the prior drifts, so a
-    /// longer recently-lost grace period only delays giving up without
-    /// improving the odds of recovery.
+    #[allow(clippy::too_many_arguments)]
     pub fn estimate_pose(
         &self,
         frame: &Frame,
@@ -148,6 +161,8 @@ impl MapProjectionEstimator {
         map: &Map,
         camera: &PinholeCamera,
         current_keyframe_idx: Option<usize>,
+        // Growth factor for the projection search radius and PnP prior
+        // reprojection gate (1.0 = normal); grow with time-since-last-track.
         search_scale: f32,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;
