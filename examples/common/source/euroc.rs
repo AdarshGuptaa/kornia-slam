@@ -82,7 +82,7 @@ impl EurocSource {
 
         // IMU samples are yielded whenever the dataset ships them (`imu0`);
         // skip those preceding the first yielded camera frame.
-        let with_imu = dataset.is_imu();
+        let with_imu = dataset.has_imu();
         let imu_cursor = if with_imu && start > 0 {
             let boundary_ts = dataset
                 .left_samples

@@ -142,7 +142,7 @@ pub struct ViBaResult {
 
 // ── f32 ↔ f64 conversion helpers (shared shape with ba.rs) ───────────────
 
-fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
+pub(crate) fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
     let r = Mat3AF32::from_cols(
         Vec3AF32::new(
             pose.rotation.col(0).x as f32,
@@ -171,7 +171,7 @@ fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
     )
 }
 
-fn se3_to_pose(se3: &SE3F32) -> Pose3d {
+pub(crate) fn se3_to_pose(se3: &SE3F32) -> Pose3d {
     let r = se3.r.matrix();
     let t = se3.t;
     Pose3d::new(
@@ -195,7 +195,7 @@ fn se3_to_pose(se3: &SE3F32) -> Pose3d {
 ///   J_pose[6..12]: [dv/dρ_x, dv/dρ_y, dv/dρ_z, dv/dω_x, dv/dω_y, dv/dω_z]
 ///   J_point[0..3]: [du/dx,   du/dy,   du/dz]
 ///   J_point[3..6]: [dv/dx,   dv/dy,   dv/dz]
-fn residual_and_jacobians(
+pub(crate) fn residual_and_jacobians(
     pose: &SE3F32,
     point_w: &Vec3F64,
     pixel: [f32; 2],

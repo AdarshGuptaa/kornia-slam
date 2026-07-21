@@ -40,6 +40,22 @@ fn rotation_from_to(from: Vec3F64, to: Vec3F64) -> SO3F64 {
     ]))
 }
 
+/// A keyframe window is monocular unless its first keyframe carries stereo data.
+fn window_is_mono(kfs: &[&Keyframe]) -> bool {
+    !kfs.first().map(|kf| kf.frame.is_stereo()).unwrap_or(false)
+}
+
+/// Pack a `Vec3F64` into the `Vec<f32>` value layout `kornia_algebra::optim`
+/// variables use.
+fn vec3_to_f32(v: Vec3F64) -> Vec<f32> {
+    vec![v.x as f32, v.y as f32, v.z as f32]
+}
+
+/// Read the first three components of an optimizer variable back into a `Vec3F64`.
+fn vec3_from_var(values: &[f32]) -> Vec3F64 {
+    Vec3F64::new(values[0] as f64, values[1] as f64, values[2] as f64)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,8 +106,7 @@ impl ImuInitializer {
 
         // ORB-SLAM3 uses minTime=2.0s (mono) vs 1.0s (stereo) — `config.min_time_sec`
         // holds the stereo (stricter/smaller) value; mono doubles it.
-        let is_mono = !kfs.first().map(|kf| kf.frame.is_stereo()).unwrap_or(false);
-        let min_time_sec = if is_mono {
+        let min_time_sec = if window_is_mono(&kfs) {
             self.config.min_time_sec * 2.0
         } else {
             self.config.min_time_sec
@@ -134,8 +149,8 @@ impl ImuInitializer {
         rwg: Mat3F64,
         seed_velocities: &[Vec3F64],
         scale_init: f64,
-        mbg: Vec3F64,
-        mba: Vec3F64,
+        bg: Vec3F64,
+        ba: Vec3F64,
         is_mono: bool,
         prior_g: f64,
         prior_a: f64,
@@ -145,19 +160,16 @@ impl ImuInitializer {
         let mut problem = Problem::new();
 
         for (local_idx, vel) in seed_velocities.iter().enumerate().take(n) {
-            let vel_f32 = vec![vel.x as f32, vel.y as f32, vel.z as f32];
             let name = format!("v{}", local_idx);
             problem
-                .add_variable(Variable::euclidean(&name, 3), vel_f32)
+                .add_variable(Variable::euclidean(&name, 3), vec3_to_f32(*vel))
                 .ok()?;
         }
-        let bg_f32 = vec![mbg.x as f32, mbg.y as f32, mbg.z as f32];
-        let ba_f32 = vec![mba.x as f32, mba.y as f32, mba.z as f32];
         problem
-            .add_variable(Variable::euclidean("bg", 3), bg_f32)
+            .add_variable(Variable::euclidean("bg", 3), vec3_to_f32(bg))
             .ok()?;
         problem
-            .add_variable(Variable::euclidean("ba", 3), ba_f32)
+            .add_variable(Variable::euclidean("ba", 3), vec3_to_f32(ba))
             .ok()?;
         let q = SO3F64::from_matrix(&rwg).to_array();
         let g_f32: Vec<f32> = q.iter().map(|&v| v as f32).collect();
@@ -250,16 +262,8 @@ impl ImuInitializer {
         );
         let vars = problem.get_variables(); // &HashMap<String, Variable>
 
-        let bg_out = Vec3F64::new(
-            vars["bg"].values[0] as f64,
-            vars["bg"].values[1] as f64,
-            vars["bg"].values[2] as f64,
-        );
-        let ba_out = Vec3F64::new(
-            vars["ba"].values[0] as f64,
-            vars["ba"].values[1] as f64,
-            vars["ba"].values[2] as f64,
-        );
+        let bg_out = vec3_from_var(&vars["bg"].values);
+        let ba_out = vec3_from_var(&vars["ba"].values);
         let gdir_v = &vars["gdir"].values;
         let rwg_out = SO3F64::from_array([
             gdir_v[0] as f64,
@@ -275,10 +279,7 @@ impl ImuInitializer {
         };
 
         let velocities_out: Vec<Vec3F64> = (0..n)
-            .map(|i| {
-                let v = &vars[&format!("v{i}")].values;
-                Vec3F64::new(v[0] as f64, v[1] as f64, v[2] as f64)
-            })
+            .map(|i| vec3_from_var(&vars[&format!("v{i}")].values))
             .collect();
 
         Some((rwg_out, scale_out, bg_out, ba_out, velocities_out))
@@ -328,10 +329,7 @@ impl ImuInitializer {
             .map(|(i, kf)| (kf.frame.idx, i))
             .collect();
 
-        let is_mono = !keyframes
-            .first()
-            .map(|kf| kf.frame.is_stereo())
-            .unwrap_or(false);
+        let is_mono = window_is_mono(&keyframes);
 
         let (velocities, rwg): (Vec<Vec3F64>, Mat3F64) = if already_initialized {
             let vels = keyframes.iter().map(|kf| kf.velocity_world).collect();

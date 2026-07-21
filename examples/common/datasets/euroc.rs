@@ -371,7 +371,7 @@ impl EurocDataset {
     }
 
     /// Whether the dataset has IMU samples
-    pub fn is_imu(&self) -> bool {
+    pub fn has_imu(&self) -> bool {
         !self.imu_samples.is_empty()
     }
 

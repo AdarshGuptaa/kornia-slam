@@ -370,15 +370,9 @@ fn mat3_scalar(m: &Mat3F64, s: f64) -> Mat3F64 {
     Mat3F64(m.mul_scalar(s))
 }
 
-/// 9×9 index (column-major).
+/// Column-major index for any matrix with 9 rows (9×9 and 9×6 alike).
 #[inline]
 fn idx9(row: usize, col: usize) -> usize {
-    row + col * 9
-}
-
-/// 9×6 index (column-major).
-#[inline]
-fn idx9x6(row: usize, col: usize) -> usize {
     row + col * 9
 }
 
@@ -406,7 +400,7 @@ fn block3x2_to_9x6(blocks: [[Mat3F64; 2]; 3]) -> [f64; 54] {
             let cols = blocks[br][bc].to_cols_array();
             for c in 0..3 {
                 for r in 0..3 {
-                    out[idx9x6(br * 3 + r, bc * 3 + c)] = cols[c * 3 + r];
+                    out[idx9(br * 3 + r, bc * 3 + c)] = cols[c * 3 + r];
                 }
             }
         }
