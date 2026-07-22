@@ -39,17 +39,13 @@
 
 use faer::Mat;
 use faer::prelude::Solve;
-use kornia_algebra::{Mat3F64, SE3F32, SO3F64, Vec3AF32, Vec3F64};
+use kornia_algebra::{Mat3AF32, Mat3F64, SE3F32, SO3F32, SO3F64, Vec3AF32, Vec3F64};
 use thiserror::Error;
 
 use kornia_3d::ba::{BaError, BaObservation};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_sensors::imu::{ImuBias, PreintegratedImu};
-
-// Reprojection / f32↔f64 pose helpers shared with the visual-only Schur BA —
-// identical algebra, so defined once in `ba_schur` and reused here.
-use crate::ba_schur::{pose_to_se3, residual_and_jacobians, se3_to_pose};
 
 const MIN_Z: f32 = 1e-3;
 
@@ -191,6 +187,141 @@ pub struct ViBaResult {
     pub final_cost: f64,
 }
 
+// ── f32 ↔ f64 pose conversion + reprojection residual/Jacobian ────────────
+// Reprojection factor algebra shared with kornia_3d's visual-only BA; kept
+// here in f32 for the Schur assembly below.
+
+fn pose_to_se3(pose: &Pose3d) -> SE3F32 {
+    let r = Mat3AF32::from_cols(
+        Vec3AF32::new(
+            pose.rotation.col(0).x as f32,
+            pose.rotation.col(0).y as f32,
+            pose.rotation.col(0).z as f32,
+        ),
+        Vec3AF32::new(
+            pose.rotation.col(1).x as f32,
+            pose.rotation.col(1).y as f32,
+            pose.rotation.col(1).z as f32,
+        ),
+        Vec3AF32::new(
+            pose.rotation.col(2).x as f32,
+            pose.rotation.col(2).y as f32,
+            pose.rotation.col(2).z as f32,
+        ),
+    );
+    let so3 = SO3F32::from_matrix(&r);
+    SE3F32::new(
+        so3,
+        Vec3AF32::new(
+            pose.translation.x as f32,
+            pose.translation.y as f32,
+            pose.translation.z as f32,
+        ),
+    )
+}
+
+fn se3_to_pose(se3: &SE3F32) -> Pose3d {
+    let r = se3.r.matrix();
+    let t = se3.t;
+    Pose3d::new(
+        Mat3F64::from_cols(
+            Vec3F64::new(r.col(0).x as f64, r.col(0).y as f64, r.col(0).z as f64),
+            Vec3F64::new(r.col(1).x as f64, r.col(1).y as f64, r.col(1).z as f64),
+            Vec3F64::new(r.col(2).x as f64, r.col(2).y as f64, r.col(2).z as f64),
+        ),
+        Vec3F64::new(t.x as f64, t.y as f64, t.z as f64),
+    )
+}
+
+/// Computes (residual, J_pose 2×6, J_point 2×3) at the current state, matching
+/// `kornia_3d::ba::ReprojFactor`. Jacobian layout (row-major flat):
+///   J_pose[0..6]:  [du/dρ, du/dω]   J_pose[6..12]: [dv/dρ, dv/dω]
+///   J_point[0..3]: [du/dxyz]        J_point[3..6]: [dv/dxyz]
+fn residual_and_jacobians(
+    pose: &SE3F32,
+    point_w: &Vec3F64,
+    pixel: [f32; 2],
+    camera: &PinholeCamera,
+) -> ([f32; 2], [f32; 12], [f32; 6]) {
+    let fx = camera.fx as f32;
+    let fy = camera.fy as f32;
+    let cx = camera.cx as f32;
+    let cy = camera.cy as f32;
+
+    let pw = Vec3AF32::new(point_w.x as f32, point_w.y as f32, point_w.z as f32);
+    let pc = *pose * pw;
+    let z = if pc.z.abs() < MIN_Z {
+        if pc.z >= 0.0 { MIN_Z } else { -MIN_Z }
+    } else {
+        pc.z
+    };
+    let inv_z = 1.0 / z;
+    let inv_z2 = inv_z * inv_z;
+
+    let u = fx * pc.x * inv_z + cx;
+    let v = fy * pc.y * inv_z + cy;
+    let r = [u - pixel[0], v - pixel[1]];
+
+    // J_proj row coefficients (∂[u; v] / ∂[X_c]).
+    let a0 = fx * inv_z;
+    let a2 = -fx * pc.x * inv_z2;
+    let b1 = fy * inv_z;
+    let b2 = -fy * pc.y * inv_z2;
+
+    // Rotation matrix elements (R: world→cam).
+    let rm = pose.r.matrix();
+    let r00 = rm.col(0).x;
+    let r01 = rm.col(1).x;
+    let r02 = rm.col(2).x;
+    let r10 = rm.col(0).y;
+    let r11 = rm.col(1).y;
+    let r12 = rm.col(2).y;
+    let r20 = rm.col(0).z;
+    let r21 = rm.col(1).z;
+    let r22 = rm.col(2).z;
+
+    let (px, py, pz) = (pw.x, pw.y, pw.z);
+
+    // S = -R · skew(p_w) — for the omega part.
+    let s00 = -pz * r01 + py * r02;
+    let s10 = -pz * r11 + py * r12;
+    let s20 = -pz * r21 + py * r22;
+
+    let s01 = pz * r00 - px * r02;
+    let s11 = pz * r10 - px * r12;
+    let s21 = pz * r20 - px * r22;
+
+    let s02 = -py * r00 + px * r01;
+    let s12 = -py * r10 + px * r11;
+    let s22 = -py * r20 + px * r21;
+
+    // J_pt = J_proj · R (3 cols).
+    let jpt_00 = a0 * r00 + a2 * r20;
+    let jpt_01 = a0 * r01 + a2 * r21;
+    let jpt_02 = a0 * r02 + a2 * r22;
+    let jpt_10 = b1 * r10 + b2 * r20;
+    let jpt_11 = b1 * r11 + b2 * r21;
+    let jpt_12 = b1 * r12 + b2 * r22;
+
+    // J_omega = J_proj · S (3 cols).
+    let jom_00 = a0 * s00 + a2 * s20;
+    let jom_01 = a0 * s01 + a2 * s21;
+    let jom_02 = a0 * s02 + a2 * s22;
+    let jom_10 = b1 * s10 + b2 * s20;
+    let jom_11 = b1 * s11 + b2 * s21;
+    let jom_12 = b1 * s12 + b2 * s22;
+
+    // Layout J_pose 2×6 row-major: [ρ(3) | ω(3)] per row.
+    let j_pose: [f32; 12] = [
+        jpt_00, jpt_01, jpt_02, jom_00, jom_01, jom_02, jpt_10, jpt_11, jpt_12, jom_10, jom_11,
+        jom_12,
+    ];
+    // J_point 2×3 row-major.
+    let j_point: [f32; 6] = [jpt_00, jpt_01, jpt_02, jpt_10, jpt_11, jpt_12];
+
+    (r, j_pose, j_point)
+}
+
 /// Depth (stereo Z) residual and Jacobian, in f64, w.r.t. pose (SE3 tangent
 /// `[ρ|ω]`) and world point. Mirrors the rotation-row-2 algebra in
 /// [`residual_and_jacobians`] (see there for the `S = -R·skew(p_w)`
@@ -198,7 +329,7 @@ pub struct ViBaResult {
 /// `BaObservation::depth_meas` carries for stereo keyframes.
 ///
 /// `visual_inertial_bundle_adjust` previously ignored `depth_meas` entirely
-/// (unlike the plain-visual [`bundle_adjust_schur_with_priors`], which
+/// (unlike the plain-visual `kornia_3d::ba_schur` BA, which
 /// honours it), so stereo+IMU local BA had nothing anchoring absolute scale
 /// beyond the IMU factor's gravity magnitude in a 3-keyframe window — while
 /// stereo-only BA (which does use this term) stayed scale-consistent. That
