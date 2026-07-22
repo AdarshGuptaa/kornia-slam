@@ -37,7 +37,7 @@ use kornia_algebra::SO3F64;
 use kornia_algebra::Vec3F64;
 use kornia_image::ImageSize;
 use kornia_imgproc::features::hamming_distance;
-use kornia_sensors::imu::{ImuBias, PreintegratedImu};
+use kornia_sensors::imu::{ImuBias, ImuMeasurement, PreintegratedImu};
 
 /// Preintegrated IMU measurements connecting two consecutive keyframes.
 #[derive(Debug, Clone)]
@@ -48,6 +48,13 @@ pub struct ImuFactor {
     pub curr_kf_idx: usize,
     /// IMU deltas integrated over the interval between the two keyframes.
     pub preintegrated: PreintegratedImu,
+    /// Raw measurements covering `[t0, t1]`, retained so this factor can be
+    /// repropagated (see `PreintegratedImu::from_measurements`) once the
+    /// bias it was linearized at has drifted too far from the current
+    /// estimate for the first-order correction to stay valid.
+    pub raw_samples: Vec<ImuMeasurement>,
+    pub t0: f64,
+    pub t1: f64,
 }
 
 /// A frame promoted into the map, with descriptor-to-map-point associations.
@@ -304,16 +311,24 @@ impl Map {
     }
 
     /// Records preintegrated IMU measurements between two consecutive keyframes.
+    /// `raw_samples` (covering `[t0, t1]`) are retained for repropagation —
+    /// see `ImuFactor::raw_samples`.
     pub fn add_imu_factor(
         &mut self,
         prev_kf_idx: usize,
         curr_kf_idx: usize,
         preintegrated: PreintegratedImu,
+        raw_samples: Vec<ImuMeasurement>,
+        t0: f64,
+        t1: f64,
     ) {
         self.imu_factors.push(ImuFactor {
             prev_kf_idx,
             curr_kf_idx,
             preintegrated,
+            raw_samples,
+            t0,
+            t1,
         });
     }
 
@@ -1089,6 +1104,196 @@ impl Map {
         for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
             if let Some(mp) = self.map_points.get_mut(global_idx) {
                 mp.position = ba_result.points[local_idx];
+            }
+        }
+        for &global_idx in &mp_global_indices {
+            self.update_map_point_geometry(global_idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        }
+    }
+
+    pub fn run_local_inertial_ba(
+        &mut self,
+        camera: &PinholeCamera,
+        imu_t_bc: Option<Pose3d>,
+        gravity_world: Vec3F64,
+    ) {
+        use crate::vi_ba_schur::{
+            ImuFactor as ViBaImuFactor, ViBaKeyframe, ViBaParams, visual_inertial_bundle_adjust,
+        };
+
+        const MAX_ACTIVE_KFS: usize = 3;
+        const MIN_OBSERVATIONS: usize = 8;
+
+        let n_kfs = self.keyframes.len();
+        if n_kfs < 2 {
+            return;
+        }
+
+        let active_start = n_kfs.saturating_sub(MAX_ACTIVE_KFS);
+
+        let mut mp_set: HashSet<usize> = HashSet::new();
+        for kf in &self.keyframes[active_start..] {
+            for mp_idx in kf.map_point_by_desc_idx.iter().flatten() {
+                if let Some(mp) = self.map_points.get(*mp_idx)
+                    && !mp.culled
+                {
+                    mp_set.insert(*mp_idx);
+                }
+            }
+        }
+        if mp_set.is_empty() {
+            return;
+        }
+
+        let mut mp_global_indices: Vec<usize> = mp_set.iter().copied().collect();
+        mp_global_indices.sort_unstable();
+
+        let mp_global_to_local: HashMap<usize, usize> = mp_global_indices
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| (global, local))
+            .collect();
+
+        let points: Vec<Vec3F64> = mp_global_indices
+            .iter()
+            .map(|&idx| self.map_points[idx].position)
+            .collect();
+
+        // Build VI-BA keyframes (all KFs; fixed flag controls which are optimised).
+        let vi_keyframes: Vec<ViBaKeyframe> = self
+            .keyframes
+            .iter()
+            .enumerate()
+            .map(|(kf_idx, kf)| ViBaKeyframe {
+                pose: kf.frame.pose_world_to_cam,
+                velocity: kf.velocity_world,
+                bias: kf.imu_bias,
+                fixed: kf_idx < active_start,
+            })
+            .collect();
+
+        let mut observations = Vec::new();
+        for (kf_idx, kf) in self.keyframes.iter().enumerate() {
+            let is_fixed = kf_idx < active_start;
+            for (desc_idx, mp_opt) in kf.map_point_by_desc_idx.iter().enumerate() {
+                if let Some(mp_idx) = mp_opt {
+                    let Some(&point_idx) = mp_global_to_local.get(mp_idx) else {
+                        continue;
+                    };
+                    if let Some(p) = kf.frame.undistorted_xy(desc_idx, camera) {
+                        let (depth_meas, depth_sigma) = stereo_depth_obs(kf, desc_idx);
+                        observations.push(BaObservation {
+                            pose_idx: kf_idx,
+                            point_idx,
+                            pixel: p,
+                            fixed_pose: is_fixed,
+                            fixed_point: false,
+                            depth_meas,
+                            depth_sigma,
+                        });
+                    }
+                }
+            }
+        }
+
+        if observations.len() < MIN_OBSERVATIONS {
+            return;
+        }
+
+        // Map global frame.idx → local keyframe slot (0..n_kfs).
+        let frame_idx_to_slot: HashMap<usize, usize> = self
+            .keyframes
+            .iter()
+            .enumerate()
+            .map(|(slot, kf)| (kf.frame.idx, slot))
+            .collect();
+
+        // Repropagate any active edge whose current from-keyframe bias has
+        // drifted past the point where `delta_*_with_bias`'s first-order
+        // correction stays valid. Without this, a sliding window that keeps
+        // re-optimizing the same edge across many calls while bias is still
+        // moving compounds a purely numerical linearization error into what
+        // looks like more residual, which pushes bias further — a feedback
+        // loop independent of whatever real motion originally nudged bias.
+        const REPROPAGATE_BIAS_THRESHOLD: f64 = 0.02;
+        for factor in self.imu_factors.iter_mut() {
+            let Some(&from) = frame_idx_to_slot.get(&factor.prev_kf_idx) else {
+                continue;
+            };
+            let Some(&to) = frame_idx_to_slot.get(&factor.curr_kf_idx) else {
+                continue;
+            };
+            if from < active_start && to < active_start {
+                continue;
+            }
+            let current_bias = self.keyframes[from].imu_bias;
+            let d_accel = (current_bias.accel - factor.preintegrated.bias.accel).length();
+            let d_gyro = (current_bias.gyro - factor.preintegrated.bias.gyro).length();
+            if d_accel > REPROPAGATE_BIAS_THRESHOLD || d_gyro > REPROPAGATE_BIAS_THRESHOLD {
+                factor.preintegrated = PreintegratedImu::from_measurements(
+                    current_bias,
+                    factor.preintegrated.calib,
+                    &factor.raw_samples,
+                    factor.t0,
+                    factor.t1,
+                );
+            }
+        }
+
+        // Build IMU edges; include only edges where at least one endpoint is active.
+        let imu_edges: Vec<ViBaImuFactor> = self
+            .imu_factors
+            .iter()
+            .filter_map(|f| {
+                let from = *frame_idx_to_slot.get(&f.prev_kf_idx)?;
+                let to = *frame_idx_to_slot.get(&f.curr_kf_idx)?;
+                if from < active_start && to < active_start {
+                    return None;
+                }
+                Some(ViBaImuFactor {
+                    from_idx: from,
+                    to_idx: to,
+                    preintegrated: f.preintegrated.clone(),
+                })
+            })
+            .collect();
+
+        // 15-DOF-per-keyframe state (pose+velocity+bias) with information
+        // entries spanning many more orders of magnitude than the pure
+        // visual 6-DOF problem (see the Marquardt-damping note in
+        // visual_inertial_bundle_adjust) converges more slowly to the same
+        // strict cost_tolerance: over half of non-converged calls were
+        // hitting the default max_iterations=20 cap while still making
+        // small, steady progress (final residuals *smaller* than many calls
+        // that did converge), not diverging. Give it more room.
+        let vi_result = match visual_inertial_bundle_adjust(
+            &vi_keyframes,
+            &points,
+            &observations,
+            &imu_edges,
+            camera,
+            &ViBaParams {
+                imu_t_bc,
+                gravity: gravity_world,
+                max_iterations: 50,
+                ..ViBaParams::default()
+            },
+        ) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        // Write back optimised poses, velocities, and biases for active keyframes.
+        for kf_idx in active_start..n_kfs {
+            let vi_kf = &vi_result.keyframes[kf_idx];
+            self.keyframes[kf_idx].frame.pose_world_to_cam = vi_kf.pose;
+            self.keyframes[kf_idx].velocity_world = vi_kf.velocity;
+            self.keyframes[kf_idx].imu_bias = vi_kf.bias;
+        }
+
+        for (local_idx, &global_idx) in mp_global_indices.iter().enumerate() {
+            if let Some(mp) = self.map_points.get_mut(global_idx) {
+                mp.position = vi_result.points[local_idx];
             }
         }
         for &global_idx in &mp_global_indices {

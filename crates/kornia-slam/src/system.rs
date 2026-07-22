@@ -56,6 +56,55 @@ impl KeyframePolicy {
     }
 }
 
+/// Recently-lost grace period policy (mirrors ORB-SLAM3's RECENTLY_LOST vs
+/// LOST distinction), bridging brief interruptions (motion blur, a few
+/// dropped/occluded frames) without throwing the map away.
+///
+/// Deliberately short, unlike ORB-SLAM3's ~5s: our PnP has no RANSAC/robust
+/// loss, so the projection search and the PnP prior-reprojection gate both
+/// key off the same predicted pose. Once genuinely lost (not a brief blip),
+/// that pose keeps compounding IMU/constant-velocity drift every extra frame
+/// we wait, which does not improve recovery odds (verified against EuRoC
+/// V101 frames ~600-770, a sustained-loss segment: granting several seconds
+/// of patience there only delayed the same eventual reset, it never let
+/// tracking resume early). A map that's too young, or an inertial state that
+/// hasn't settled yet, gets no grace at all.
+#[derive(Debug, Clone)]
+pub struct TrackingLossRecoveryPolicy {
+    /// Minimum keyframe count before any grace period is granted.
+    pub min_keyframes_for_grace: usize,
+    /// Grace period once the IMU has been initialized for at least
+    /// `min_imu_confidence_sec`.
+    pub timeout_imu_sec: f64,
+    /// Grace period otherwise (no IMU, or too recently initialized).
+    pub timeout_visual_sec: f64,
+    /// How long the IMU must have been initialized before `timeout_imu_sec`
+    /// applies instead of `timeout_visual_sec`.
+    pub min_imu_confidence_sec: f64,
+}
+
+impl Default for TrackingLossRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            min_keyframes_for_grace: 10,
+            timeout_imu_sec: 1.0,
+            timeout_visual_sec: 0.5,
+            min_imu_confidence_sec: 2.0,
+        }
+    }
+}
+
+impl TrackingLossRecoveryPolicy {
+    /// Grace period, in seconds, to allow before giving up and resetting.
+    pub fn grace_period_sec(&self, imu_confident: bool) -> f64 {
+        if imu_confident {
+            self.timeout_imu_sec
+        } else {
+            self.timeout_visual_sec
+        }
+    }
+}
+
 /// Status of processing one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackingStatus {
@@ -88,11 +137,17 @@ pub struct SystemState {
     pub last_frame_timestamp_sec: f64,
     /// Whether visual-inertial initialization succeeded (gates IMU pose prediction).
     pub imu_initialized: bool,
+    /// Timestamp (sec) at which inertial initialization completed. IMU-only
+    /// pose prediction isn't trustworthy yet for a short window after this,
+    /// so a tracking loss shortly after init is treated as fully lost rather
+    /// than granted the longer inertial grace period.
+    pub imu_init_timestamp_sec: Option<f64>,
     pub current_keyframe_idx: Option<usize>,
     pub last_keyframe_idx: Option<usize>,
-    pub consecutive_failures: usize,
-    /// Maximum consecutive tracking failures before resetting to bootstrap.
-    pub max_consecutive_failures: usize,
+    /// Timestamp (sec) of the first frame in the current run of tracking
+    /// failures, or `None` while tracking is healthy. Drives the
+    /// recently-lost grace period (mirrors ORB-SLAM3's `mTimeStampLost`).
+    pub lost_since_sec: Option<f64>,
     pub bootstrap_frame: Option<Frame>,
     pub mode: SystemMode,
 }
@@ -116,10 +171,10 @@ impl SystemState {
             velocity_world: Vec3F64::ZERO,
             current_keyframe_idx: None,
             last_keyframe_idx: None,
-            consecutive_failures: 0,
-            max_consecutive_failures: 15,
+            lost_since_sec: None,
             bootstrap_frame: None,
             imu_initialized: false,
+            imu_init_timestamp_sec: None,
             last_frame_timestamp_sec: 0.0,
             mode: SystemMode::Bootstrap,
         }
@@ -130,11 +185,12 @@ impl SystemState {
         self.current_keyframe_idx = None;
         self.last_keyframe_idx = None;
         self.velocity = None;
-        self.consecutive_failures = 0;
+        self.lost_since_sec = None;
         self.bootstrap_frame = None;
         // The new map starts at an unknown monocular scale, so the metric
         // IMU state no longer applies until inertial init runs again.
         self.imu_initialized = false;
+        self.imu_init_timestamp_sec = None;
         self.velocity_world = Vec3F64::ZERO;
     }
 }
