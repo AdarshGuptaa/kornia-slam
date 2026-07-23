@@ -132,8 +132,7 @@ impl FrameSource for UvcSource {
             )));
         }
 
-        let image: Image<u8, 1> =
-            Image::new(self.image_size, bytes).map_err(SourceError::other)?;
+        let image: Image<u8, 1> = Image::new(self.image_size, bytes).map_err(SourceError::other)?;
         let idx = self.cursor;
         self.cursor += 1;
         let timestamp_sec = self.start.elapsed().as_secs_f64();
