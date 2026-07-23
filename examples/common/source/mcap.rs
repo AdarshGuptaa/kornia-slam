@@ -20,22 +20,21 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_image::Image;
 use kornia_imgproc::color::gray_from_rgb_u8;
 use kornia_io::jpeg::{decode_image_jpeg_layout, decode_image_jpeg_mono8, decode_image_jpeg_rgb8};
-use kornia_tensor::CpuAllocator;
 use mcap::McapError;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::StereoCalib;
 
 /// A timestamped grayscale frame, `(log_time_sec, image)`.
-type TimedImage = (f64, Image<u8, 1, CpuAllocator>);
+type TimedImage = (f64, Image<u8, 1>);
 /// A timestamped left/right pair, `(log_time_sec, left, right)`.
-type TimedPair = (f64, Image<u8, 1, CpuAllocator>, Image<u8, 1, CpuAllocator>);
+type TimedPair = (f64, Image<u8, 1>, Image<u8, 1>);
 
 /// A pre-decoded grayscale frame queued for `next_frame`.
 struct PreparedFrame {
     timestamp_sec: f64,
-    image: Image<u8, 1, CpuAllocator>,
-    right_image: Option<Image<u8, 1, CpuAllocator>>,
+    image: Image<u8, 1>,
+    right_image: Option<Image<u8, 1>>,
 }
 
 /// Offline MCAP frame source.
@@ -278,19 +277,19 @@ fn nearest_index(ts: &[f64], t: f64) -> usize {
 /// RGB JPEGs (used by the `compressed` channel) are decoded then converted.
 fn decode_jpeg_to_luma(
     jpeg_bytes: &[u8],
-) -> Result<Image<u8, 1, CpuAllocator>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Image<u8, 1>, Box<dyn std::error::Error + Send + Sync>> {
     let layout = decode_image_jpeg_layout(jpeg_bytes)?;
     let size = layout.image_size;
     match layout.channels {
         1 => {
-            let mut dst = Image::<u8, 1, _>::from_size_val(size, 0, CpuAllocator)?;
+            let mut dst = Image::<u8, 1>::from_size_val(size, 0)?;
             decode_image_jpeg_mono8(jpeg_bytes, &mut dst)?;
             Ok(dst)
         }
         3 => {
-            let mut rgb = Image::<u8, 3, _>::from_size_val(size, 0, CpuAllocator)?;
+            let mut rgb = Image::<u8, 3>::from_size_val(size, 0)?;
             decode_image_jpeg_rgb8(jpeg_bytes, &mut rgb)?;
-            let mut gray = Image::<u8, 1, _>::from_size_val(size, 0, CpuAllocator)?;
+            let mut gray = Image::<u8, 1>::from_size_val(size, 0)?;
             gray_from_rgb_u8(&rgb, &mut gray)?;
             Ok(gray)
         }

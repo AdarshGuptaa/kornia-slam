@@ -41,7 +41,6 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::Frame;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use kornia_tensor::CpuAllocator;
 use pipeline::Pipeline;
 #[cfg(feature = "oakd")]
 use source::OakdSource;
@@ -310,7 +309,7 @@ const ORB_LEVELS: usize = 8;
 /// Builds an ORB-consistent u8 image pyramid: level `o` is the full image
 /// downscaled by `ORB_SCALE^o`, so a full-resolution keypoint at octave `o`
 /// maps into level `o` by multiplying its coordinates by `ORB_SCALE^-o`.
-fn build_u8_pyramid(img: &Image<u8, 1, CpuAllocator>) -> Vec<Image<u8, 1, CpuAllocator>> {
+fn build_u8_pyramid(img: &Image<u8, 1>) -> Vec<Image<u8, 1>> {
     let mut pyramid = Vec::with_capacity(ORB_LEVELS);
     pyramid.push(img.clone());
     let (w0, h0) = (img.width() as f32, img.height() as f32);
@@ -324,7 +323,6 @@ fn build_u8_pyramid(img: &Image<u8, 1, CpuAllocator>) -> Vec<Image<u8, 1, CpuAll
                 height: h,
             },
             0u8,
-            CpuAllocator,
         )
         .expect("pyramid level allocation");
         resize_fast_mono(img, &mut dst, InterpolationMode::Bilinear).expect("pyramid resize");

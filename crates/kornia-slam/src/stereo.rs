@@ -26,7 +26,7 @@
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_algebra::Vec3F64;
-use kornia_image::{Image, allocator::ImageAllocator};
+use kornia_image::Image;
 use kornia_imgproc::features::{OrbFeatures, hamming_distance};
 
 use crate::frame::Frame;
@@ -109,17 +109,13 @@ const SAD_SEARCH_RANGE: i32 = 5;
 /// octave); only level 0 is required if all keypoints are at octave 0. `left`
 /// and `right` are the ORB features of the respective views. Returns a
 /// [`StereoMatches`] of length `left.len()`.
-pub fn compute_stereo_matches<A1, A2>(
-    left_pyramid: &[Image<u8, 1, A1>],
-    right_pyramid: &[Image<u8, 1, A2>],
+pub fn compute_stereo_matches(
+    left_pyramid: &[Image<u8, 1>],
+    right_pyramid: &[Image<u8, 1>],
     left: &OrbFeatures,
     right: &OrbFeatures,
     cfg: &StereoMatchConfig,
-) -> StereoMatches
-where
-    A1: ImageAllocator,
-    A2: ImageAllocator,
-{
+) -> StereoMatches {
     let n_left = left.keypoints_xy.len();
     let mut u_right = vec![-1.0f32; n_left];
     let mut depth = vec![-1.0f32; n_left];
@@ -346,7 +342,7 @@ pub fn unproject_stereo(frame: &Frame, camera: &PinholeCamera) -> Vec<(usize, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kornia_image::{ImageSize, allocator::CpuAllocator};
+    use kornia_image::ImageSize;
     use kornia_imgproc::features::OrbDetector;
 
     const ORB_SCALE_FACTOR: f32 = 1.2;
@@ -382,7 +378,7 @@ mod tests {
         width: usize,
         height: usize,
         disparity: usize,
-    ) -> (Image<u8, 1, CpuAllocator>, Image<u8, 1, CpuAllocator>) {
+    ) -> (Image<u8, 1>, Image<u8, 1>) {
         let mut left = vec![0u8; width * height];
         let mut right = vec![0u8; width * height];
         for y in 0..height {
@@ -396,8 +392,8 @@ mod tests {
         }
         let size = ImageSize { width, height };
         (
-            Image::from_size_slice(size, &left, CpuAllocator).unwrap(),
-            Image::from_size_slice(size, &right, CpuAllocator).unwrap(),
+            Image::from_size_slice(size, &left).unwrap(),
+            Image::from_size_slice(size, &right).unwrap(),
         )
     }
 
