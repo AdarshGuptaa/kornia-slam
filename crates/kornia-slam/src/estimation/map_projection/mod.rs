@@ -152,6 +152,9 @@ impl MapProjectionEstimator {
     }
 
     /// Estimate the pose of `frame` against the map.
+    ///
+    /// `search_scale` (1.0 = normal) grows the projection search radius and PnP
+    /// reprojection gate; see [`MapProjectionConfig::search_scale_for`].
     #[allow(clippy::too_many_arguments)]
     pub fn estimate_pose(
         &self,
@@ -161,8 +164,6 @@ impl MapProjectionEstimator {
         map: &Map,
         camera: &PinholeCamera,
         current_keyframe_idx: Option<usize>,
-        // Growth factor for the projection search radius and PnP prior
-        // reprojection gate (1.0 = normal); grow with time-since-last-track.
         search_scale: f32,
     ) -> Result<Estimate, MapProjectionRejectReason> {
         let pnp = &self.config.pnp;

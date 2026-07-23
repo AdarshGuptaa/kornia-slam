@@ -10,5 +10,7 @@ kornia-algebra = { git = "https://github.com/kornia/kornia-rs", branch = "main" 
 kornia-image = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
 kornia-sensors = { path = "../kornia-sensors" }
+# Dense Cholesky solver for the reduced camera system in Schur-complement BA
+# (see vi_ba_schur.rs / ba_schur.rs).
 faer = "0.22"
 thiserror = "1"

@@ -31,7 +31,7 @@ pub struct KfConst {
     /// `R_bw`: rotates world-frame vectors into the body frame.
     pub r_bw: Mat3F64,
     /// `t_wb`: body/IMU origin position in world coordinates.
-    pub twb: Vec3F64,
+    pub t_wb: Vec3F64,
 }
 
 impl KfConst {
@@ -42,8 +42,8 @@ impl KfConst {
         let r_cw = pose_world_to_cam.rotation;
         let r_bw = r_bc * r_cw;
         let t_bw = r_bc * pose_world_to_cam.translation + imu_t_bc.translation;
-        let twb = -(r_bw.transpose() * t_bw);
-        Self { r_bw, twb }
+        let t_wb = -(r_bw.transpose() * t_bw);
+        Self { r_bw, t_wb }
     }
 }
 
@@ -60,7 +60,6 @@ impl KfConst {
 pub struct InertialInitFactor {
     kf_i: KfConst,
     kf_j: KfConst,
-    dt: f64,
     pim: PreintegratedImu,
     /// Cholesky factor `L` of the 9×9 information matrix (`L Lᵀ = C⁻¹`),
     /// used to whiten the raw residual/Jacobian before returning them.
@@ -84,11 +83,9 @@ pub struct InertialInitFactor {
 impl InertialInitFactor {
     pub fn new(kf_i: KfConst, kf_j: KfConst, pim: PreintegratedImu, is_mono: bool) -> Self {
         let sqrt_info = sqrt_information_9x9(&pim.covariance);
-        let dt = pim.dt;
         Self {
             kf_i,
             kf_j,
-            dt,
             pim,
             sqrt_info,
             is_mono,
@@ -134,7 +131,7 @@ impl Factor for InertialInitFactor {
             1.0
         };
 
-        let dt = self.dt;
+        let dt = self.pim.dt;
         let r_bw_i = self.kf_i.r_bw;
         let r_wb_j = self.kf_j.r_bw.transpose();
 
@@ -163,7 +160,7 @@ impl Factor for InertialInitFactor {
         let dv_world = scale * (v_j - v_i) - g * dt;
         let ev = r_bw_i * dv_world - d_vel;
 
-        let dp_world = scale * (self.kf_j.twb - self.kf_i.twb - v_i * dt) - g * (0.5 * dt * dt);
+        let dp_world = scale * (self.kf_j.t_wb - self.kf_i.t_wb - v_i * dt) - g * (0.5 * dt * dt);
         let ep = r_bw_i * dp_world - d_pos;
 
         let residual =
@@ -215,7 +212,7 @@ impl Factor for InertialInitFactor {
             // at its seed value of 1.0 under LM (see `is_mono` doc comment).
             if self.is_mono {
                 let d_ev_d_s = r_bw_i * (v_j - v_i);
-                let d_ep_d_s = r_bw_i * (self.kf_j.twb - self.kf_i.twb - v_i * dt);
+                let d_ep_d_s = r_bw_i * (self.kf_j.t_wb - self.kf_i.t_wb - v_i * dt);
                 set_col3(&mut jac, 3, 15, d_ev_d_s);
                 set_col3(&mut jac, 6, 15, d_ep_d_s);
             }
