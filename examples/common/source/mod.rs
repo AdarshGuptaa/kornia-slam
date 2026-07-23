@@ -16,7 +16,6 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_image::Image;
 use kornia_imgproc::features::OrbFeatures;
-use kornia_tensor::CpuAllocator;
 
 use crate::datasets::euroc::ImuSample;
 
@@ -36,9 +35,9 @@ pub struct FrameItem {
     #[allow(dead_code)]
     pub timestamp_sec: f64,
     /// Grayscale image (rectified left view when the source is stereo).
-    pub image: Image<u8, 1, CpuAllocator>,
+    pub image: Image<u8, 1>,
     /// Rectified right view, when the source provides a stereo pair.
-    pub right_image: Option<Image<u8, 1, CpuAllocator>>,
+    pub right_image: Option<Image<u8, 1>>,
     /// IMU samples between the previous yielded camera frame and this one.
     #[allow(dead_code)]
     pub imu_samples: Vec<ImuSample>,

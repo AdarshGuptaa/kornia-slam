@@ -27,7 +27,6 @@ use kornia_algebra::Vec2F64;
 use kornia_image::Image;
 use kornia_imgproc::features::OrbFeatures;
 use kornia_io::png::read_image_png_mono8;
-use kornia_tensor::CpuAllocator;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::euroc::GroundTruthPose;
@@ -104,11 +103,10 @@ impl HiltiSource {
 
 /// Rotates a single-channel image 180° in place. For one channel this is just a
 /// reverse of the row-major pixel buffer: `out[i] = in[N-1-i]`.
-fn rotate_180_mono(img: &Image<u8, 1, CpuAllocator>) -> Image<u8, 1, CpuAllocator> {
+fn rotate_180_mono(img: &Image<u8, 1>) -> Image<u8, 1> {
     let mut buf = img.as_slice().to_vec();
     buf.reverse();
-    Image::from_size_slice(img.size(), &buf, CpuAllocator)
-        .expect("rotated buffer matches original size")
+    Image::from_size_slice(img.size(), &buf).expect("rotated buffer matches original size")
 }
 
 impl FrameSource for HiltiSource {
@@ -271,7 +269,6 @@ mod tests {
                 height: 2,
             },
             &[1u8, 2, 3, 4],
-            CpuAllocator,
         )
         .unwrap();
         let rot = rotate_180_mono(&img);

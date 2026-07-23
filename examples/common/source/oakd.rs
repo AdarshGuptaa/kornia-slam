@@ -13,7 +13,6 @@ use depthai::common::{CameraBoardSocket, ImageFrameType};
 use depthai::{Device, Pipeline as DaiPipeline};
 use kornia_3d::camera::PinholeCamera;
 use kornia_image::{Image, ImageSize};
-use kornia_tensor::CpuAllocator;
 
 use super::{FrameItem, FrameSource, SourceError};
 use crate::datasets::{StereoCalib, StereoRectifier};
@@ -234,7 +233,7 @@ fn pull_gray8(
     queue: &mut OutputQueue,
     image_size: &ImageSize,
     n_pixels: usize,
-) -> Result<Image<u8, 1, CpuAllocator>, SourceError> {
+) -> Result<Image<u8, 1>, SourceError> {
     loop {
         let frame_msg = match queue.try_next().map_err(SourceError::other)? {
             Some(f) => f,
@@ -264,6 +263,6 @@ fn pull_gray8(
             );
             continue;
         }
-        return Image::new(*image_size, bytes, CpuAllocator).map_err(SourceError::other);
+        return Image::new(*image_size, bytes).map_err(SourceError::other);
     }
 }

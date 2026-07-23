@@ -9,8 +9,6 @@ use kornia_algebra::Mat3F64;
 use kornia_image::{Image, ImageSize};
 #[cfg(feature = "viz")]
 use kornia_slam::map::MapPoint;
-#[cfg(feature = "viz")]
-use kornia_tensor::CpuAllocator;
 
 #[cfg(feature = "viz")]
 const CAMERA_IMAGE_PLANE_DISTANCE: f32 = 0.15;
@@ -29,7 +27,7 @@ struct CameraVisualizationSpec {
 #[cfg(feature = "viz")]
 pub fn log_frame_to_rerun(
     rec: &rerun::RecordingStream,
-    image: &Image<u8, 1, CpuAllocator>,
+    image: &Image<u8, 1>,
     keypoints_xy: &[[f32; 2]],
 ) {
     rec.log(
