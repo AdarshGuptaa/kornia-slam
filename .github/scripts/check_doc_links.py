@@ -43,6 +43,27 @@ AUTOLINK_RE = re.compile(r"<((?:https?://|mailto:)[^>\s]+)>")
 errors: list[str] = []
 notes: list[str] = []
 
+# Things that look like an address but are not a mailbox.
+NOT_MAILBOXES = re.compile(
+    r"@(?:\d+x)?\.(?:png|jpe?g|svg|gif|webp|ico)$|^git@", re.I
+)
+
+COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+FENCE_RE = re.compile(r"^```.*?^```", re.S | re.M)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+
+def strip_noncontent(text: str) -> str:
+    """Drop HTML comments and code so template snippets are not treated as links.
+
+    kornia/kornia's BACKERS.md documents how to add a sponsor logo with an
+    example `![Name](./logos/name.svg)` inside an HTML comment. That file
+    does not exist and is not meant to; flagging it would be a false alarm.
+    """
+    text = COMMENT_RE.sub("", text)
+    text = FENCE_RE.sub("", text)
+    return INLINE_CODE_RE.sub("", text)
+
 
 def markdown_files() -> list[Path]:
     out: list[Path] = []
@@ -87,7 +108,7 @@ def main() -> int:
 
     for path in files:
         rel = path.relative_to(ROOT)
-        text = path.read_text(encoding="utf-8")
+        text = strip_noncontent(path.read_text(encoding="utf-8"))
 
         targets = set(LINK_RE.findall(text)) | set(AUTOLINK_RE.findall(text))
 
@@ -119,7 +140,10 @@ def main() -> int:
         # The trailing group must not be [\w.-]+, or a sentence-ending period
         # gets swallowed into the address ("hello@kornia.org." != the mailbox).
         addr_re = r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
-        for addr in set(re.findall(addr_re, path.read_text(encoding="utf-8"))):
+        body = strip_noncontent(path.read_text(encoding="utf-8"))
+        for addr in set(re.findall(addr_re, body)):
+            if NOT_MAILBOXES.search(addr):
+                continue  # image filename or an SSH remote, not an address
             emails.setdefault(addr, []).append(str(rel))
 
     mode = "offline" if offline else "networked"
