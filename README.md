@@ -71,8 +71,7 @@ short-lived `feat/*` and `fix/*` branches on top and tags for releases.
 
 ## Roadmap
 
-Everything below is a roadmap entry, not a shipped capability. Design notes live in
-[docs/plans](docs/plans).
+Everything below is a roadmap entry, not a shipped capability.
 
 **Next — complete the SLAM stack**
 - [ ] Relocalization on tracking loss
