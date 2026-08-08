@@ -15,7 +15,9 @@ use kornia_image::Image;
 use kornia_imgproc::features::{OrbMatchConfig, hamming_distance, match_orb_descriptors};
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::Frame;
-use kornia_slam::estimation::optical_flow::{KltTracker, MapKeypointMatch, TrackSet, snap_unique};
+use kornia_slam::estimation::optical_flow::{
+    FlowSurvivor, KltTracker, MapKeypointMatch, TrackSet, snap_unique,
+};
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
 use kornia_slam::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
@@ -898,6 +900,8 @@ impl Pipeline {
                 )
             }
             Err(reason) => {
+                carry_klt_survivors(&mut self.track_set, klt_survivors);
+
                 // Carry the predicted pose forward instead of freezing at
                 // pose_before. state.velocity_world was already advanced by
                 // predict_pose_imu above regardless of visual outcome, so
@@ -969,6 +973,7 @@ impl Pipeline {
                     "[lost] frame={} giving up after {:.2}s (map_established={}): resetting",
                     frame.idx, recently_lost_for, map_established,
                 ));
+                self.track_set = TrackSet::new();
                 self.state.reset();
                 return self.bootstrap_step(frame, timestamp_sec);
             }
@@ -1592,6 +1597,12 @@ impl Pipeline {
         }
 
         n_fused
+    }
+}
+
+fn carry_klt_survivors(track_set: &mut TrackSet, survivors: Option<Vec<FlowSurvivor>>) {
+    if survivors.is_none_or(|survivors| track_set.advance(survivors).is_err()) {
+        *track_set = TrackSet::new();
     }
 }
 
