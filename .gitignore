@@ -3,3 +3,4 @@ runs/
 mono_vo_run-*/
 .worktrees/
 docs/
+DETAILS.md
