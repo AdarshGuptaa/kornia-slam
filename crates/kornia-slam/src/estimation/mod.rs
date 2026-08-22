@@ -11,7 +11,10 @@ use kornia_3d::pose::Pose3d;
 
 pub use imu_init::{ImuInitConfig, ImuInitResult, ImuInitializer};
 pub use map_projection::MapProjectionEstimator;
-pub use optical_flow::{Track, TrackState};
+pub use optical_flow::{
+    FlowSurvivor, KeypointCorrespondence, KltTracker, MapKeypointMatch, SurvivorFilterConfig,
+    Track, TrackId, TrackSet, TrackSetError,
+};
 
 /// Successful pose estimate returned by any estimator.
 #[derive(Debug, Clone)]
