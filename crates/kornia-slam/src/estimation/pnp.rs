@@ -272,3 +272,153 @@ pub fn count_reprojection_inliers(
     }
     inliers
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_camera() -> PinholeCamera {
+        PinholeCamera {
+            fx: 300.0,
+            fy: 300.0,
+            cx: 320.0,
+            cy: 240.0,
+            k1: 0.0,
+            k2: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+        }
+    }
+
+    fn synthetic_correspondences(
+        camera: &PinholeCamera,
+        pose: &Pose3d,
+        count: usize,
+    ) -> (Vec<Vec3F64>, Vec<Vec2F32>) {
+        let points_world: Vec<Vec3F64> = (0..count)
+            .map(|i| {
+                let x = (i % 5) as f64 * 0.35 - 0.7;
+                let y = (i / 5) as f64 * 0.28 - 0.7;
+                let z = 4.0 + (i % 4) as f64 * 0.4;
+                Vec3F64::new(x, y, z)
+            })
+            .collect();
+        let points_image = points_world
+            .iter()
+            .map(|point| {
+                let point_camera = pose.transform_point(point);
+                let pixel = camera.project_to_pixel(&point_camera, 0.0).unwrap();
+                Vec2F32::new(pixel.x as f32, pixel.y as f32)
+            })
+            .collect();
+        (points_world, points_image)
+    }
+
+    #[test]
+    fn robust_defaults_match_tracking_configuration() {
+        let config = PnpConfig::default();
+
+        assert_eq!(config.robust, RobustKernelKind::Huber);
+        assert_eq!(config.robust_scale_sq, 25.0);
+        assert_eq!(config.outlier_rounds, 4);
+    }
+
+    #[test]
+    fn diagnostics_report_insufficient_input() {
+        let camera = test_camera();
+        let (points_world, points_image) = synthetic_correspondences(&camera, &Pose3d::IDENTITY, 3);
+
+        let (result, diagnostics) = solve_pnp_with_diagnostics(
+            &points_world,
+            &points_image,
+            &camera,
+            &Pose3d::IDENTITY,
+            &PnpConfig::default(),
+        );
+
+        assert!(result.is_none());
+        assert_eq!(diagnostics.input, 3);
+        assert_eq!(diagnostics.prior_survivors, 0);
+        assert_eq!(diagnostics.last_round_active, 0);
+    }
+
+    #[test]
+    fn diagnostics_report_prior_gate_starvation() {
+        let camera = test_camera();
+        let (points_world, mut points_image) =
+            synthetic_correspondences(&camera, &Pose3d::IDENTITY, 8);
+        for point in &mut points_image {
+            point.x += 100.0;
+        }
+        let config = PnpConfig {
+            prior_reproj_threshold_px: 1.0,
+            ..PnpConfig::default()
+        };
+
+        let (result, diagnostics) = solve_pnp_with_diagnostics(
+            &points_world,
+            &points_image,
+            &camera,
+            &Pose3d::IDENTITY,
+            &config,
+        );
+
+        assert!(result.is_none());
+        assert_eq!(diagnostics.prior_survivors, 0);
+        assert_eq!(diagnostics.last_round_active, 0);
+    }
+
+    #[test]
+    fn solves_clean_synthetic_correspondences() {
+        let camera = test_camera();
+        let expected_pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.1, -0.05, 0.15));
+        let (points_world, points_image) = synthetic_correspondences(&camera, &expected_pose, 24);
+        let config = PnpConfig {
+            prior_reproj_threshold_px: 50.0,
+            final_reproj_threshold_px: 1.0,
+            ..PnpConfig::default()
+        };
+
+        let (pose, inliers) = solve_pnp(
+            &points_world,
+            &points_image,
+            &camera,
+            &Pose3d::IDENTITY,
+            &config,
+        )
+        .expect("clean correspondences should solve");
+
+        assert_eq!(inliers, points_world.len());
+        assert!((pose.translation - expected_pose.translation).length() < 1e-3);
+    }
+
+    #[test]
+    fn exclusion_rounds_remove_reprojection_outliers() {
+        let camera = test_camera();
+        let expected_pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.1, -0.05, 0.15));
+        let (points_world, mut points_image) =
+            synthetic_correspondences(&camera, &expected_pose, 30);
+        for point in points_image.iter_mut().step_by(6) {
+            point.x += 30.0;
+            point.y -= 20.0;
+        }
+        let config = PnpConfig {
+            prior_reproj_threshold_px: 100.0,
+            final_reproj_threshold_px: 2.0,
+            ..PnpConfig::default()
+        };
+
+        let (result, diagnostics) = solve_pnp_with_diagnostics(
+            &points_world,
+            &points_image,
+            &camera,
+            &Pose3d::IDENTITY,
+            &config,
+        );
+        let (_, inliers) = result.expect("robust solve should retain the inlier set");
+
+        assert_eq!(diagnostics.prior_survivors, points_world.len());
+        assert!(diagnostics.last_round_active < diagnostics.prior_survivors);
+        assert!(inliers >= 25);
+    }
+}

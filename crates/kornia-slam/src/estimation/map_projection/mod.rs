@@ -620,6 +620,7 @@ mod estimator_tests {
 mod matching_tests {
     use super::*;
     use kornia_algebra::{Mat3F64, Vec3F64};
+    use kornia_imgproc::features::OrbFeatures;
 
     fn make_test_estimator() -> MapProjectionEstimator {
         MapProjectionEstimator::new(MapProjectionConfig::default())
@@ -636,6 +637,116 @@ mod matching_tests {
             p1: 0.0,
             p2: 0.0,
         }
+    }
+
+    fn test_frame(keypoints: Vec<[f32; 2]>) -> Frame {
+        let count = keypoints.len();
+        Frame {
+            idx: 0,
+            features: OrbFeatures {
+                keypoints_xy: keypoints.clone(),
+                orientations: vec![0.0; count],
+                descriptors: vec![[0; 32]; count],
+                octaves: vec![0; count],
+            },
+            pose_world_to_cam: Pose3d::IDENTITY,
+            image_size: ImageSize {
+                width: 640,
+                height: 480,
+            },
+            keypoint_colors: vec![[0; 3]; count],
+            u_right: Vec::new(),
+            depth: Vec::new(),
+            keypoints_undist: keypoints,
+        }
+    }
+
+    fn two_view_keypoints(camera: &PinholeCamera, count: usize) -> (Vec<[f32; 2]>, Vec<[f32; 2]>) {
+        let angle = 5.0_f64.to_radians();
+        let (sin, cos) = angle.sin_cos();
+        let rotation = Mat3F64::from_cols(
+            Vec3F64::new(cos, 0.0, -sin),
+            Vec3F64::new(0.0, 1.0, 0.0),
+            Vec3F64::new(sin, 0.0, cos),
+        );
+        let current_pose = Pose3d::new(rotation, Vec3F64::new(0.2, 0.05, 0.0));
+        let mut random_state = 12_345_678_901_234_567_u64;
+        let random = |state: &mut u64| -> f64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*state >> 32) as f64 / 4_294_967_296.0
+        };
+        let mut reference = Vec::with_capacity(count);
+        let mut current = Vec::with_capacity(count);
+        for _ in 0..count {
+            let point = Vec3F64::new(
+                (random(&mut random_state) - 0.5) * 3.0,
+                (random(&mut random_state) - 0.5) * 2.0,
+                random(&mut random_state) * 3.0 + 3.0,
+            );
+            let reference_pixel = camera.project_to_pixel(&point, 0.0).unwrap();
+            let current_pixel = camera
+                .project_to_pixel(&current_pose.transform_point(&point), 0.0)
+                .unwrap();
+            reference.push([reference_pixel.x as f32, reference_pixel.y as f32]);
+            current.push([current_pixel.x as f32, current_pixel.y as f32]);
+        }
+        (reference, current)
+    }
+
+    #[test]
+    fn geometric_filter_rejects_epipolar_outlier() {
+        let estimator = make_test_estimator();
+        let camera = test_camera();
+        let (reference, mut current) = two_view_keypoints(&camera, 30);
+        current[29] = [80.0, 430.0];
+        current.push([10.0, 10.0]);
+
+        let mut keyframe = Keyframe::from_frame(test_frame(reference));
+        for index in 0..30 {
+            keyframe.associate_map_point(index, index);
+        }
+        let mut correspondences: Vec<(usize, usize)> = (0..30).map(|i| (i, i)).collect();
+        let uncheckable = (1000, 30);
+        correspondences.push(uncheckable);
+
+        let filtered = estimator.geometric_consistency_filter(
+            Some(&keyframe),
+            &correspondences,
+            &current,
+            &camera,
+        );
+
+        assert!(!filtered.contains(&(29, 29)));
+        assert!(filtered.contains(&uncheckable));
+        assert_eq!(filtered.len(), 30);
+    }
+
+    #[test]
+    fn geometric_filter_is_noop_without_enough_reference_pairs() {
+        let estimator = make_test_estimator();
+        let camera = test_camera();
+        let (reference, current) = two_view_keypoints(&camera, 7);
+        let mut keyframe = Keyframe::from_frame(test_frame(reference));
+        for index in 0..7 {
+            keyframe.associate_map_point(index, index);
+        }
+        let correspondences: Vec<(usize, usize)> = (0..7).map(|i| (i, i)).collect();
+
+        assert_eq!(
+            estimator.geometric_consistency_filter(
+                Some(&keyframe),
+                &correspondences,
+                &current,
+                &camera,
+            ),
+            correspondences
+        );
+        assert_eq!(
+            estimator.geometric_consistency_filter(None, &correspondences, &current, &camera),
+            correspondences
+        );
     }
 
     #[test]
