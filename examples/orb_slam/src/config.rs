@@ -1,6 +1,6 @@
-use crate::local_mapping::LocalMappingMode;
 use kornia_slam::estimation::map_projection::MapProjectionConfig;
 use kornia_slam::estimation::two_view::TwoViewInitConfig;
+use kornia_slam::map::LocalMappingMode;
 use kornia_slam::system::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// Example-local pipeline preset used by the standalone ORB-SLAM binary.

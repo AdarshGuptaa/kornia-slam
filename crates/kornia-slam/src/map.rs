@@ -25,6 +25,10 @@
 //!      * run_local_ba
 //! ```
 
+mod local_mapping;
+
+pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
+
 use std::collections::{HashMap, HashSet};
 
 use crate::frame::Frame;

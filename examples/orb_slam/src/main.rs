@@ -26,7 +26,6 @@ mod config;
 #[path = "../../common/datasets/mod.rs"]
 mod datasets;
 mod evaluation;
-mod local_mapping;
 mod pipeline;
 #[path = "../../common/source/mod.rs"]
 mod source;
@@ -41,8 +40,8 @@ use kornia_image::{Image, ImageSize, InterpolationMode};
 use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::Frame;
+use kornia_slam::map::LocalMappingMode;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use local_mapping::LocalMappingMode;
 use pipeline::Pipeline;
 #[cfg(feature = "oakd")]
 use source::OakdSource;

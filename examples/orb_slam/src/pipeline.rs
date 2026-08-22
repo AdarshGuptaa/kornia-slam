@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::config::PipelineConfig;
-use crate::local_mapping::{KeyframeJob, LocalMapping};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::pose::{TriangulationConfig, triangulate_matched_points};
@@ -17,7 +16,7 @@ use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, 
 use kornia_slam::Frame;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
-use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
+use kornia_slam::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,

@@ -6,7 +6,7 @@ use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 
-use kornia_slam::map::{LocalBaMergeResult, LocalBaSnapshot, Map};
+use super::{LocalBaMergeResult, LocalBaSnapshot, Map};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LocalMappingMode {
@@ -292,7 +292,7 @@ mod tests {
     use kornia_algebra::Vec3F64;
 
     use super::{KeyframeJob, LocalMapping, LocalMappingBackend, LocalMappingMode};
-    use kornia_slam::map::Map;
+    use crate::map::Map;
 
     fn test_camera() -> PinholeCamera {
         PinholeCamera {
