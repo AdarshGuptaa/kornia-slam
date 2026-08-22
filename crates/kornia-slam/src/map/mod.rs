@@ -25,6 +25,10 @@
 //!      * run_local_ba
 //! ```
 
+mod local_mapping;
+
+pub use local_mapping::{KeyframeJob, LocalMapping, LocalMappingMode};
+
 use std::collections::{HashMap, HashSet};
 
 use crate::frame::Frame;
@@ -286,18 +290,172 @@ pub struct InitialMapHealth {
     pub median_depth_older_kf: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct KeyframeBaState {
+    idx: usize,
+    pose_world_to_cam: Pose3d,
+    velocity_world: Vec3F64,
+    imu_bias: ImuBias,
+}
+
+/// A private copy of the map on which local bundle adjustment can run without
+/// holding the live map lock.
+#[derive(Debug, Clone)]
+pub struct LocalBaSnapshot {
+    optimized: Map,
+    world_epoch: u64,
+    keyframes_before: Vec<KeyframeBaState>,
+    map_points_before: Vec<Vec3F64>,
+}
+
+impl LocalBaSnapshot {
+    /// Optimizes the visual local window in this private snapshot.
+    pub fn run_visual(&mut self, camera: &PinholeCamera) {
+        self.optimized.run_local_ba(camera);
+    }
+
+    /// Optimizes the visual-inertial local window in this private snapshot.
+    pub fn run_inertial(
+        &mut self,
+        camera: &PinholeCamera,
+        imu_t_bc: Option<Pose3d>,
+        gravity_world: Vec3F64,
+    ) {
+        self.optimized
+            .run_local_inertial_ba(camera, imu_t_bc, gravity_world);
+    }
+}
+
+/// A keyframe state change accepted from an asynchronous local BA result.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyframeBaCorrection {
+    pub kf_idx: usize,
+    pub pose_before: Pose3d,
+    pub pose_after: Pose3d,
+    pub velocity_world: Vec3F64,
+    pub imu_bias: ImuBias,
+}
+
+/// Changes accepted while merging an asynchronous local BA snapshot.
+#[derive(Debug, Default)]
+pub struct LocalBaMergeResult {
+    pub keyframe_corrections: Vec<KeyframeBaCorrection>,
+    pub map_points_updated: usize,
+}
+
 /// In-memory map storage for keyframes and persistent map points.
 #[derive(Debug, Clone, Default)]
 pub struct Map {
     keyframes: Vec<Keyframe>,
     map_points: Vec<MapPoint>,
     imu_factors: Vec<ImuFactor>,
+    // Incremented whenever the map's world coordinate frame changes. Local BA
+    // snapshots from an older epoch must never be merged into the new frame.
+    world_epoch: u64,
 }
 
 impl Map {
     /// Creates an empty map.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a private local-BA snapshot. The returned value owns all solver
+    /// inputs and can be optimized without holding a lock on this map.
+    pub fn local_ba_snapshot(&self) -> LocalBaSnapshot {
+        LocalBaSnapshot {
+            optimized: self.clone(),
+            world_epoch: self.world_epoch,
+            keyframes_before: self
+                .keyframes
+                .iter()
+                .map(|kf| KeyframeBaState {
+                    idx: kf.frame.idx,
+                    pose_world_to_cam: kf.frame.pose_world_to_cam,
+                    velocity_world: kf.velocity_world,
+                    imu_bias: kf.imu_bias,
+                })
+                .collect(),
+            map_points_before: self.map_points.iter().map(|mp| mp.position).collect(),
+        }
+    }
+
+    /// Merges solver-changed geometry from a local-BA snapshot.
+    ///
+    /// Entities inserted after the snapshot are left untouched. A snapshot is
+    /// rejected wholesale if the live map has since been scaled, rotated, or
+    /// cleared, because its coordinates then belong to another world frame.
+    pub fn merge_local_ba_snapshot(
+        &mut self,
+        snapshot: LocalBaSnapshot,
+    ) -> Option<LocalBaMergeResult> {
+        if self.world_epoch != snapshot.world_epoch {
+            return None;
+        }
+
+        let mut result = LocalBaMergeResult::default();
+        for (before, optimized) in snapshot
+            .keyframes_before
+            .iter()
+            .zip(snapshot.optimized.keyframes.iter())
+        {
+            if !keyframe_ba_state_changed(before, optimized) {
+                continue;
+            }
+            let Some(live) = self.get_keyframe_mut(before.idx) else {
+                continue;
+            };
+
+            let pose_before = live.frame.pose_world_to_cam;
+            live.frame.pose_world_to_cam = optimized.frame.pose_world_to_cam;
+            live.velocity_world = optimized.velocity_world;
+            live.imu_bias = optimized.imu_bias;
+            result.keyframe_corrections.push(KeyframeBaCorrection {
+                kf_idx: before.idx,
+                pose_before,
+                pose_after: optimized.frame.pose_world_to_cam,
+                velocity_world: optimized.velocity_world,
+                imu_bias: optimized.imu_bias,
+            });
+        }
+
+        let mut changed_points = Vec::new();
+        for (idx, (&before, optimized)) in snapshot
+            .map_points_before
+            .iter()
+            .zip(snapshot.optimized.map_points.iter())
+            .enumerate()
+        {
+            if optimized.position == before {
+                continue;
+            }
+            let Some(live) = self.map_points.get_mut(idx) else {
+                continue;
+            };
+            if live.culled {
+                continue;
+            }
+            live.position = optimized.position;
+            changed_points.push(idx);
+        }
+        result.map_points_updated = changed_points.len();
+
+        for idx in changed_points {
+            self.update_map_point_geometry(idx, ORB_SCALE_FACTOR, ORB_N_LEVELS);
+        }
+
+        // VI-BA may repropagate an existing preintegration on its private copy.
+        // Preserve newer live factors while copying those refreshed edges back.
+        for optimized in &snapshot.optimized.imu_factors {
+            if let Some(live) = self.imu_factors.iter_mut().find(|live| {
+                live.prev_kf_idx == optimized.prev_kf_idx
+                    && live.curr_kf_idx == optimized.curr_kf_idx
+            }) {
+                live.preintegrated = optimized.preintegrated.clone();
+            }
+        }
+        self.cull();
+        Some(result)
     }
 
     /// Returns all keyframes.
@@ -339,6 +497,7 @@ impl Map {
 
     /// Applies a metric scale to camera centers and map points.
     pub fn scale_world(&mut self, scale: f64) {
+        self.world_epoch = self.world_epoch.wrapping_add(1);
         for kf in &mut self.keyframes {
             let mut cam_to_world = kf.frame.pose_world_to_cam.inverse();
             cam_to_world.translation *= scale;
@@ -351,6 +510,7 @@ impl Map {
     }
 
     pub fn rotate_world(&mut self, r: &SO3F64) {
+        self.world_epoch = self.world_epoch.wrapping_add(1);
         for kf in self.keyframes_mut() {
             let cam_to_world = kf.frame.pose_world_to_cam.inverse();
             let new_translation = *r * cam_to_world.translation;
@@ -384,6 +544,7 @@ impl Map {
 
     /// Wipes all keyframes and map points. Used to discard a failed bootstrap.
     pub fn clear_active(&mut self) {
+        self.world_epoch = self.world_epoch.wrapping_add(1);
         self.keyframes.clear();
         self.map_points.clear();
         self.imu_factors.clear();
@@ -1302,6 +1463,13 @@ impl Map {
     }
 }
 
+fn keyframe_ba_state_changed(before: &KeyframeBaState, after: &Keyframe) -> bool {
+    before.pose_world_to_cam != after.frame.pose_world_to_cam
+        || before.velocity_world != after.velocity_world
+        || before.imu_bias.gyro != after.imu_bias.gyro
+        || before.imu_bias.accel != after.imu_bias.accel
+}
+
 /// Depth measurement + sigma for a BA observation at `desc_idx` of `kf`.
 ///
 /// Returns `(Some(z), sigma)` when the keyframe's keypoint has a valid stereo
@@ -1606,6 +1774,78 @@ mod tests {
 
         assert!(map.map_points()[first_idx].culled);
         assert!(!map.map_points()[second_idx].culled);
+    }
+
+    #[test]
+    fn local_ba_snapshot_merge_updates_only_snapshot_entities() {
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
+        map.push_map_point(MapPoint::new(
+            Vec3F64::new(0.0, 0.0, 5.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        ));
+
+        let mut snapshot = map.local_ba_snapshot();
+        snapshot.optimized.keyframes[0]
+            .frame
+            .pose_world_to_cam
+            .translation
+            .x = 2.0;
+        snapshot.optimized.map_points[0].position.x = 3.0;
+
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(1, vec![[1u8; 32]])));
+        let later_point = map.push_map_point(MapPoint::new(
+            Vec3F64::new(9.0, 0.0, 5.0),
+            [1u8; 32],
+            0,
+            [0; 3],
+            1,
+        ));
+
+        let merged = map
+            .merge_local_ba_snapshot(snapshot)
+            .expect("snapshot should still use the live world frame");
+
+        assert_eq!(merged.keyframe_corrections.len(), 1);
+        assert_eq!(merged.keyframe_corrections[0].kf_idx, 0);
+        assert_eq!(
+            map.get_keyframe(0)
+                .unwrap()
+                .frame
+                .pose_world_to_cam
+                .translation
+                .x,
+            2.0
+        );
+        assert_eq!(map.map_points()[0].position.x, 3.0);
+        assert_eq!(
+            map.get_keyframe(1).unwrap().frame.pose_world_to_cam,
+            Pose3d::IDENTITY
+        );
+        assert_eq!(map.map_points()[later_point].position.x, 9.0);
+    }
+
+    #[test]
+    fn local_ba_snapshot_merge_rejects_an_obsolete_world_frame() {
+        let mut map = Map::new();
+        map.upsert_keyframe(Keyframe::from_frame(test_frame(0, vec![[0u8; 32]])));
+        map.push_map_point(MapPoint::new(
+            Vec3F64::new(1.0, 0.0, 5.0),
+            [0u8; 32],
+            0,
+            [0; 3],
+            0,
+        ));
+
+        let mut snapshot = map.local_ba_snapshot();
+        snapshot.optimized.map_points[0].position.x = 7.0;
+        map.scale_world(2.0);
+
+        assert!(map.merge_local_ba_snapshot(snapshot).is_none());
+        assert_eq!(map.map_points()[0].position.x, 2.0);
     }
 
     // ── Scale-invariance state (T1: deterministic, cross-checked vs ORB-SLAM3

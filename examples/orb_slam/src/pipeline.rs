@@ -4,6 +4,7 @@
 //! to bottom in the same order frames move through the system.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use crate::config::PipelineConfig;
 use kornia_3d::camera::PinholeCamera;
@@ -15,7 +16,7 @@ use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, ImuCalib, ImuMeasurement, 
 use kornia_slam::Frame;
 use kornia_slam::estimation::two_view::{TwoViewInitConfig, try_initialize_two_view};
 use kornia_slam::estimation::{ImuInitConfig, ImuInitializer, MapProjectionEstimator};
-use kornia_slam::map::{Keyframe, Map, MapPoint, ORB_SCALE_FACTOR};
+use kornia_slam::map::{Keyframe, KeyframeJob, LocalMapping, Map, MapPoint, ORB_SCALE_FACTOR};
 use kornia_slam::stereo::unproject_stereo;
 use kornia_slam::system::{
     KeyframePolicy, SystemMode, SystemState, TrackingLossRecoveryPolicy, TrackingResult,
@@ -34,8 +35,6 @@ pub struct Pipeline {
     keyframe_policy: KeyframePolicy,
     // Recently-lost grace period policy
     tracking_loss_recovery: TrackingLossRecoveryPolicy,
-    // Enable local bundle adjustment after keyframe insertion
-    enable_local_ba: bool,
     // mThDepth (metres): back-project close stereo points at each keyframe when set
     stereo_close_depth: Option<f64>,
     // Emit per-frame diagnostic logs (skip/reject reasons, growth counters)
@@ -44,7 +43,9 @@ pub struct Pipeline {
     // drained by the caller (TUI panel or stderr).
     debug_messages: Vec<String>,
     // Map object
-    map: Map,
+    map: Arc<Mutex<Map>>,
+    // Serializes compound map publication and short local-BA snapshot/merge phases.
+    map_publication_gate: Option<Arc<Mutex<()>>>,
     // IMU states
     imu_calib: ImuCalib,
     imu_bias: ImuBias,
@@ -75,7 +76,7 @@ pub struct Pipeline {
     // Map::GetIniertialBA1()/GetIniertialBA2() latching in ORB-SLAM3.
     imu_viba1_done: bool,
     imu_viba2_done: bool,
-
+    local_mapping: LocalMapping,
     // System state
     state: SystemState,
 }
@@ -83,17 +84,22 @@ pub struct Pipeline {
 impl Pipeline {
     /// Creates a new pipeline with identity pose.
     pub fn new(camera: PinholeCamera, config: PipelineConfig) -> Self {
+        let map = Arc::new(Mutex::new(Map::new()));
+        let local_mapping =
+            LocalMapping::new(config.local_mapping, Arc::clone(&map), camera.clone());
+        let map_publication_gate = local_mapping.publication_gate();
         Self {
             camera,
             estimator: MapProjectionEstimator::new(config.map_projection),
             two_view_init_config: config.two_view_init,
             keyframe_policy: config.keyframe_policy,
             tracking_loss_recovery: config.tracking_loss_recovery,
-            enable_local_ba: config.enable_local_ba,
             stereo_close_depth: config.stereo_close_depth_m,
             debug: config.debug,
             debug_messages: Vec::new(),
-            map: Map::new(),
+            map,
+            map_publication_gate,
+            local_mapping,
             state: SystemState::new(),
             imu_calib: ImuCalib {
                 gyro_noise: 1.6968e-4,
@@ -138,6 +144,13 @@ impl Pipeline {
         timestamp_sec: f64,
         imu_samples: Vec<ImuMeasurement>,
     ) -> TrackingResult {
+        // Local-BA snapshots, merges, and their correction messages can only
+        // cross this boundary between complete tracking frames.
+        let publication_gate = self.map_publication_gate.clone();
+        let _publication = publication_gate
+            .as_ref()
+            .map(|gate| gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        self.apply_local_mapping_results();
         // Fill the per-frame undistortion cache once; tracking, BA gathering,
         // growth, and fuse all read from it.
         frame.ensure_undistorted(&self.camera);
@@ -150,21 +163,27 @@ impl Pipeline {
         }
     }
 
-    /// Returns all persistent map points.
-    pub fn map_points(&self) -> &[MapPoint] {
-        self.map.map_points()
+    /// Runs `f` against the live map points, holding the map lock only for the
+    /// duration of the call. Avoids cloning the whole point list (descriptors
+    /// included) for read-only consumers such as viz logging and summaries.
+    pub fn with_map_points<R>(&self, f: impl FnOnce(&[MapPoint]) -> R) -> R {
+        f(self.map.lock().unwrap().map_points())
     }
 
     /// Returns the index of the current reference keyframe, if tracking has one.
     pub fn current_keyframe_idx(&self) -> Option<usize> {
-        self.state
-            .current_keyframe_idx
-            .and_then(|ki| self.map.get_keyframe(ki).map(|kf| kf.frame.idx))
+        self.state.current_keyframe_idx.and_then(|ki| {
+            self.map
+                .lock()
+                .unwrap()
+                .get_keyframe(ki)
+                .map(|kf| kf.frame.idx)
+        })
     }
 
     /// Returns the number of active (non-culled) map points.
     pub fn num_active_map_points(&self) -> usize {
-        self.map.num_active_map_points()
+        self.map.lock().unwrap().num_active_map_points()
     }
 
     /// Drain any debug messages accumulated since the last call.
@@ -177,6 +196,32 @@ impl Pipeline {
         self.debug = on;
         if !on {
             self.debug_messages.clear();
+        }
+    }
+
+    fn apply_local_mapping_results(&mut self) {
+        let Some(reference_idx) = self.state.current_keyframe_idx else {
+            // Still drain results so a completed worker cannot build a result backlog.
+            let _ = self.local_mapping.drain_results();
+            return;
+        };
+
+        for result in self.local_mapping.drain_results() {
+            let Some(correction) = result
+                .keyframe_corrections
+                .iter()
+                .find(|correction| correction.kf_idx == reference_idx)
+            else {
+                continue;
+            };
+
+            self.state.pose_world_to_cam = apply_reference_pose_correction(
+                self.state.pose_world_to_cam,
+                correction.pose_before,
+                correction.pose_after,
+            );
+            self.state.velocity_world = correction.velocity_world;
+            self.imu_bias = correction.imu_bias;
         }
     }
 
@@ -236,8 +281,10 @@ impl Pipeline {
 
         let added = self
             .map
+            .lock()
+            .unwrap()
             .add_triangulated_points(None, &mut keyframe, &points);
-        self.map.upsert_keyframe(keyframe);
+        self.map.lock().unwrap().upsert_keyframe(keyframe);
 
         self.dbg(format!(
             "[bootstrap_stereo] frame={curr_idx} metric map created with {added} points",
@@ -298,7 +345,10 @@ impl Pipeline {
             points.push((p_world, descriptor, color, *desc_idx, *desc_idx));
         }
 
-        self.map.add_triangulated_points(None, curr_kf, &points)
+        self.map
+            .lock()
+            .unwrap()
+            .add_triangulated_points(None, curr_kf, &points)
     }
 
     fn bootstrap_mono(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
@@ -395,13 +445,13 @@ impl Pipeline {
         // CreateInitialMapMonocular). Discard the bootstrap if the resulting
         // map has too few valid points or a degenerate scale.
         const MIN_VALID_POINTS: usize = 50;
-        let health = self.map.initial_map_health();
+        let health = self.map.lock().unwrap().initial_map_health();
         if health.valid_in_both < MIN_VALID_POINTS || health.median_depth_older_kf <= 0.0 {
             self.dbg(format!(
                 "[init_gate] reject: valid_in_both={} median_depth={:.3} (need >= {} and > 0)",
                 health.valid_in_both, health.median_depth_older_kf, MIN_VALID_POINTS,
             ));
-            self.map.clear_active();
+            self.map.lock().unwrap().clear_active();
             self.state.reset();
             return TrackingResult {
                 pose_world_to_cam: self.state.pose_world_to_cam,
@@ -411,14 +461,14 @@ impl Pipeline {
 
         // BA inside build_initial_map may have refined KF1's pose; sync state
         // and recompute velocity from the post-BA pose.
-        if let Some(kf) = self.map.get_keyframe(curr_idx) {
+        if let Some(kf) = self.map.lock().unwrap().get_keyframe(curr_idx) {
             self.state.pose_world_to_cam = kf.frame.pose_world_to_cam;
         }
 
         if let Some(prev_ts) = self.bootstrap_timestamp_sec {
             let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_factor(
+                self.map.lock().unwrap().add_imu_factor(
                     prev_idx,
                     curr_idx,
                     preint,
@@ -505,16 +555,16 @@ impl Pipeline {
             triangulated.push((p_world, descriptor, color, ref_desc_idx, curr_desc_idx));
         }
 
-        let added = self.map.add_triangulated_points(
+        let added = self.map.lock().unwrap().add_triangulated_points(
             Some(&mut reference_kf),
             &mut current_kf,
             &triangulated,
         );
 
-        self.map.upsert_keyframe(reference_kf);
-        self.map.upsert_keyframe(current_kf);
+        self.map.lock().unwrap().upsert_keyframe(reference_kf);
+        self.map.lock().unwrap().upsert_keyframe(current_kf);
 
-        self.map.run_initial_ba(&self.camera);
+        self.map.lock().unwrap().run_initial_ba(&self.camera);
 
         added
     }
@@ -587,39 +637,35 @@ impl Pipeline {
         if result.status == TrackingStatus::KeyframeAccepted
             && let Some(start_idx) = self.inertial_init_start_kf_idx
         {
-            let kfs: Vec<_> = self
+            // Snapshot the fields needed after releasing the map lock.
+            let kfs: Vec<usize> = self
                 .map
+                .lock()
+                .unwrap()
                 .keyframes()
                 .iter()
                 .filter(|kf| kf.frame.idx >= start_idx)
+                .map(|kf| kf.frame.idx)
                 .collect();
             let imu_time: f64 = self
                 .map
+                .lock()
+                .unwrap()
                 .imu_factors()
                 .iter()
                 .filter(|f| f.curr_kf_idx >= start_idx)
                 .map(|f| f.preintegrated.dt)
                 .sum();
-            let motion = if let (Some(first), Some(last)) = (kfs.first(), kfs.last()) {
-                let t0 = first.frame.pose_world_to_cam.inverse().translation;
-                let t1 = last.frame.pose_world_to_cam.inverse().translation;
-                Some((t0, t1, (t1 - t0).length()))
-            } else {
-                None
-            };
-            println!(
-                "[imu_init_gate] start_idx={start_idx} first_idx={:?} last_idx={:?} kfs={}/{} imu_time={:.2}/{:.1}s motion={:?}",
-                kfs.first().map(|kf| kf.frame.idx),
-                kfs.last().map(|kf| kf.frame.idx),
+            let gate_msg = format_imu_init_gate(
+                start_idx,
+                kfs.first().copied(),
+                kfs.last().copied(),
                 kfs.len(),
                 self.inertial_init.config.min_keyframes,
                 imu_time,
                 self.inertial_init.config.min_time_sec,
-                motion.map(|(t0, t1, d)| format!(
-                    "t0={t0:?} t1={t1:?} dist={d:.4}/{:.2}",
-                    self.inertial_init.config.min_motion
-                )),
             );
+            self.dbg(gate_msg);
         }
 
         // Throttle retries: without this, once `ready()` is true, a rejected
@@ -632,13 +678,11 @@ impl Pipeline {
         let due_for_retry = self
             .inertial_init_last_attempt_sec
             .is_none_or(|last| timestamp_sec - last >= RETRY_INTERVAL_SEC);
+        let imu_init_ready = self
+            .inertial_init
+            .ready(&self.map.lock().unwrap(), self.inertial_init_start_kf_idx);
 
-        if result.status == TrackingStatus::KeyframeAccepted
-            && due_for_retry
-            && self
-                .inertial_init
-                .ready(&self.map, self.inertial_init_start_kf_idx)
-        {
+        if result.status == TrackingStatus::KeyframeAccepted && due_for_retry && imu_init_ready {
             let Some(start_idx) = self.inertial_init_start_kf_idx else {
                 return result;
             };
@@ -649,27 +693,31 @@ impl Pipeline {
             // window can't yet observe it; stereo uses priorA=1e5.
             let is_mono = !self
                 .map
+                .lock()
+                .unwrap()
                 .keyframes()
                 .iter()
                 .find(|kf| kf.frame.idx >= start_idx)
                 .map(|kf| kf.frame.is_stereo())
                 .unwrap_or(false);
             let prior_a0 = if is_mono { 1e10 } else { 1e5 };
-            match self.inertial_init.try_initialize(
-                &self.map,
+            // Drop the solve's map lock before applying its result with a new lock.
+            let init_result = self.inertial_init.try_initialize(
+                &self.map.lock().unwrap(),
                 self.imu_t_bc,
                 self.imu_bias,
                 start_idx,
                 1e2,
                 prior_a0,
                 false,
-            ) {
+            );
+            match init_result {
                 Some(init) => {
                     let scale = init.scale;
                     let gravity = init.gravity_world;
                     let bg = init.bias.gyro;
                     self.inertial_init.apply_initialization(
-                        &mut self.map,
+                        &mut self.map.lock().unwrap(),
                         &mut self.state,
                         &mut self.imu_bias,
                         &mut self.gravity_world,
@@ -683,6 +731,14 @@ impl Pipeline {
                     // resuming tracking.
                     self.state.mode = SystemMode::Tracking;
                     self.state.imu_init_timestamp_sec = Some(timestamp_sec);
+                    if !self.local_mapping.submit(KeyframeJob {
+                        imu_initialized: true,
+                        imu_t_bc: self.imu_t_bc,
+                        gravity_world: self.gravity_world,
+                    }) {
+                        self.dbg("[local_mapping] worker is unavailable".into());
+                    }
+                    self.apply_local_mapping_results();
                     self.dbg(format!(
                         "[imu_init] VIBA0 accepted: scale={scale:.4} gravity=({:.3},{:.3},{:.3}) \
                          gyro_bias=({:.4},{:.4},{:.4})",
@@ -702,6 +758,14 @@ impl Pipeline {
         let image_size = frame.image_size;
         let pose_before = self.state.pose_world_to_cam;
         let prev_timestamp = self.state.last_frame_timestamp_sec;
+
+        // Local BA updates keyframe state asynchronously, so refresh cached IMU state.
+        if let Some(kf_idx) = self.state.current_keyframe_idx
+            && let Some(kf) = self.map.lock().unwrap().get_keyframe(kf_idx)
+        {
+            self.state.velocity_world = kf.velocity_world;
+            self.imu_bias = kf.imu_bias;
+        }
 
         let candidate_pose = if self.state.imu_initialized && prev_timestamp > 0.0 {
             let (preint, _) = self.preintegrate_window(prev_timestamp, timestamp_sec);
@@ -738,7 +802,7 @@ impl Pipeline {
             &frame,
             &candidate_pose,
             &pose_before,
-            &self.map,
+            &self.map.lock().unwrap(),
             &self.camera,
             self.state.current_keyframe_idx,
             search_scale,
@@ -795,18 +859,22 @@ impl Pipeline {
             // Visibility bookkeeping over the local map only (mirrors
             // ORB-SLAM3, which counts mnVisible on local-map points): full-map
             // scans here would grow with trajectory length.
-            let current_kf = self
-                .state
-                .current_keyframe_idx
-                .and_then(|ki| self.map.get_keyframe(ki));
-            let local_indices = self.map.build_local_map_point_indices(&matches, current_kf);
-            let visible = self.map.map_points_in_frustum(
-                &local_indices,
-                &self.camera,
-                &candidate_pose,
-                image_size,
-            );
-            self.map.update_observation_counts(&visible, &matches);
+            // Release this non-reentrant lock before keyframe insertion locks the map.
+            {
+                let mut map_guard = self.map.lock().unwrap();
+                let current_kf = self
+                    .state
+                    .current_keyframe_idx
+                    .and_then(|ki| map_guard.get_keyframe(ki));
+                let local_indices = map_guard.build_local_map_point_indices(&matches, current_kf);
+                let visible = map_guard.map_points_in_frustum(
+                    &local_indices,
+                    &self.camera,
+                    &candidate_pose,
+                    image_size,
+                );
+                map_guard.update_observation_counts(&visible, &matches);
+            }
 
             if self.try_insert_keyframe(&frame, timestamp_sec, tracked_inliers, &matches) {
                 status = TrackingStatus::KeyframeAccepted;
@@ -825,7 +893,8 @@ impl Pipeline {
                     .imu_init_timestamp_sec
                     .is_some_and(|t0| timestamp_sec - t0 >= policy.min_imu_confidence_sec);
             let grace_period_sec = policy.grace_period_sec(imu_confident);
-            let map_established = self.map.keyframes().len() > policy.min_keyframes_for_grace;
+            let map_established =
+                self.map.lock().unwrap().keyframes().len() > policy.min_keyframes_for_grace;
 
             if !map_established || recently_lost_for >= grace_period_sec {
                 self.dbg(format!(
@@ -857,12 +926,14 @@ impl Pipeline {
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> bool {
-        let n_ref_map_points = self
-            .state
-            .current_keyframe_idx
-            .and_then(|ki| self.map.get_keyframe(ki))
-            .map(|kf| kf.num_associated_points())
-            .unwrap_or(0);
+        let n_ref_map_points = if let Some(ki) = self.state.current_keyframe_idx {
+            let map = self.map.lock().unwrap();
+            map.get_keyframe(ki)
+                .map(|kf| kf.num_associated_points())
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         if !self.keyframe_policy.should_insert(
             frame.idx,
@@ -874,12 +945,12 @@ impl Pipeline {
         }
 
         // Guard: reference KF must exist before we can triangulate.
-        if self
-            .state
-            .current_keyframe_idx
-            .and_then(|ki| self.map.get_keyframe(ki))
-            .is_none()
-        {
+        if let Some(ki) = self.state.current_keyframe_idx {
+            let map = self.map.lock().unwrap();
+            if map.get_keyframe(ki).is_none() {
+                return false;
+            }
+        } else {
             return false;
         }
 
@@ -902,7 +973,10 @@ impl Pipeline {
         }
         for &(mp_idx, curr_idx) in matches {
             curr_kf.associate_map_point(curr_idx, mp_idx);
-            self.map.register_observation(mp_idx, &curr_kf, curr_idx);
+            self.map
+                .lock()
+                .unwrap()
+                .register_observation(mp_idx, &curr_kf, curr_idx);
         }
 
         // Stereo densification: back-project this keyframe's unassociated
@@ -928,6 +1002,8 @@ impl Pipeline {
         const MAX_COVIS_KFS: usize = 10;
         let neighbor_kf_indices: Vec<usize> = self
             .map
+            .lock()
+            .unwrap()
             .keyframes()
             .iter()
             .rev()
@@ -935,7 +1011,6 @@ impl Pipeline {
             .map(|kf| kf.frame.idx)
             .collect();
 
-        let enable_local_ba = self.enable_local_ba;
         let imu_initialized = self.state.imu_initialized;
         let match_config = self.two_view_init_config.match_config;
         let triangulation_config = self.two_view_init_config.triangulation_config.clone();
@@ -956,14 +1031,14 @@ impl Pipeline {
             neighbor_kf_indices.len()
         ));
 
-        self.map.upsert_keyframe(curr_kf);
+        self.map.lock().unwrap().upsert_keyframe(curr_kf);
         if let (Some(prev_kf_idx), Some(prev_ts)) = (
             self.state.last_keyframe_idx,
             self.last_keyframe_timestamp_sec,
         ) {
             let (preint, raw_samples) = self.preintegrate_window(prev_ts, timestamp_sec);
             if preint.dt > 0.0 {
-                self.map.add_imu_factor(
+                self.map.lock().unwrap().add_imu_factor(
                     prev_kf_idx,
                     frame.idx,
                     preint,
@@ -985,37 +1060,23 @@ impl Pipeline {
         let n_fused = self.fuse_into_neighbors(frame.idx, &neighbor_kf_indices);
         self.dbg(format!("[fuse] frame={} fused={}", frame.idx, n_fused));
 
-        if enable_local_ba {
-            if imu_initialized {
-                self.map
-                    .run_local_inertial_ba(&self.camera, self.imu_t_bc, self.gravity_world);
-            } else {
-                self.map.run_local_ba(&self.camera);
-            }
-            if let Some(newest_kf) = self.map.keyframes().last() {
-                self.state.pose_world_to_cam = newest_kf.frame.pose_world_to_cam;
-                // Pull BA-corrected velocity and bias back so the next keyframe is
-                // seeded from the post-BA state, not the stale pre-BA propagation.
-                if imu_initialized {
-                    self.state.velocity_world = newest_kf.velocity_world;
-                    self.imu_bias = newest_kf.imu_bias;
-                    println!(
-                        "kf accel bias: {:3}, {:3}, {:3}",
-                        self.imu_bias.accel.x, self.imu_bias.accel.y, self.imu_bias.accel.z
-                    );
-                    println!(
-                        "kf gyro bias: {:3}, {:3}, {:3}",
-                        self.imu_bias.gyro.x, self.imu_bias.gyro.y, self.imu_bias.gyro.z
-                    );
-                }
-            }
-        }
-
+        // Refinement can rotate/scale the world and update gravity. Do it before
+        // constructing the BA request so the job and its future snapshot agree.
         if imu_initialized {
             self.refine_inertial_init(timestamp_sec);
         }
 
-        self.map.cull();
+        if !self.local_mapping.submit(KeyframeJob {
+            imu_initialized,
+            imu_t_bc: self.imu_t_bc,
+            gravity_world: self.gravity_world,
+        }) {
+            self.dbg("[local_mapping] worker is unavailable".into());
+        }
+        // Synchronous mode has a completed correction available immediately;
+        // asynchronous mode will deliver it at a later frame boundary.
+        self.apply_local_mapping_results();
+
         true
     }
 
@@ -1049,20 +1110,22 @@ impl Pipeline {
             return;
         };
 
-        match self.inertial_init.try_initialize(
-            &self.map,
+        // Drop the solve's map lock before applying its result with a new lock.
+        let init_result = self.inertial_init.try_initialize(
+            &self.map.lock().unwrap(),
             self.imu_t_bc,
             self.imu_bias,
             start_idx,
             prior_g,
             prior_a,
             true,
-        ) {
+        );
+        match init_result {
             Some(init) => {
                 let scale = init.scale;
                 let bg = init.bias.gyro;
                 self.inertial_init.apply_initialization(
-                    &mut self.map,
+                    &mut self.map.lock().unwrap(),
                     &mut self.state,
                     &mut self.imu_bias,
                     &mut self.gravity_world,
@@ -1104,7 +1167,8 @@ impl Pipeline {
         // keyframe stored in the map. The shared borrow on self.map ends with
         // this block so the write phase below can mutate the map.
         let points = {
-            let Some(prev_kf) = self.map.get_keyframe(prev_kf_idx) else {
+            let map_guard = self.map.lock().unwrap();
+            let Some(prev_kf) = map_guard.get_keyframe(prev_kf_idx) else {
                 return 0;
             };
 
@@ -1300,8 +1364,12 @@ impl Pipeline {
 
         // Write phase: create the new map points; curr_kf is registered as
         // the first observer inside add_triangulated_points.
-        let first_mp_idx = self.map.num_map_points();
-        let added = self.map.add_triangulated_points(None, curr_kf, &points);
+        let first_mp_idx = self.map.lock().unwrap().num_map_points();
+        let added = self
+            .map
+            .lock()
+            .unwrap()
+            .add_triangulated_points(None, curr_kf, &points);
 
         // Register the neighbor as a second observer on each new map point.
         // This is the SearchInNeighbors-equivalent piece for the
@@ -1311,8 +1379,10 @@ impl Pipeline {
         for (i, &(_, _, _, prev_desc_idx, _)) in points.iter().take(added).enumerate() {
             let mp_idx = first_mp_idx + i;
             self.map
+                .lock()
+                .unwrap()
                 .register_observation_at(mp_idx, prev_kf_idx, prev_desc_idx);
-            if let Some(prev_live) = self.map.get_keyframe_mut(prev_kf_idx) {
+            if let Some(prev_live) = self.map.lock().unwrap().get_keyframe_mut(prev_kf_idx) {
                 prev_live.associate_map_point(prev_desc_idx, mp_idx);
             }
         }
@@ -1332,7 +1402,7 @@ impl Pipeline {
 
         // Collect map points observed by curr_kf. We snapshot the indices
         // here so we can hold no other borrow on self.map during the loop.
-        let curr_mp_indices: Vec<usize> = match self.map.get_keyframe(curr_kf_idx) {
+        let curr_mp_indices: Vec<usize> = match self.map.lock().unwrap().get_keyframe(curr_kf_idx) {
             Some(kf) => kf
                 .map_point_by_desc_idx
                 .iter()
@@ -1358,12 +1428,13 @@ impl Pipeline {
             // by two map points.
             let mut proposals: Vec<(usize, usize, u32)> = Vec::new();
             {
-                let Some(nb_kf) = self.map.get_keyframe(nb_kf_idx) else {
+                let map_guard = self.map.lock().unwrap();
+                let Some(nb_kf) = map_guard.get_keyframe(nb_kf_idx) else {
                     continue;
                 };
 
                 for &mp_idx in &curr_mp_indices {
-                    let mp = match self.map.map_points().get(mp_idx) {
+                    let mp = match map_guard.map_points().get(mp_idx) {
                         Some(mp) if !mp.culled => mp,
                         _ => continue,
                     };
@@ -1432,14 +1503,19 @@ impl Pipeline {
                 // call associating a different mp).
                 let already = self
                     .map
+                    .lock()
+                    .unwrap()
                     .get_keyframe(nb_kf_idx)
                     .and_then(|kf| kf.map_point(kp_idx))
                     .is_some();
                 if already {
                     continue;
                 }
-                self.map.register_observation_at(mp_idx, nb_kf_idx, kp_idx);
-                if let Some(nb_live) = self.map.get_keyframe_mut(nb_kf_idx) {
+                self.map
+                    .lock()
+                    .unwrap()
+                    .register_observation_at(mp_idx, nb_kf_idx, kp_idx);
+                if let Some(nb_live) = self.map.lock().unwrap().get_keyframe_mut(nb_kf_idx) {
                     nb_live.associate_map_point(kp_idx, mp_idx);
                 }
                 taken_kp.insert(kp_idx);
@@ -1448,5 +1524,79 @@ impl Pipeline {
         }
 
         n_fused
+    }
+}
+
+fn format_imu_init_gate(
+    start_idx: usize,
+    first_idx: Option<usize>,
+    last_idx: Option<usize>,
+    keyframes: usize,
+    min_keyframes: usize,
+    imu_time: f64,
+    min_time_sec: f64,
+) -> String {
+    format!(
+        "[imu_init_gate] start_idx={start_idx} first_idx={first_idx:?} last_idx={last_idx:?} kfs={keyframes}/{min_keyframes} imu_time={imu_time:.2}/{min_time_sec:.1}s"
+    )
+}
+
+/// Carries a reference-keyframe BA correction into the current tracking pose
+/// while preserving the current camera's pose relative to that reference.
+fn apply_reference_pose_correction(
+    current_pose: Pose3d,
+    reference_before: Pose3d,
+    reference_after: Pose3d,
+) -> Pose3d {
+    let current_from_reference = Pose3d::between(&reference_before, &current_pose);
+    current_from_reference.compose(&reference_after)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_reference_pose_correction, format_imu_init_gate};
+    use kornia_3d::pose::Pose3d;
+    use kornia_algebra::{SO3F64, Vec3F64};
+
+    fn assert_pose_close(actual: Pose3d, expected: Pose3d) {
+        assert!((actual.translation - expected.translation).length() < 1e-10);
+        for (actual, expected) in actual
+            .rotation
+            .to_cols_array()
+            .iter()
+            .zip(expected.rotation.to_cols_array())
+        {
+            assert!((actual - expected).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn reference_pose_correction_preserves_relative_camera_pose() {
+        let reference_before = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix(),
+            Vec3F64::new(-1.0, 0.5, 0.2),
+        );
+        let relative_pose = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(-0.15, 0.05, 0.2)).matrix(),
+            Vec3F64::new(-0.5, 0.1, 0.3),
+        );
+        let current_before = relative_pose.compose(&reference_before);
+        let reference_after = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.25, 0.1, -0.1)).matrix(),
+            Vec3F64::new(-2.0, -0.3, 0.8),
+        );
+
+        let corrected =
+            apply_reference_pose_correction(current_before, reference_before, reference_after);
+
+        assert_pose_close(Pose3d::between(&reference_after, &corrected), relative_pose);
+    }
+
+    #[test]
+    fn formats_compact_imu_init_gate() {
+        assert_eq!(
+            format_imu_init_gate(12, Some(12), Some(32), 7, 10, 1.05, 1.0),
+            "[imu_init_gate] start_idx=12 first_idx=Some(12) last_idx=Some(32) kfs=7/10 imu_time=1.05/1.0s"
+        );
     }
 }
