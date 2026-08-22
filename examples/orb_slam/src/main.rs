@@ -42,6 +42,7 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::Frame;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
+use local_mapping::LocalMappingMode;
 use pipeline::Pipeline;
 #[cfg(feature = "oakd")]
 use source::OakdSource;
@@ -75,6 +76,10 @@ struct Args {
     /// map-projection reject reasons, keyframe growth and fuse counters
     #[argh(switch)]
     debug: bool,
+
+    /// local mapping mode: sync or async
+    #[argh(option, default = "LocalMappingMode::Asynchronous")]
+    local_mapping: LocalMappingMode,
 
     /// ORB keypoints to extract per frame (default 1000; the 2 MP Hilti fisheye
     /// frames need ~3000 to bootstrap)
@@ -483,6 +488,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── SLAM system ────────────────────────────────────────────────────────
     let pipeline_config = PipelineConfig {
         debug: args.debug,
+        local_mapping: args.local_mapping,
         stereo_close_depth_m,
         ..PipelineConfig::default()
     };
