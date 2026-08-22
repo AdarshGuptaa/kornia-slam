@@ -1,13 +1,4 @@
-//! Persistent per-point track identity for optical-flow tracking.
-//!
-//! Unlike [`super::map_projection`], which re-derives every correspondence
-//! from scratch each frame (project map points via the candidate pose, match
-//! by descriptor), optical-flow tracking carries a point's identity and
-//! map-point association *forward* from frame to frame — established once,
-//! then just followed, not re-matched every time. This module holds that
-//! carried state; the KLT call itself and the merge logic that produces a
-//! new [`TrackState`] each frame live elsewhere (see the tracker built on
-//! top of `kornia_imgproc::optical_flow_pyr_lk`).
+//! Persistent KLT track state and map-point associations.
 
 use std::collections::HashMap;
 
@@ -16,54 +7,30 @@ use kornia_imgproc::optical_flow_pyr_lk::{
     BorderMode, PyrLKError, PyrLKParams, TermCriteria, calc_optical_flow_pyr_lk,
 };
 
-/// One point being tracked frame-to-frame via optical flow, independent of
-/// how many detection cycles it has survived.
+/// One point tracked frame-to-frame by optical flow.
 #[derive(Debug, Clone, Copy)]
 pub struct Track {
-    /// Stable identity across frames, for observability only — nothing in
-    /// the tracking mechanism itself keys off this; carrying state forward
-    /// frame-to-frame is positional (see [`TrackState::pixels`] and the KLT
-    /// call it feeds).
+    /// Stable identity across frames.
     pub track_id: u64,
-    /// Raw (distorted) pixel position in the frame this `Track` belongs to —
-    /// same convention as `Frame::features.keypoints_xy`, since KLT tracks
-    /// directly on the raw image (there's no full-image undistortion step
-    /// anywhere in this codebase, only point-wise). Undistort on demand
-    /// wherever undistorted coordinates are needed, exactly as
-    /// `Frame::undistorted_xy` already does for detected keypoints.
+    /// Raw, distorted pixel position in the current frame.
     pub pixel: [f32; 2],
-    /// Map point this track is associated with, if any. `None` until the
-    /// track survives to become part of a keyframe.
+    /// Associated map-point index, if any.
     pub map_point_idx: Option<usize>,
     /// Consecutive frames this track has survived. 1 = just detected.
     pub age: u32,
 }
 
-/// The set of points currently being tracked, owned by the pipeline and
-/// carried from frame to frame.
-///
-/// Rebuilt wholesale each frame via [`TrackState::set_tracks`]: KLT survivors
-/// keep their `Track` (carried-forward `track_id`/`map_point_idx`,
-/// incremented `age`), failed tracks are dropped, and replenished detections
-/// are appended as new `Track`s minted via [`TrackState::new_track`].
+/// Persistent state for points carried between frames.
 #[derive(Debug, Default)]
 pub struct TrackState {
     next_track_id: u64,
     tracks: Vec<Track>,
 }
 
-/// Tunable parameters for KLT tracking: the library's own LK math
-/// (`win_size` through `border_mode`, matching `PyrLKParams` field-for-field
-/// — kept flattened here rather than nested, at the cost of an explicit
-/// conversion where `track()` builds the `PyrLKParams` it actually passes to
-/// `calc_optical_flow_pyr_lk`) plus the three accept/reject gates the library
-/// itself doesn't provide.
+/// KLT solver parameters and survivor acceptance thresholds.
 #[derive(Debug)]
 pub struct OpticalFlowConfig {
-    /// LK integration window size in pixels. The library currently only
-    /// supports exactly `21` — kept as a field (not a constant) so
-    /// `calc_optical_flow_pyr_lk`'s own validation is what enforces that,
-    /// not a silent assumption baked in here.
+    /// LK integration window size in pixels (currently required to be 21).
     pub win_size: usize,
     /// Pyramid depth: more levels track larger displacements, at higher cost
     /// and less precision at the coarsest level.
@@ -75,29 +42,18 @@ pub struct OpticalFlowConfig {
     /// Minimum structure-tensor eigenvalue for a patch to be considered
     /// trackable at all (rejects flat/aliased regions).
     pub min_eigen_threshold: f32,
-    /// Seed the search from a provided initial guess instead of `prev_pts`'
-    /// own position. Left `false` for now — the pose-informed hybrid this
-    /// would enable is a later refinement, not needed for the first working
-    /// version.
+    /// Seed the search from a provided initial-flow estimate.
     pub use_initial_flow: bool,
     /// Iteration stopping rule (count / epsilon / both).
     pub term_criteria: TermCriteria,
-    /// How the LK math itself samples pixels near the image edge during
-    /// iteration. Separate from `border_margin_px` below, which governs
-    /// whether a result close to the edge is *trusted* afterward.
+    /// Sampling policy near image borders during iteration.
     pub border_mode: BorderMode,
 
-    /// Reject a track if KLT's own reported error exceeds this, even when
-    /// `status == 1` — `status` only means "didn't fail outright," `error`
-    /// is the actual residual.
+    /// Maximum accepted KLT residual when tracking succeeds.
     pub max_error: f32,
-    /// Reject a track whose pixel displacement from the previous frame
-    /// exceeds this — catches LK converging to a plausible-looking but
-    /// wrong local optimum (e.g. aliasing onto a nearby similar patch).
+    /// Maximum accepted frame-to-frame displacement in pixels.
     pub max_movement_px: f32,
-    /// Reject a track landing within this many pixels of the image edge —
-    /// stricter than `border_mode`, which only affects the LK math's
-    /// internal sampling, not whether the final result is trustworthy.
+    /// Required distance in pixels from the output image border.
     pub border_margin_px: f32,
 }
 
@@ -120,9 +76,7 @@ impl Default for OpticalFlowConfig {
 }
 
 impl OpticalFlowConfig {
-    /// Packs the flattened LK-math fields back into the `PyrLKParams` shape
-    /// `calc_optical_flow_pyr_lk` actually takes. Pure plumbing — nothing
-    /// here is a decision, just matching field-for-field.
+    /// Converts the public configuration into the underlying LK parameters.
     fn to_pyr_lk_params(&self) -> PyrLKParams {
         PyrLKParams {
             win_size: self.win_size,
@@ -138,7 +92,7 @@ impl OpticalFlowConfig {
 }
 
 impl TrackState {
-    /// Empty track state, as at startup or right after a re-bootstrap.
+    /// Creates an empty track state.
     pub fn new() -> Self {
         Self {
             next_track_id: 0,
@@ -146,7 +100,7 @@ impl TrackState {
         }
     }
 
-    /// Current tracks, in the same order [`TrackState::pixels`] hands to KLT.
+    /// Returns current tracks in KLT input order.
     pub fn tracks(&self) -> &[Track] {
         &self.tracks
     }
@@ -160,17 +114,12 @@ impl TrackState {
         self.tracks.is_empty()
     }
 
-    /// Pixel positions of all current tracks, in a form the KLT call
-    /// consumes directly as `prev_pts`. Positional order must be preserved
-    /// through that call — `status`/`next_pts` come back parallel to this —
-    /// so whatever merges KLT's output back into a new `TrackState` can zip
-    /// them against `tracks()` by index.
+    /// Returns pixel positions in the same order as [`Self::tracks`].
     pub fn pixels(&self) -> Vec<[f32; 2]> {
         self.tracks.iter().map(|t| t.pixel).collect()
     }
 
-    /// Mints a fresh, uniquely-identified `Track` for a newly detected point
-    /// (replenishment) — not yet associated with any map point.
+    /// Creates a uniquely identified, unassociated track.
     pub fn new_track(&mut self, pixel: [f32; 2]) -> Track {
         let track_id = self.next_track_id;
         self.next_track_id += 1;
@@ -182,28 +131,13 @@ impl TrackState {
         }
     }
 
-    /// Replaces the track list wholesale with the next frame's full set.
-    /// Callers assemble `tracks` themselves — carried-forward survivors
-    /// (via [`Track`]'s fields, incremented `age`) plus any freshly-minted
-    /// tracks from [`TrackState::new_track`] — this just commits it.
+    /// Replaces the current track set.
     pub fn set_tracks(&mut self, tracks: Vec<Track>) {
         self.tracks = tracks;
     }
 
-    /// Advances `self` one frame via pyramidal Lucas-Kanade: tracks every
-    /// point in `self` from `prev_img` into `next_img`, and returns the
-    /// survivors as a fresh `Vec<Track>` — carried-forward `track_id`/
-    /// `map_point_idx`, `age` incremented, `pixel` updated to wherever KLT
-    /// found it.
-    ///
-    /// Does **not** call [`TrackState::set_tracks`] itself, and does not
-    /// replenish — this only tracks what's already in `self`. The caller
-    /// decides how to merge these survivors with newly-detected points
-    /// before committing the next frame's state.
-    ///
-    /// `prev_img`/`next_img` must be the raw (distorted) grayscale images
-    /// for the frames `self` and the frame being tracked into, respectively
-    /// — same pixel space as `Track::pixel`.
+    /// Tracks current points between raw grayscale images and returns the
+    /// accepted survivors without mutating this state.
     pub fn track(
         &self,
         prev_img: &Image<u8, 1>,
@@ -214,9 +148,7 @@ impl TrackState {
             return Ok(Vec::new());
         }
 
-        // u8 -> f32 is always exactly representable (every u8 value fits a
-        // f32 with no precision loss), so `cast`'s only failure mode
-        // (genuine numeric conversion loss) can't happen here.
+        // Every u8 value is exactly representable as f32.
         let prev_f32 = prev_img
             .cast::<f32>()
             .expect("u8 -> f32 image cast is always representable");
@@ -268,20 +200,8 @@ impl TrackState {
         Ok(survivors)
     }
 
-    /// Rebuilds the track list from a frame's winning correspondence set —
-    /// meant to be called once per successful `estimate_pose`, regardless
-    /// of whether `matches` came from KLT-seeded correspondences (see
-    /// [`klt_correspondences`]) or the existing projection-search /
-    /// reference-keyframe fallback. That's deliberate: it's what lets
-    /// tracking *recover* rather than being a one-way ratchet that can only
-    /// ever lose tracks — any map point the fallback path finds (e.g. one
-    /// KLT lost, or one newly visible) becomes a fresh, trackable point
-    /// again starting next frame.
-    ///
-    /// Track identity (`track_id`/`age`) is preserved for any map point
-    /// that was already being tracked; anything new mints a fresh `Track`.
-    /// `keypoints` must be the current frame's raw (distorted) keypoints,
-    /// indexed the same way `matches`' second element is.
+    /// Rebuilds tracks from `(map_point_idx, keypoint_idx)` matches, preserving
+    /// identity and age for map points already present in the state.
     pub fn refresh_from_matches(&mut self, matches: &[(usize, usize)], keypoints: &[[f32; 2]]) {
         let mut old_by_mp: HashMap<usize, Track> = self
             .tracks
@@ -313,9 +233,7 @@ impl TrackState {
     }
 }
 
-/// Nearest keypoint in `keypoints` to `predicted`, within `radius_px` —
-/// brute-force since per-frame track counts are modest (hundreds, not
-/// thousands); a spatial grid isn't justified yet.
+/// Finds the nearest keypoint within `radius_px`.
 fn nearest_keypoint(predicted: [f32; 2], keypoints: &[[f32; 2]], radius_px: f32) -> Option<usize> {
     let r2 = radius_px * radius_px;
     let mut best: Option<(usize, f32)> = None;
@@ -334,16 +252,8 @@ fn nearest_keypoint(predicted: [f32; 2], keypoints: &[[f32; 2]], radius_px: f32)
     best.map(|(i, _)| i)
 }
 
-/// Snaps each survivor's predicted pixel onto the nearest freshly detected
-/// keypoint in `curr_keypoints` (raw/distorted, same convention as
-/// `Track::pixel`) within `snap_radius_px`, producing
-/// `(map_point_idx, current_frame_keypoint_idx)` correspondences.
-///
-/// Split out from [`klt_correspondences`] so a caller can hold onto
-/// `survivors` itself (e.g. to commit them back via
-/// [`TrackState::set_tracks`] even on a frame whose correspondences don't
-/// win — see that method's doc) instead of only getting the derived
-/// correspondences.
+/// Snaps associated survivors to detected keypoints, producing
+/// `(map_point_idx, keypoint_idx)` correspondences.
 pub fn snap_survivors(
     survivors: &[Track],
     curr_keypoints: &[[f32; 2]],
@@ -360,19 +270,7 @@ pub fn snap_survivors(
     correspondences
 }
 
-/// Produces `(map_point_idx, current_frame_keypoint_idx)` correspondences by
-/// KLT-tracking `track_state`'s existing points from `prev_img` into
-/// `next_img`, then snapping each survivor's predicted pixel onto the
-/// nearest freshly detected keypoint in `curr_keypoints` (raw/distorted,
-/// same convention as `Track::pixel`) within `snap_radius_px`.
-///
-/// Returns only correspondences, not an updated `TrackState` — the caller
-/// rebuilds that from the *winning* `Estimate`'s matches afterward via
-/// [`TrackState::refresh_from_matches`], not from this function's output
-/// directly (see that method's doc for why). Callers that also need the raw
-/// survivors (e.g. to keep KLT continuity alive across a losing frame)
-/// should call [`TrackState::track`] and [`snap_survivors`] directly instead
-/// of this convenience wrapper.
+/// Tracks existing points and snaps survivors to current-frame keypoints.
 pub fn klt_correspondences(
     track_state: &TrackState,
     prev_img: &Image<u8, 1>,
@@ -409,9 +307,7 @@ mod tests {
         assert_eq!(state.pixels(), vec![[1.0, 2.0], [3.0, 4.0]]);
     }
 
-    /// Builds a 200x200 black image with a white square, corner at `origin`,
-    /// 40px on a side — the corner itself is the useful test feature (a
-    /// real gradient in both x and y), not the square's flat interior.
+    /// Builds a black image with a white square whose corner is trackable.
     fn square_image(origin: [usize; 2]) -> Image<u8, 1> {
         const SIZE: usize = 200;
         let mut data = vec![0u8; SIZE * SIZE];
@@ -436,8 +332,7 @@ mod tests {
         let next_img = square_image([93, 92]); // shifted by (+3, +2)
 
         let mut state = TrackState::new();
-        // Seed at the square's top-left corner in `prev` — a real corner
-        // feature (gradient in both directions), not the flat interior.
+        // Seed the square's top-left corner, which has gradients on both axes.
         let t = state.new_track([90.0, 90.0]);
         state.set_tracks(vec![t]);
 
@@ -462,9 +357,7 @@ mod tests {
         t0.map_point_idx = Some(42);
         state.set_tracks(vec![t0]);
 
-        // Map point 42 matched again this frame (at a new pixel, as if KLT
-        // + snapping had moved it), and a brand-new map point 7 shows up
-        // via the fallback path.
+        // Map point 42 persists while map point 7 appears for the first time.
         let keypoints = [[5.0, 6.0], [10.0, 11.0]];
         state.refresh_from_matches(&[(42, 0), (7, 1)], &keypoints);
 
