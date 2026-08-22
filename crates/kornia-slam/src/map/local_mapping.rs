@@ -179,7 +179,7 @@ impl LocalMappingHandle {
         let (result_sender, results) = mpsc::channel();
 
         let join_handle = thread::Builder::new()
-            .name("orb-local-mapping".into())
+            .name("kornia-local-mapping".into())
             .spawn(move || {
                 let _worker_exit = WorkerExit {
                     pending: Arc::clone(&worker_pending),

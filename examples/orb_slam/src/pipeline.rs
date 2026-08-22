@@ -163,9 +163,11 @@ impl Pipeline {
         }
     }
 
-    /// Returns an owned snapshot of all persistent map points.
-    pub fn map_points(&self) -> Vec<MapPoint> {
-        self.map.lock().unwrap().map_points().to_vec()
+    /// Runs `f` against the live map points, holding the map lock only for the
+    /// duration of the call. Avoids cloning the whole point list (descriptors
+    /// included) for read-only consumers such as viz logging and summaries.
+    pub fn with_map_points<R>(&self, f: impl FnOnce(&[MapPoint]) -> R) -> R {
+        f(self.map.lock().unwrap().map_points())
     }
 
     /// Returns the index of the current reference keyframe, if tracking has one.

@@ -666,7 +666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref rec) = rec {
             log_trajectory_to_rerun(rec, &trajectory);
             log_camera_to_rerun(rec, &result.pose_world_to_cam, &camera, image_size);
-            log_map_points_to_rerun(rec, &system.map_points());
+            system.with_map_points(|map_points| log_map_points_to_rerun(rec, map_points));
         }
 
         // TUI render.
@@ -704,17 +704,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tui::restore_terminal(&mut term)?;
     }
 
-    let total_pts = system.map_points().len();
-    let active_pts = system.map_points().iter().filter(|mp| !mp.culled).count();
-    let mut obs_total: usize = 0;
-    let mut obs_max: usize = 0;
-    for mp in system.map_points().iter().filter(|mp| !mp.culled) {
-        let n = mp.observation_kf_indices.len();
-        obs_total += n;
-        if n > obs_max {
-            obs_max = n;
+    let (total_pts, active_pts, obs_total, obs_max) = system.with_map_points(|map_points| {
+        let mut active_pts: usize = 0;
+        let mut obs_total: usize = 0;
+        let mut obs_max: usize = 0;
+        for mp in map_points.iter().filter(|mp| !mp.culled) {
+            let n = mp.observation_kf_indices.len();
+            active_pts += 1;
+            obs_total += n;
+            if n > obs_max {
+                obs_max = n;
+            }
         }
-    }
+        (map_points.len(), active_pts, obs_total, obs_max)
+    });
     let obs_mean = if active_pts > 0 {
         obs_total as f64 / active_pts as f64
     } else {
