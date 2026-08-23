@@ -1633,9 +1633,10 @@ fn apply_reference_pose_correction(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_reference_pose_correction, format_imu_init_gate};
+    use super::{apply_reference_pose_correction, carry_klt_survivors, format_imu_init_gate};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
+    use kornia_slam::estimation::optical_flow::{FlowSurvivor, MapKeypointMatch, TrackSet};
 
     fn assert_pose_close(actual: Pose3d, expected: Pose3d) {
         assert!((actual.translation - expected.translation).length() < 1e-10);
@@ -1677,5 +1678,38 @@ mod tests {
             format_imu_init_gate(12, Some(12), Some(32), 7, 10, 1.05, 1.0),
             "[imu_init_gate] start_idx=12 first_idx=Some(12) last_idx=Some(32) kfs=7/10 imu_time=1.05/1.0s"
         );
+    }
+
+    #[test]
+    fn klt_tracks_survive_skipped_frame_and_clear_without_survivors() {
+        let mut tracks = TrackSet::new();
+        tracks
+            .reconcile_from_matches(
+                &[MapKeypointMatch {
+                    map_point_idx: 42,
+                    keypoint_idx: 0,
+                }],
+                &[[10.0, 20.0]],
+            )
+            .unwrap();
+        let track_id = tracks.tracks()[0].id();
+
+        carry_klt_survivors(
+            &mut tracks,
+            Some(vec![FlowSurvivor {
+                track_id,
+                pixel: [12.0, 21.0],
+                error: 0.5,
+            }]),
+        );
+
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks.tracks()[0].id(), track_id);
+        assert_eq!(tracks.tracks()[0].map_point_idx(), Some(42));
+        assert_eq!(tracks.tracks()[0].pixel(), [12.0, 21.0]);
+        assert_eq!(tracks.tracks()[0].age(), 2);
+
+        carry_klt_survivors(&mut tracks, None);
+        assert!(tracks.is_empty());
     }
 }

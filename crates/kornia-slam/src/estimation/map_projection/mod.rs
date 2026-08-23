@@ -764,6 +764,21 @@ mod matching_tests {
     }
 
     #[test]
+    fn klt_source_is_eligible_at_minimum_size() {
+        let seeded = vec![(0, 0), (1, 1), (2, 2), (3, 3)];
+
+        assert_eq!(
+            MapProjectionEstimator::eligible_pre_seeded(Some(seeded.clone()), 4),
+            Some(seeded)
+        );
+        assert_eq!(
+            MapProjectionEstimator::eligible_pre_seeded(Some(vec![(0, 0); 3]), 4),
+            None
+        );
+        assert_eq!(MapProjectionEstimator::eligible_pre_seeded(None, 4), None);
+    }
+
+    #[test]
     fn test_match_by_projection_simple() {
         let estimator = make_test_estimator();
         let camera = test_camera();
