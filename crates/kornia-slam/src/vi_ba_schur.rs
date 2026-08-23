@@ -624,6 +624,10 @@ fn huber_imu_weight(res: &[f64; 15], omega: &[f64; 225], chi2_threshold: f64) ->
     }
 }
 
+fn visual_huber_weight(chi2: f64, chi2_threshold: f64) -> f64 {
+    HuberKernel.weight(chi2, chi2_threshold)
+}
+
 /// Diagonal information matrix from preintegrated IMU covariances.
 /// Uses diagonal approximation (off-diagonal terms ignored).
 /// Replace with full 15×15 inversion once FD tests pass.
@@ -911,7 +915,7 @@ pub fn visual_inertial_bundle_adjust(
             let jx_raw: [f64; 6] = std::array::from_fn(|i| jx_f32[i] as f64);
 
             let chi2_vis = r_raw[0] * r_raw[0] + r_raw[1] * r_raw[1];
-            let hw_vis = HuberKernel.weight(chi2_vis, params.huber_reproj_px_sq);
+            let hw_vis = visual_huber_weight(chi2_vis, params.huber_reproj_px_sq);
             cost_vis += 0.5 * hw_vis * chi2_vis;
             let sqrt_hw_vis = hw_vis.sqrt();
             let r = [r_raw[0] * sqrt_hw_vis, r_raw[1] * sqrt_hw_vis];
@@ -969,7 +973,7 @@ pub fn visual_inertial_bundle_adjust(
                 let (r_z_raw, jpd_raw, jxd_raw) =
                     depth_residual_and_jacobian(pose, point, d_meas as f64, sigma);
                 let chi2_depth = r_z_raw * r_z_raw;
-                let hw_depth = HuberKernel.weight(chi2_depth, params.huber_depth_sigma_sq);
+                let hw_depth = visual_huber_weight(chi2_depth, params.huber_depth_sigma_sq);
                 cost_vis += 0.5 * hw_depth * chi2_depth;
                 let sqrt_hw_depth = hw_depth.sqrt();
                 let r_z = r_z_raw * sqrt_hw_depth;
@@ -1343,7 +1347,7 @@ pub fn visual_inertial_bundle_adjust(
                 camera,
             );
             let chi2_vis = (r_f32[0] * r_f32[0] + r_f32[1] * r_f32[1]) as f64;
-            let hw_vis = HuberKernel.weight(chi2_vis, params.huber_reproj_px_sq);
+            let hw_vis = visual_huber_weight(chi2_vis, params.huber_reproj_px_sq);
             new_cost_vis += 0.5 * hw_vis * chi2_vis;
 
             if let Some(d_meas) = obs.depth_meas {
@@ -1355,7 +1359,7 @@ pub fn visual_inertial_bundle_adjust(
                     sigma,
                 );
                 let chi2_depth = r_z * r_z;
-                let hw_depth = HuberKernel.weight(chi2_depth, params.huber_depth_sigma_sq);
+                let hw_depth = visual_huber_weight(chi2_depth, params.huber_depth_sigma_sq);
                 new_cost_vis += 0.5 * hw_depth * chi2_depth;
             }
         }
@@ -1499,4 +1503,18 @@ pub fn visual_inertial_bundle_adjust(
         converged,
         final_cost,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ViBaParams, visual_huber_weight};
+
+    #[test]
+    fn visual_huber_defaults_and_weights() {
+        let params = ViBaParams::default();
+        assert_eq!(params.huber_reproj_px_sq, 25.0);
+        assert_eq!(params.huber_depth_sigma_sq, 9.0);
+        assert_eq!(visual_huber_weight(4.0, 25.0), 1.0);
+        assert_eq!(visual_huber_weight(100.0, 25.0), 0.5);
+    }
 }
