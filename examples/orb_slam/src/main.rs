@@ -32,7 +32,7 @@ mod source;
 mod tui;
 mod utils;
 use crate::datasets::euroc::GroundTruthPose;
-use config::PipelineConfig;
+use config::{PgoPipelineConfig, PipelineConfig};
 use evaluation::associate_gt;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
@@ -42,7 +42,7 @@ use kornia_sensors::imu::ImuMeasurement;
 use kornia_slam::Frame;
 use kornia_slam::map::LocalMappingMode;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use pipeline::Pipeline;
+use pipeline::{LoopClosureEvent, Pipeline};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
 #[cfg(feature = "uvc")]
@@ -84,6 +84,16 @@ struct Args {
     /// frames need ~3000 to bootstrap)
     #[argh(option, default = "1000")]
     n_keypoints: usize,
+
+    /// path to a bag-of-words vocabulary (`.bin` from `convert_orbvoc`, or a
+    /// DBoW2 `ORBvoc.txt`) to enable appearance-based loop detection
+    #[argh(option)]
+    vocab: Option<String>,
+
+    /// apply usable pose-graph corrections to the live metric map; initialized
+    /// IMU input uses gravity-preserving four-degree-of-freedom optimization
+    #[argh(switch)]
+    apply_pgo: bool,
 }
 
 #[derive(argh::FromArgs)]
@@ -336,6 +346,21 @@ fn build_u8_pyramid(img: &Image<u8, 1>) -> Vec<Image<u8, 1>> {
     pyramid
 }
 
+fn validate_pgo_mode(
+    apply_pgo: bool,
+    has_vocabulary: bool,
+    has_stereo: bool,
+    has_imu: bool,
+) -> Result<(), &'static str> {
+    if apply_pgo && !has_vocabulary {
+        return Err("--apply-pgo requires --vocab");
+    }
+    if apply_pgo && !has_stereo && !has_imu {
+        return Err("--apply-pgo requires stereo or IMU input");
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Args = argh::from_env();
 
@@ -478,6 +503,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         StereoMatchConfig::new(baseline as f32, camera.fx as f32, ORB_SCALE, ORB_LEVELS)
     });
 
+    if let Err(error) = validate_pgo_mode(
+        args.apply_pgo,
+        args.vocab.is_some(),
+        stereo_config.is_some(),
+        imu_enabled,
+    ) {
+        return Err(error.into());
+    }
+
     // ── ORB detector ───────────────────────────────────────────────────────
     let detector = kornia_imgproc::features::OrbDetector {
         n_keypoints: args.n_keypoints,
@@ -489,9 +523,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug: args.debug,
         local_mapping: args.local_mapping,
         stereo_close_depth_m,
+        pgo: args.apply_pgo.then(|| PgoPipelineConfig {
+            require_imu_initialized: imu_enabled,
+            ..PgoPipelineConfig::default()
+        }),
         ..PipelineConfig::default()
     };
     let mut system = Pipeline::new(camera.clone(), pipeline_config);
+    if let Some(vocab_path) = args.vocab.as_deref() {
+        use kornia_slam::place_recognition::{Vocabulary, load_orb_slam3_vocabulary};
+        let vocab = if vocab_path.ends_with(".txt") {
+            load_orb_slam3_vocabulary(vocab_path)
+                .map_err(|e| format!("failed to load text vocabulary {vocab_path}: {e}"))?
+        } else {
+            Vocabulary::load(vocab_path)
+                .map_err(|e| format!("failed to load vocabulary {vocab_path}: {e}"))?
+        };
+        eprintln!("[place-recognition] loaded vocabulary from {vocab_path}");
+        system.set_vocabulary(vocab);
+    }
     if imu_enabled {
         match source.imu_extrinsics() {
             Some(t_bc) => system.set_imu_extrinsics(t_bc),
@@ -549,6 +599,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             imu_samples,
         } = item;
         let image_size = gray_u8.size();
+        #[cfg(feature = "viz")]
+        if let Some(ref rec) = rec {
+            rec.set_time_sequence("frame", idx as i64);
+            rec.set_duration_secs("timestamp", timestamp_sec);
+        }
         let imu_measurements: Vec<ImuMeasurement> = if imu_enabled {
             imu_samples
                 .into_iter()
@@ -638,6 +693,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let map_point_count = system.num_active_map_points();
         let debug_msgs = system.drain_debug_messages();
         processed += 1;
+
+        for event in system.drain_loop_closure_events() {
+            match event {
+                LoopClosureEvent::Accepted { edge, applied } => eprintln!(
+                    "[loop-closure] accepted kf={} ~ kf={} inliers={} rmse={:.2}px applied={applied}",
+                    edge.query_kf_idx,
+                    edge.candidate_kf_idx,
+                    edge.inliers,
+                    edge.reprojection_rmse_px,
+                ),
+                LoopClosureEvent::PgoFailed {
+                    query_kf_idx,
+                    candidate_kf_idx,
+                    reason,
+                } => eprintln!("[pgo] failed kf={query_kf_idx} ~ kf={candidate_kf_idx}: {reason}"),
+            }
+        }
 
         // Status line.
         if !tui_active {
@@ -743,4 +815,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pgo_mode_tests {
+    use super::validate_pgo_mode;
+
+    #[test]
+    fn apply_pgo_requires_metric_input_and_accepts_mono_imu() {
+        assert_eq!(
+            validate_pgo_mode(true, false, true, false).unwrap_err(),
+            "--apply-pgo requires --vocab"
+        );
+        assert_eq!(
+            validate_pgo_mode(true, true, false, false).unwrap_err(),
+            "--apply-pgo requires stereo or IMU input"
+        );
+        assert!(validate_pgo_mode(true, true, false, true).is_ok());
+        assert!(validate_pgo_mode(true, true, true, true).is_ok());
+        assert!(validate_pgo_mode(true, true, true, false).is_ok());
+        assert!(validate_pgo_mode(false, false, false, false).is_ok());
+    }
 }
