@@ -1,48 +1,42 @@
-//! Monocular ORB-SLAM example with a selectable frame source.
+//! `kornia-slam` command-line application: runs the SLAM runtime over a selectable frame source.
 //!
 //! Run on an offline EuRoC dataset:
 //! ```text
-//! cargo run --release -p orb_slam -- euroc --data /path/to/V1_01_easy
+//! cargo run --release -p kornia-slam-app -- euroc --data /path/to/V1_01_easy
 //! ```
 //!
 //! Run on a bubbaloop MCAP recording (defaults to the mono_left channel):
 //! ```text
-//! cargo run --release -p orb_slam -- mcap --path /path/to/recording.mcap
+//! cargo run --release -p kornia-slam-app -- mcap --path /path/to/recording.mcap
 //! ```
 //!
 //! Run live on an OAK-D camera (requires `--features oakd`):
 //! ```text
-//! cargo run --release -p orb_slam --features oakd -- oakd
+//! cargo run --release -p kornia-slam-app --features oakd -- oakd
 //! ```
 //!
 //! Run live on a UVC camera (built-in webcam, USB cam, etc.; requires
 //! `--features uvc`):
 //! ```text
-//! cargo run --release -p orb_slam --features uvc -- uvc \
+//! cargo run --release -p kornia-slam-app --features uvc -- uvc \
 //!     --fx 600 --fy 600 --cx 320 --cy 240
 //! ```
 
-mod config;
-#[path = "../../common/datasets/mod.rs"]
 mod datasets;
 mod evaluation;
-mod pipeline;
-#[path = "../../common/source/mod.rs"]
 mod source;
 mod tui;
 mod utils;
 use crate::datasets::euroc::GroundTruthPose;
-use config::{PgoPipelineConfig, PipelineConfig};
 use evaluation::associate_gt;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_image::{Image, ImageSize, InterpolationMode};
 use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::ImuMeasurement;
-use kornia_slam::Frame;
 use kornia_slam::map::LocalMappingMode;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches};
-use pipeline::{LoopClosureEvent, Pipeline};
+use kornia_slam::{Frame, LoopClosureEvent, PgoPipelineConfig, PipelineConfig, SlamPipeline};
 #[cfg(feature = "oakd")]
 use source::OakdSource;
 #[cfg(feature = "uvc")]
@@ -529,7 +523,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         ..PipelineConfig::default()
     };
-    let mut system = Pipeline::new(camera.clone(), pipeline_config);
+    let mut system = SlamPipeline::new(camera.clone(), pipeline_config);
     if let Some(vocab_path) = args.vocab.as_deref() {
         use kornia_slam::place_recognition::{Vocabulary, load_orb_slam3_vocabulary};
         let vocab = if vocab_path.ends_with(".txt") {
@@ -557,7 +551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Rerun ──────────────────────────────────────────────────────────────
     #[cfg(feature = "viz")]
     let rec = if args.rerun_stream {
-        let r = rerun::RecordingStreamBuilder::new("orb_slam").spawn()?;
+        let r = rerun::RecordingStreamBuilder::new("kornia-slam").spawn()?;
         r.log("/", &rerun::ViewCoordinates::RIGHT_HAND_Y_DOWN())?;
         r.log("world/camera", &rerun::ViewCoordinates::RDF())?;
         Some(r)

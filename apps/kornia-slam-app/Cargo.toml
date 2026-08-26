@@ -1,11 +1,16 @@
 [package]
-name = "orb_slam"
+name = "kornia-slam-app"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "ORB-SLAM example for kornia-slam (EuRoC dataset or live OAK-D)"
+description = "Runnable visual and visual-inertial SLAM application"
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[[bin]]
+name = "kornia-slam"
+path = "src/main.rs"
 
 [dependencies]
 argh = "0.1"
