@@ -14,7 +14,7 @@ use thiserror::Error;
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
-use kornia_apriltag::family::TagFamilyKind;
+pub use kornia_apriltag::family::TagFamilyKind;
 use kornia_apriltag::{AprilTagDecoder, DecodeTagsConfig};
 use kornia_image::{Image, ImageSize};
 
@@ -72,6 +72,9 @@ pub enum AprilTagAnchorError {
         /// Number of distinct keyframes that observed the tag.
         keyframes: usize,
     },
+    /// The pipeline has no AprilTag anchor configured.
+    #[error("no AprilTag anchor configured")]
+    AnchorNotConfigured,
 }
 
 /// Accumulates anchor-tag observations across keyframes.
@@ -110,6 +113,11 @@ impl AprilTagAnchor {
     /// Returns the accumulated observations.
     pub fn observations(&self) -> &[TagObservation] {
         &self.observations
+    }
+
+    /// Returns the anchor configuration.
+    pub fn config(&self) -> &AprilTagAnchorConfig {
+        &self.config
     }
 
     /// Ingests one keyframe image.
