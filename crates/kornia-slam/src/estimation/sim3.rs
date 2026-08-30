@@ -42,6 +42,13 @@ fn umeyama_weighted(src: &[Vec3F64], dst: &[Vec3F64], w: &[f64]) -> Sim3Alignmen
     sigma *= 1.0 / sum_w;
     var_est /= sum_w;
 
+    // Coplanar correspondences (e.g. AprilTag corners) make the cross-covariance
+    // exactly rank-deficient, whose singular decomposition has tied/zero
+    // eigenvalues that the quaternion-based `svd3_f64` cannot handle robustly.
+    // Add a tiny isotropic Tikhonov term (~1e-12 relative) to keep the SVD
+    // well-conditioned; it is far below any 1e-9 accuracy tolerance.
+    sigma += Mat3F64::IDENTITY * ((sigma.x_axis.x + sigma.y_axis.y + sigma.z_axis.z) / 3.0 * 1e-12);
+
     let svd = svd3_f64(&sigma);
     let u = *svd.u();
     let s = *svd.s();
@@ -112,10 +119,13 @@ pub fn align_sim3_robust(est: &[Vec3F64], gt: &[Vec3F64], cfg: HuberIrlsConfig) 
 
     for _ in 0..cfg.max_iters {
         // Residuals under the current fit.
-        let mut residuals = Vec::with_capacity(n);
+        let residuals: Vec<f64> = est
+            .iter()
+            .zip(gt)
+            .map(|(a, b)| (fit.apply(*a) - *b).length())
+            .collect();
         for i in 0..n {
-            let r = (fit.apply(est[i]) - gt[i]).length();
-            residuals.push(r);
+            let r = residuals[i];
             w[i] = if r > 0.0 {
                 (cfg.delta / r).min(1.0)
             } else {
@@ -160,25 +170,9 @@ pub fn align_sim3_robust(est: &[Vec3F64], gt: &[Vec3F64], cfg: HuberIrlsConfig) 
 
     // Robust residual scale: 1.4826 x MAD (pseudo-sigma under Gaussian noise).
     let mut dev = residuals.clone();
-    dev.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = {
-        let m = dev.len() / 2;
-        if dev.len() % 2 == 1 {
-            dev[m]
-        } else {
-            0.5 * (dev[m - 1] + dev[m])
-        }
-    };
+    let med = median_of(&mut dev);
     let mut abs_dev: Vec<f64> = residuals.iter().map(|r| (r - med).abs()).collect();
-    abs_dev.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mad = {
-        let m = abs_dev.len() / 2;
-        if abs_dev.len() % 2 == 1 {
-            abs_dev[m]
-        } else {
-            0.5 * (abs_dev[m - 1] + abs_dev[m])
-        }
-    };
+    let mad = median_of(&mut abs_dev);
     let sigma = 1.4826 * mad;
 
     // Drop gross outliers (residual > 3.5 sigma) and re-fit on the inliers.
@@ -191,7 +185,7 @@ pub fn align_sim3_robust(est: &[Vec3F64], gt: &[Vec3F64], cfg: HuberIrlsConfig) 
             .map(|(i, _)| i)
             .collect();
 
-        if inliers.len() < n {
+        if !inliers.is_empty() && inliers.len() < n {
             let est_in: Vec<Vec3F64> = inliers.iter().map(|&i| est[i]).collect();
             let gt_in: Vec<Vec3F64> = inliers.iter().map(|&i| gt[i]).collect();
             let w_in = vec![1.0_f64; inliers.len()];
@@ -200,6 +194,18 @@ pub fn align_sim3_robust(est: &[Vec3F64], gt: &[Vec3F64], cfg: HuberIrlsConfig) 
     }
 
     fit
+}
+
+/// Median of a slice, sorted in place.
+fn median_of(sorted: &mut [f64]) -> f64 {
+    let m = sorted.len() / 2;
+    if sorted.len() % 2 == 1 {
+        sorted[m]
+    } else if m > 0 {
+        0.5 * (sorted[m - 1] + sorted[m])
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
