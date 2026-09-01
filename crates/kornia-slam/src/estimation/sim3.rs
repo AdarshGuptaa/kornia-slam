@@ -7,8 +7,9 @@ pub struct Sim3Alignment {
 }
 
 impl Sim3Alignment {
+    /// Applies the similarity transform to a point.
     #[inline]
-    fn apply(&self, p: Vec3F64) -> Vec3F64 {
+    pub fn apply(&self, p: Vec3F64) -> Vec3F64 {
         (self.rotation * p) * self.scale + self.translation
     }
 }

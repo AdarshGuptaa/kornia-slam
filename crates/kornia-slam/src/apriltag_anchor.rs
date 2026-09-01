@@ -55,13 +55,16 @@ impl Default for AprilTagAnchorConfig {
 pub struct TagObservation {
     /// Index of the keyframe in which the tag was observed.
     pub kf_idx: usize,
-    /// Tag corners in map frame, ordered top-right, bottom-right,
-    /// bottom-left, top-left (matching the decoder's quad corner winding).
-    pub corners_map: [Vec3F64; 4],
+    /// Tag pose in the *camera* frame (`T_cam<-tag`), computed by
+    /// [`kornia_apriltag`]'s planar-pose solver from the image quad, intrinsics
+    /// and tag size. This is independent of the SLAM keyframe pose, so it stays
+    /// valid even after local BA refines the keyframe; the map-frame corners
+    /// are resolved from it at solve time using the keyframe's final pose.
+    pub tag_to_cam: Pose3d,
 }
 
 /// Errors produced by [`AprilTagAnchor::solve`].
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq)]
 pub enum AprilTagAnchorError {
     /// Too few distinct keyframes have observed the tag to constrain the full
     /// similarity transform.
@@ -75,6 +78,20 @@ pub enum AprilTagAnchorError {
     /// The pipeline has no AprilTag anchor configured.
     #[error("no AprilTag anchor configured")]
     AnchorNotConfigured,
+    /// The robust Sim3 solve produced a degenerate fit (non-finite or
+    /// implausible scale, or a residual far larger than the tag size). The map
+    /// is left untouched rather than being silently corrupted.
+    #[error(
+        "degenerate Sim3 fit: scale={scale:.6} median_residual={med:.6} (tag size {tag_size_m:.3} m)"
+    )]
+    DegenerateFit {
+        /// Fitted scale factor.
+        scale: f64,
+        /// Median residual of the fitted corners in metres.
+        med: f64,
+        /// Physical tag size in metres.
+        tag_size_m: f64,
+    },
 }
 
 /// Accumulates anchor-tag observations across keyframes.
@@ -139,16 +156,13 @@ impl AprilTagAnchor {
     /// On the first call the image size is unknown at construction time, so the
     /// decoder is lazily built here. The image is decoded, detections for the
     /// configured tag are filtered (`id`, `hamming`, `decision_margin`), and
-    /// the best match's corner geometry is stored in map frame.
+    /// the best match's camera-frame tag pose (`T_cam<-tag`) is stored. The
+    /// pose is independent of the SLAM keyframe pose, so local-BA refinement
+    /// later does not invalidate it; [`AprilTagAnchor::solve`] resolves it into
+    /// the map frame using the keyframe's final pose.
     /// Decoding or pose errors are ignored: a failed frame must never poison
     /// the SLAM chain.
-    pub fn on_keyframe(
-        &mut self,
-        kf_idx: usize,
-        image: &Image<u8, 1>,
-        pose_world_to_cam: &Pose3d,
-        camera: &PinholeCamera,
-    ) {
+    pub fn on_keyframe(&mut self, kf_idx: usize, image: &Image<u8, 1>, camera: &PinholeCamera) {
         if self.decoder.is_none() {
             let decode_config = match DecodeTagsConfig::new(vec![self.config.family.clone()]) {
                 Ok(config) => config,
@@ -184,24 +198,39 @@ impl AprilTagAnchor {
             return;
         };
 
-        // T_cam<-tag from the planar-pose solver.
+        // T_cam<-tag from the planar-pose solver, in the camera frame and
+        // independent of the SLAM keyframe pose.
         let pose_pair = match detection.estimate_pose(camera, self.config.tag_size_m, 50) {
             Ok(pair) => pair,
             Err(_) => return,
         };
 
-        // Compose into map frame: tag -> cam -> map.
-        let tag_to_map = pose_world_to_cam.inverse().compose(&pose_pair.best.pose);
-        let corners_map =
-            canonical_corners(self.config.tag_size_m).map(|p| tag_to_map.transform_point(&p));
-
         self.observations.push(TagObservation {
             kf_idx,
-            corners_map,
+            tag_to_cam: pose_pair.best.pose,
         });
     }
 
+    /// Resolves a stored observation into map-frame tag corners using the
+    /// keyframe's (final) world-to-camera pose. Returns `None` if the pose is
+    /// unavailable (e.g. the keyframe was culled).
+    fn resolve_observation(
+        &self,
+        obs: &TagObservation,
+        pose_world_to_cam: &Pose3d,
+    ) -> [Vec3F64; 4] {
+        // Compose into map frame: tag -> cam -> world.
+        let tag_to_map = pose_world_to_cam.inverse().compose(&obs.tag_to_cam);
+        canonical_corners(self.config.tag_size_m).map(|p| tag_to_map.transform_point(&p))
+    }
+
     /// Fits the map -> tag-frame Sim3 from the accumulated observations.
+    ///
+    /// `kf_pose` must return the keyframe's *final* world-to-camera pose (e.g.
+    /// read from the live map under the map lock). Resolving the stored
+    /// camera-frame tag poses against these final poses — rather than against
+    /// the provisional pose seen at ingest — makes the fit independent of when
+    /// each keyframe was observed and of any later local-BA refinement.
     ///
     /// Observations are screened first: a pose-estimation error corrupts all
     /// four corners of an observation together, so each observation is scored
@@ -212,8 +241,22 @@ impl AprilTagAnchor {
     /// survivors are flattened into corner pairs (`corners_map[i]` ->
     /// canonical tag corner `i`) and fitted robustly with `align_sim3_robust`.
     /// At least two distinct keyframes are required.
-    pub fn solve(&self) -> Result<Sim3Alignment, AprilTagAnchorError> {
-        let distinct: HashSet<usize> = self.observations.iter().map(|o| o.kf_idx).collect();
+    pub fn solve(
+        &self,
+        kf_pose: impl Fn(usize) -> Option<Pose3d>,
+    ) -> Result<Sim3Alignment, AprilTagAnchorError> {
+        // Resolve every stored camera-frame tag pose into map-frame corners
+        // using the keyframe's final pose. Observations whose keyframe has no
+        // final pose (e.g. culled) are dropped.
+        let resolved: Vec<(usize, [Vec3F64; 4])> = self
+            .observations
+            .iter()
+            .filter_map(|obs| {
+                kf_pose(obs.kf_idx).map(|pose| (obs.kf_idx, self.resolve_observation(obs, &pose)))
+            })
+            .collect();
+
+        let distinct: HashSet<usize> = resolved.iter().map(|(kf_idx, _)| *kf_idx).collect();
         if distinct.len() < 2 {
             return Err(AprilTagAnchorError::InsufficientObservations {
                 keyframes: distinct.len(),
@@ -224,22 +267,22 @@ impl AprilTagAnchor {
 
         // Score each observation by the median distance of its corners to the
         // canonical corners, then drop observations at > 4x the median score.
-        let mut scores: Vec<f64> = self
-            .observations
+        let mut scores: Vec<f64> = resolved
             .iter()
-            .map(|obs| observation_score(obs, &canonical))
+            .map(|(_, corners)| observation_score(corners, &canonical))
             .collect();
         let med_score = median_of(&mut scores);
-        let screened: Vec<&TagObservation> = if med_score > 0.0 {
-            self.observations
+        let screened: Vec<&(usize, [Vec3F64; 4])> = if med_score > 0.0 {
+            resolved
                 .iter()
-                .filter(|obs| observation_score(obs, &canonical) <= 4.0 * med_score)
+                .filter(|(_, corners)| observation_score(corners, &canonical) <= 4.0 * med_score)
                 .collect()
         } else {
-            self.observations.iter().collect()
+            resolved.iter().collect()
         };
 
-        let distinct_survivors: HashSet<usize> = screened.iter().map(|o| o.kf_idx).collect();
+        let distinct_survivors: HashSet<usize> =
+            screened.iter().map(|(kf_idx, _)| *kf_idx).collect();
         if distinct_survivors.len() < 2 {
             return Err(AprilTagAnchorError::InsufficientObservations {
                 keyframes: distinct_survivors.len(),
@@ -248,12 +291,47 @@ impl AprilTagAnchor {
 
         let mut est = Vec::with_capacity(screened.len() * 4);
         let mut gt = Vec::with_capacity(screened.len() * 4);
-        for obs in &screened {
-            est.extend(obs.corners_map);
+        for (_, corners) in &screened {
+            est.extend(*corners);
             gt.extend(canonical);
         }
 
-        Ok(align_sim3_robust(&est, &gt, self.config.robust))
+        let fit = align_sim3_robust(&est, &gt, self.config.robust);
+
+        // Residuals of the fitted corners in metres. A degenerate fit that
+        // collapses every corner onto the tag center yields residuals all near
+        // the tag half-diagonal (~0.71 * tag size); a genuine fit on noisy
+        // hand-held data can scatter corners by a good fraction of the tag
+        // size (uncalibrated intrinsics dominate). The scale gate above is the
+        // reliable discriminator for the observed collapse (scale -> 0); the
+        // median residual here is only a coarse sanity check that catches
+        // genuinely broken fits (corners farther apart than the tag itself).
+        let mut residuals: Vec<f64> = est
+            .iter()
+            .zip(&gt)
+            .map(|(e, g)| {
+                let d = fit.apply(*e) - *g;
+                (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
+            })
+            .collect();
+        residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = residuals[residuals.len() / 2];
+
+        let scale = fit.scale;
+        if !scale.is_finite()
+            || !scale.is_sign_positive()
+            || scale <= 1e-6
+            || scale >= 1e6
+            || med > 1.5 * self.config.tag_size_m
+        {
+            return Err(AprilTagAnchorError::DegenerateFit {
+                scale,
+                med,
+                tag_size_m: self.config.tag_size_m,
+            });
+        }
+
+        Ok(fit)
     }
 }
 
@@ -271,10 +349,10 @@ fn median_of(sorted: &mut [f64]) -> f64 {
 
 /// Per-observation score: median distance of the observed corners to the
 /// canonical tag corners.
-fn observation_score(obs: &TagObservation, canonical: &[Vec3F64; 4]) -> f64 {
+fn observation_score(corners: &[Vec3F64; 4], canonical: &[Vec3F64; 4]) -> f64 {
     let mut ds = [0.0_f64; 4];
     for i in 0..4 {
-        ds[i] = (obs.corners_map[i] - canonical[i]).length();
+        ds[i] = (corners[i] - canonical[i]).length();
     }
     ds.sort_by(|a, b| a.partial_cmp(b).unwrap());
     0.5 * (ds[1] + ds[2])
@@ -298,9 +376,12 @@ mod tests {
             .sqrt()
     }
 
-    /// Builds observations for two keyframes by transforming the canonical tag
-    /// corners through the given tag->map pose (the same convention
-    /// `on_keyframe` uses to store `corners_map`).
+    /// Builds a keyframe-pose lookup closure that returns the given pose for
+    /// every keyframe index.
+    fn identity_kf_pose() -> impl Fn(usize) -> Option<Pose3d> {
+        |_| Some(Pose3d::IDENTITY)
+    }
+
     #[test]
     fn winding_convention_yields_identity_when_tag_aligned_with_map() {
         // Tag at the map origin, axes aligned: the solved anchor must be the
@@ -310,76 +391,91 @@ mod tests {
         for kf_idx in [0, 1] {
             anchor.observations.push(TagObservation {
                 kf_idx,
-                corners_map: canonical_corners(anchor.config.tag_size_m),
+                tag_to_cam: Pose3d::IDENTITY,
             });
         }
 
-        let fit = anchor.solve().unwrap();
+        let fit = anchor.solve(identity_kf_pose()).unwrap();
         assert!((fit.scale - 1.0).abs() < 1e-9);
         assert!(mat3_frobenius_diff(&fit.rotation, &Mat3F64::IDENTITY) < 1e-9);
         assert!(vec3_norm(fit.translation) < 1e-9);
     }
 
     #[test]
-    fn scale_recovery_is_inverse_of_map_scale() {
-        // A "synthetic map" whose tag geometry is 0.5x the true metric tag,
-        // rotated and translated arbitrarily: solving must recover scale ≈ 2.
+    fn solve_resolves_observations_against_final_keyframe_poses() {
+        // The fix: observations are stored in the camera frame and resolved
+        // against the keyframe's *final* pose supplied to solve(). If solve
+        // ignored the closure (e.g. assumed identity), the recovered Sim3
+        // would be identity; here it must invert the supplied final pose.
         let tag_size_m = 0.2;
-        let r_m = rotation_from_axis_angle(Vec3F64::new(0.0, 0.0, 1.0), 0.5);
-        let t_m = Vec3F64::new(1.0, 2.0, 0.5);
-        let scale_map = 0.5;
+        let r = rotation_from_axis_angle(Vec3F64::new(0.0, 0.0, 1.0), 0.5);
+        let t = Vec3F64::new(0.3, -0.2, 1.0);
+        let final_pose = Pose3d::from_rt(r, t);
 
         let mut anchor = AprilTagAnchor::new(AprilTagAnchorConfig {
             tag_size_m,
             ..Default::default()
         });
         for kf_idx in [0, 1, 2] {
-            let corners_map = canonical_corners(tag_size_m).map(|p| scale_map * (r_m * p + t_m));
             anchor.observations.push(TagObservation {
                 kf_idx,
-                corners_map,
+                tag_to_cam: Pose3d::IDENTITY,
             });
         }
 
-        let fit = anchor.solve().unwrap();
-        // Map -> tag: scale closes the 0.5x map factor, rotation/translation
-        // invert the tag->map pose.
-        let expected_rot = r_m.transpose();
-        assert!((fit.scale - 2.0).abs() < 1e-9, "scale error: {}", fit.scale);
-        assert!(mat3_frobenius_diff(&fit.rotation, &expected_rot) < 1e-9);
-        let expected_t = -(expected_rot * t_m);
-        assert!(vec3_norm(fit.translation - expected_t) < 1e-9);
+        let fit = anchor
+            .solve(|_| Some(final_pose))
+            .expect("solve must succeed with a valid final pose");
+        // Resolved corners = final_pose^-1(canonical); the map->tag Sim3 must
+        // invert that, recovering `final_pose` with unit scale.
+        assert!((fit.scale - 1.0).abs() < 1e-6, "scale error: {}", fit.scale);
+        assert!(
+            mat3_frobenius_diff(&fit.rotation, &r) < 1e-6,
+            "rotation error"
+        );
+        assert!(vec3_norm(fit.translation - t) < 1e-6, "translation error");
     }
 
     #[test]
     fn robust_solve_ignores_corrupted_observations() {
         let tag_size_m = 0.2;
-        let r_m = rotation_from_axis_angle(Vec3F64::new(0.0, 0.0, 1.0), 1.1);
-        let t_m = Vec3F64::new(0.5, -0.5, 1.0);
-        let scale_map = 0.5;
+        let r = rotation_from_axis_angle(Vec3F64::new(0.0, 0.0, 1.0), 1.1);
+        let t = Vec3F64::new(0.5, -0.5, 1.0);
+        let final_pose = Pose3d::from_rt(r, t);
 
-        let mut anchor = AprilTagAnchor::new(AprilTagAnchorConfig::default());
+        let mut anchor = AprilTagAnchor::new(AprilTagAnchorConfig {
+            tag_size_m,
+            ..Default::default()
+        });
         for kf_idx in 0..10 {
-            let mut corners_map =
-                canonical_corners(tag_size_m).map(|p| scale_map * (r_m * p + t_m));
-            // Grossly corrupt two of the ten observations.
-            if kf_idx == 3 || kf_idx == 6 {
-                for c in corners_map.iter_mut() {
-                    *c += Vec3F64::new(5.0, -4.0, 3.0);
-                }
-            }
-            anchor.observations.push(TagObservation {
-                kf_idx,
-                corners_map,
-            });
+            // A consistent observation: the tag aligned with the camera frame.
+            let tag_to_cam = Pose3d::IDENTITY;
+            // Grossly corrupt two of the ten observations: a far-away,
+            // rotated tag that the screening must reject.
+            let tag_to_cam = if kf_idx == 3 || kf_idx == 6 {
+                Pose3d::from_rt(
+                    rotation_from_axis_angle(Vec3F64::new(1.0, 0.0, 0.0), 2.0),
+                    Vec3F64::new(8.0, -6.0, 4.0),
+                )
+            } else {
+                tag_to_cam
+            };
+            anchor
+                .observations
+                .push(TagObservation { kf_idx, tag_to_cam });
         }
 
-        let fit = anchor.solve().unwrap();
-        let expected_rot = r_m.transpose();
-        let expected_t = -(expected_rot * t_m);
-        assert!((fit.scale - 2.0).abs() < 1e-3, "scale error: {}", fit.scale);
-        assert!(mat3_frobenius_diff(&fit.rotation, &expected_rot) < 5e-3);
-        assert!(vec3_norm(fit.translation - expected_t) < 1e-2);
+        let fit = anchor
+            .solve(|_| Some(final_pose))
+            .expect("solve must succeed with mostly-good observations");
+        // Resolved corners = final_pose^-1(canonical); the map->tag Sim3
+        // recovers `final_pose` (unit scale), matching the pose test above.
+        assert!((fit.scale - 1.0).abs() < 1e-3, "scale error: {}", fit.scale);
+        assert!(
+            mat3_frobenius_diff(&fit.rotation, &r) < 5e-3,
+            "rotation error"
+        );
+        assert!(vec3_norm(fit.translation - t) < 1e-2, "translation error");
     }
 
     #[test]
@@ -387,10 +483,10 @@ mod tests {
         let mut anchor = AprilTagAnchor::new(AprilTagAnchorConfig::default());
         anchor.observations.push(TagObservation {
             kf_idx: 0,
-            corners_map: canonical_corners(anchor.config.tag_size_m),
+            tag_to_cam: Pose3d::IDENTITY,
         });
 
-        let err = match anchor.solve() {
+        let err = match anchor.solve(identity_kf_pose()) {
             Err(err) => err,
             Ok(_) => panic!("expected solve to fail with a single keyframe"),
         };

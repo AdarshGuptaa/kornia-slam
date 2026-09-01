@@ -245,17 +245,8 @@ impl SlamPipeline {
         if self.apriltag_anchor.is_none() {
             return;
         }
-        let Some(pose) = self
-            .map
-            .lock()
-            .unwrap()
-            .get_keyframe(kf_idx)
-            .map(|kf| kf.frame.pose_world_to_cam)
-        else {
-            return;
-        };
         if let Some(anchor) = self.apriltag_anchor.as_mut() {
-            anchor.on_keyframe(kf_idx, image, &pose, &self.camera);
+            anchor.on_keyframe(kf_idx, image, &self.camera);
         }
     }
 
@@ -274,7 +265,18 @@ impl SlamPipeline {
         let Some(anchor) = self.apriltag_anchor.as_ref() else {
             return Err(AprilTagAnchorError::AnchorNotConfigured);
         };
-        let alignment = anchor.solve()?;
+        // Ensure no async local-BA merge is in flight before reading the map;
+        // then resolve the stored tag observations against each keyframe's
+        // *final* pose so the Sim3 solve sees a self-consistent map regardless
+        // of when each keyframe was observed.
+        self.local_mapping.flush();
+        let alignment = {
+            let map = self.map.lock().unwrap();
+            anchor.solve(|kf_idx| {
+                map.get_keyframe(kf_idx)
+                    .map(|kf| kf.frame.pose_world_to_cam)
+            })?
+        };
         let config = anchor.config().clone();
         self.map.lock().unwrap().apply_world_sim3(
             alignment.scale,

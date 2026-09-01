@@ -1032,16 +1032,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── AprilTag metric anchor (batch Sim3 correction) ─────────────────────
     #[cfg(feature = "apriltag")]
     if apriltag_anchor {
-        if let Some((obs, kfs)) = system.apriltag_anchor_stats() {
-            eprintln!("[apriltag-anchor] observations={obs} distinct_keyframes={kfs}");
-        }
-        match system.apply_apriltag_anchor() {
-            Ok(a) => eprintln!(
-                "[apriltag-anchor] scale={:.6} translation=({:.4}, {:.4}, {:.4})",
-                a.scale, a.translation.x, a.translation.y, a.translation.z
-            ),
-            Err(e) => eprintln!("[apriltag-anchor] failed: {e}"),
-        }
+        let alignment = system
+            .apply_apriltag_anchor()
+            .map_err(|e| format!("apriltag anchor failed: {e}"))?;
+        eprintln!(
+            "[apriltag-anchor] scale={:.6} translation=({:.4}, {:.4}, {:.4})",
+            alignment.scale,
+            alignment.translation.x,
+            alignment.translation.y,
+            alignment.translation.z
+        );
     }
     // ── Trajectory evaluation (EuRoC, --evaluate only) ─────────────────────
     if evaluate {
