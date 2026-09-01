@@ -1005,29 +1005,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
-    // Map-point axis-aligned bounds (map units before any anchor).
+    // Map-point depth statistics in map units (before any anchor). Median and
+    // max depth of active points from the world origin; a stable median across
+    // runs indicates the bootstrap's median-depth normalization is consistent.
     {
-        let (min, max) = system.with_map_points(|pts| {
-            let mut mn = kornia_algebra::Vec3F64::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-            let mut mx = kornia_algebra::Vec3F64::new(
-                f64::NEG_INFINITY,
-                f64::NEG_INFINITY,
-                f64::NEG_INFINITY,
-            );
-            for p in pts.iter().filter(|p| !p.culled) {
-                mn.x = mn.x.min(p.position.x);
-                mn.y = mn.y.min(p.position.y);
-                mn.z = mn.z.min(p.position.z);
-                mx.x = mx.x.max(p.position.x);
-                mx.y = mx.y.max(p.position.y);
-                mx.z = mx.z.max(p.position.z);
-            }
-            (mn, mx)
+        let mut depths: Vec<f64> = system.with_map_points(|pts| {
+            pts.iter()
+                .filter(|p| !p.culled)
+                .map(|p| p.position.length())
+                .collect()
         });
-        let sz = max - min;
+        depths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = if depths.is_empty() {
+            0.0
+        } else if depths.len() % 2 == 1 {
+            depths[depths.len() / 2]
+        } else {
+            0.5 * (depths[depths.len() / 2 - 1] + depths[depths.len() / 2])
+        };
+        let max = depths.last().copied().unwrap_or(0.0);
         eprintln!(
-            "[map-bounds] min=({:.2},{:.2},{:.2}) max=({:.2},{:.2},{:.2}) size=({:.2},{:.2},{:.2})",
-            min.x, min.y, min.z, max.x, max.y, max.z, sz.x, sz.y, sz.z
+            "[map-depth] median={median:.2} max={max:.2} n={}",
+            depths.len()
         );
     }
     // ── AprilTag metric anchor (batch Sim3 correction) ─────────────────────

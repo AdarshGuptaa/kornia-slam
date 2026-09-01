@@ -270,7 +270,8 @@ impl SlamPipeline {
     /// [`AprilTagAnchorError::InsufficientObservations`] instead of re-applying
     /// a second correction.
     #[cfg(feature = "apriltag")]
-    pub fn apply_apriltag_anchor(&mut self) -> Result<Sim3Alignment, AprilTagAnchorError> {        let Some(anchor) = self.apriltag_anchor.as_ref() else {
+    pub fn apply_apriltag_anchor(&mut self) -> Result<Sim3Alignment, AprilTagAnchorError> {
+        let Some(anchor) = self.apriltag_anchor.as_ref() else {
             return Err(AprilTagAnchorError::AnchorNotConfigured);
         };
         let alignment = anchor.solve()?;
@@ -295,12 +296,9 @@ impl SlamPipeline {
     /// (total observations and distinct keyframes observed).
     #[cfg(feature = "apriltag")]
     pub fn apriltag_anchor_stats(&self) -> Option<(usize, usize)> {
-        self.apriltag_anchor.as_ref().map(|a| {
-            (
-                a.num_observations(),
-                a.num_distinct_keyframes(),
-            )
-        })
+        self.apriltag_anchor
+            .as_ref()
+            .map(|a| (a.num_observations(), a.num_distinct_keyframes()))
     }
 
     /// Returns the index of the current reference keyframe, if tracking has one.
