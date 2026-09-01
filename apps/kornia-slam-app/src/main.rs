@@ -1005,9 +1005,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+    // Map-point axis-aligned bounds (map units before any anchor).
+    {
+        let (min, max) = system.with_map_points(|pts| {
+            let mut mn = kornia_algebra::Vec3F64::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+            let mut mx = kornia_algebra::Vec3F64::new(
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            );
+            for p in pts.iter().filter(|p| !p.culled) {
+                mn.x = mn.x.min(p.position.x);
+                mn.y = mn.y.min(p.position.y);
+                mn.z = mn.z.min(p.position.z);
+                mx.x = mx.x.max(p.position.x);
+                mx.y = mx.y.max(p.position.y);
+                mx.z = mx.z.max(p.position.z);
+            }
+            (mn, mx)
+        });
+        let sz = max - min;
+        eprintln!(
+            "[map-bounds] min=({:.2},{:.2},{:.2}) max=({:.2},{:.2},{:.2}) size=({:.2},{:.2},{:.2})",
+            min.x, min.y, min.z, max.x, max.y, max.z, sz.x, sz.y, sz.z
+        );
+    }
     // ── AprilTag metric anchor (batch Sim3 correction) ─────────────────────
     #[cfg(feature = "apriltag")]
     if apriltag_anchor {
+        if let Some((obs, kfs)) = system.apriltag_anchor_stats() {
+            eprintln!("[apriltag-anchor] observations={obs} distinct_keyframes={kfs}");
+        }
         match system.apply_apriltag_anchor() {
             Ok(a) => eprintln!(
                 "[apriltag-anchor] scale={:.6} translation=({:.4}, {:.4}, {:.4})",

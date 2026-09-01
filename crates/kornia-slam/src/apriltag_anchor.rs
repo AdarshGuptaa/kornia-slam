@@ -115,6 +115,20 @@ impl AprilTagAnchor {
         &self.observations
     }
 
+    /// Total tag detections accumulated across keyframes.
+    pub fn num_observations(&self) -> usize {
+        self.observations.len()
+    }
+
+    /// Number of distinct keyframes that observed the tag.
+    pub fn num_distinct_keyframes(&self) -> usize {
+        self.observations
+            .iter()
+            .map(|o| o.kf_idx)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
     /// Returns the anchor configuration.
     pub fn config(&self) -> &AprilTagAnchorConfig {
         &self.config
