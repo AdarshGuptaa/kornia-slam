@@ -22,10 +22,13 @@
 //!     --fx 600 --fy 600 --cx 320 --cy 240
 //! ```
 //!
-//! Anchor the final map to a physical AprilTag (requires `--features apriltag`):
+//! Anchor the final map to a physical AprilTag (requires `--features apriltag`).
+//! AprilTag flags are subcommand-local, so they come *after* the subcommand;
+//! global flags (e.g. `--debug`, `--no-tui`) come *before* it:
 //! ```text
-//! cargo run --release -p kornia-slam-app --features apriltag -- euroc \
-//!     --data /path/to/V1_01_easy --apriltag-anchor --apriltag-size 0.16 --apriltag-id 7
+//! cargo run --release -p kornia-slam-app --features apriltag -- \
+//!     --debug euroc --data /path/to/V1_01_easy \
+//!     --apriltag-anchor --apriltag-size 0.16 --apriltag-id 7
 //! ```
 
 mod datasets;
@@ -96,25 +99,6 @@ struct Args {
     /// IMU input uses gravity-preserving four-degree-of-freedom optimization
     #[argh(switch)]
     apply_pgo: bool,
-
-    /// after the run, anchor map scale/orientation to a physical AprilTag
-    /// solved once as a Sim3 (requires building with --features apriltag)
-    #[argh(switch)]
-    apriltag_anchor: bool,
-
-    /// apriltag side length in metres (with --apriltag-anchor)
-    #[argh(option, default = "0.16")]
-    apriltag_size: f64,
-
-    /// apriltag id to anchor to (with --apriltag-anchor)
-    #[argh(option, default = "0")]
-    apriltag_id: u16,
-
-    /// tag family: tag16h5 | tag25h9 | tag36h10 | tag36h11 | tagcircle21h7 |
-    /// tagcircle49h12 | tagcustom48h12 | tagstandard41h12 | tagstandard52h13
-    /// (with --apriltag-anchor)
-    #[argh(option, default = "String::from(\"tag36h11\")")]
-    apriltag_family: String,
 }
 
 #[derive(argh::FromArgs)]
@@ -162,6 +146,25 @@ struct EurocCmd {
     /// directory for the evaluation CSVs (created if missing; default: current dir)
     #[argh(option, default = "String::from(\".\")")]
     eval_out: String,
+
+    /// after the run, anchor map scale/orientation to a physical AprilTag
+    /// solved once as a Sim3 (requires building with --features apriltag)
+    #[argh(switch)]
+    apriltag_anchor: bool,
+
+    /// apriltag side length in metres (with --apriltag-anchor)
+    #[argh(option, default = "0.16")]
+    apriltag_size: f64,
+
+    /// apriltag id to anchor to (with --apriltag-anchor)
+    #[argh(option, default = "0")]
+    apriltag_id: u16,
+
+    /// tag family: tag16h5 | tag25h9 | tag36h10 | tag36h11 | tagcircle21h7 |
+    /// tagcircle49h12 | tagcustom48h12 | tagstandard41h12 | tagstandard52h13
+    /// (with --apriltag-anchor)
+    #[argh(option, default = "String::from(\"tag36h11\")")]
+    apriltag_family: String,
 }
 
 /// Run on a Hilti-Trimble SLAM Challenge 2026 sequence extracted to the
@@ -203,6 +206,24 @@ struct HiltiCmd {
     /// directory for the evaluation CSVs (created if missing; default: current dir)
     #[argh(option, default = "String::from(\".\")")]
     eval_out: String,
+
+    /// anchor the final map to a physical AprilTag (requires --features apriltag)
+    #[argh(switch)]
+    apriltag_anchor: bool,
+
+    /// apriltag side length in metres (with --apriltag-anchor)
+    #[argh(option, default = "0.16")]
+    apriltag_size: f64,
+
+    /// apriltag id to anchor to (with --apriltag-anchor)
+    #[argh(option, default = "0")]
+    apriltag_id: u16,
+
+    /// tag family: tag16h5 | tag25h9 | tag36h10 | tag36h11 | tagcircle21h7 |
+    /// tagcircle49h12 | tagcustom48h12 | tagstandard41h12 | tagstandard52h13
+    /// (with --apriltag-anchor)
+    #[argh(option, default = "String::from(\"tag36h11\")")]
+    apriltag_family: String,
 }
 
 /// Run on a bubbaloop MCAP recording.
@@ -241,6 +262,24 @@ struct McapCmd {
     /// skip this many initial frames
     #[argh(option, default = "0")]
     start_frame: usize,
+
+    /// anchor the final map to a physical AprilTag (requires --features apriltag)
+    #[argh(switch)]
+    apriltag_anchor: bool,
+
+    /// apriltag side length in metres (with --apriltag-anchor)
+    #[argh(option, default = "0.16")]
+    apriltag_size: f64,
+
+    /// apriltag id to anchor to (with --apriltag-anchor)
+    #[argh(option, default = "0")]
+    apriltag_id: u16,
+
+    /// tag family: tag16h5 | tag25h9 | tag36h10 | tag36h11 | tagcircle21h7 |
+    /// tagcircle49h12 | tagcustom48h12 | tagstandard41h12 | tagstandard52h13
+    /// (with --apriltag-anchor)
+    #[argh(option, default = "String::from(\"tag36h11\")")]
+    apriltag_family: String,
 }
 
 /// Run live on an OAK-D camera (CamB mono, or CamB+CamC stereo with --stereo).
@@ -271,6 +310,24 @@ struct OakdCmd {
     /// path to a stereo calibration YAML (required for --stereo)
     #[argh(option)]
     calib: Option<String>,
+
+    /// anchor the final map to a physical AprilTag (requires --features apriltag)
+    #[argh(switch)]
+    apriltag_anchor: bool,
+
+    /// apriltag side length in metres (with --apriltag-anchor)
+    #[argh(option, default = "0.16")]
+    apriltag_size: f64,
+
+    /// apriltag id to anchor to (with --apriltag-anchor)
+    #[argh(option, default = "0")]
+    apriltag_id: u16,
+
+    /// tag family: tag16h5 | tag25h9 | tag36h10 | tag36h11 | tagcircle21h7 |
+    /// tagcircle49h12 | tagcustom48h12 | tagstandard41h12 | tagstandard52h13
+    /// (with --apriltag-anchor)
+    #[argh(option, default = "String::from(\"tag36h11\")")]
+    apriltag_family: String,
 }
 
 /// Run live on a UVC camera (laptop webcam, USB cam, CSI-to-UVC adapter…),
@@ -329,6 +386,24 @@ struct UvcCmd {
     /// tangential distortion p2
     #[argh(option, default = "0.0")]
     p2: f64,
+
+    /// anchor the final map to a physical AprilTag (requires --features apriltag)
+    #[argh(switch)]
+    apriltag_anchor: bool,
+
+    /// apriltag side length in metres (with --apriltag-anchor)
+    #[argh(option, default = "0.16")]
+    apriltag_size: f64,
+
+    /// apriltag id to anchor to (with --apriltag-anchor)
+    #[argh(option, default = "0")]
+    apriltag_id: u16,
+
+    /// tag family: tag16h5 | tag25h9 | tag36h10 | tag36h11 | tagcircle21h7 |
+    /// tagcircle49h12 | tagcustom48h12 | tagstandard41h12 | tagstandard52h13
+    /// (with --apriltag-anchor)
+    #[argh(option, default = "String::from(\"tag36h11\")")]
+    apriltag_family: String,
 }
 
 /// ORB pyramid scale factor (matches `OrbDetector` default `downscale`).
@@ -452,6 +527,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut evaluate = false;
     let mut eval_out = String::from(".");
     let mut imu_enabled = false;
+    let apriltag_anchor: bool;
+    let apriltag_size: f64;
+    let apriltag_id: u16;
+    let apriltag_family: String;
     let target_dt = Duration::from_secs_f64(1.0 / 30.0);
     let mut last_frame_walltime = Instant::now();
     let (mut source, euroc_gt): (Box<dyn FrameSource>, Option<Vec<GroundTruthPose>>) = match args
@@ -461,6 +540,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             evaluate = e.evaluate;
             eval_out = e.eval_out.clone();
             imu_enabled = e.imu;
+            apriltag_anchor = e.apriltag_anchor;
+            apriltag_size = e.apriltag_size;
+            apriltag_id = e.apriltag_id;
+            apriltag_family = e.apriltag_family.clone();
             let src = if e.stereo {
                 EurocSource::open_stereo(&e.data, e.start_frame, e.max_frames)?
             } else {
@@ -482,6 +565,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SourceCmd::Hilti(h) => {
             evaluate = h.evaluate;
             eval_out = h.eval_out.clone();
+            apriltag_anchor = h.apriltag_anchor;
+            apriltag_size = h.apriltag_size;
+            apriltag_id = h.apriltag_id;
+            apriltag_family = h.apriltag_family.clone();
             let src =
                 HiltiSource::open(&h.data, &h.calib, h.start_frame, h.max_frames, !h.no_rotate)?;
             if !tui_active {
@@ -498,6 +585,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (Box::new(src), Some(gt))
         }
         SourceCmd::Mcap(m) => {
+            apriltag_anchor = m.apriltag_anchor;
+            apriltag_size = m.apriltag_size;
+            apriltag_id = m.apriltag_id;
+            apriltag_family = m.apriltag_family.clone();
             let path = std::path::Path::new(&m.path);
             let src = if m.stereo {
                 let calib = m
@@ -522,6 +613,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(feature = "oakd")]
         SourceCmd::Oakd(o) => {
+            apriltag_anchor = o.apriltag_anchor;
+            apriltag_size = o.apriltag_size;
+            apriltag_id = o.apriltag_id;
+            apriltag_family = o.apriltag_family.clone();
             let src = if o.stereo {
                 let calib = o
                     .calib
@@ -535,6 +630,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(feature = "uvc")]
         SourceCmd::Uvc(w) => {
+            apriltag_anchor = w.apriltag_anchor;
+            apriltag_size = w.apriltag_size;
+            apriltag_id = w.apriltag_id;
+            apriltag_family = w.apriltag_family.clone();
             let camera = kornia_3d::camera::PinholeCamera {
                 fx: w.fx,
                 fy: w.fy,
@@ -590,10 +689,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(error.into());
     }
     if let Err(error) = validate_apriltag_mode(
-        args.apriltag_anchor,
-        args.apriltag_id,
-        &args.apriltag_family,
-        args.apriltag_size,
+        apriltag_anchor,
+        apriltag_id,
+        &apriltag_family,
+        apriltag_size,
     ) {
         return Err(error.into());
     }
@@ -619,11 +718,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "apriltag")]
     let pipeline_config = {
         let mut config = pipeline_config;
-        if args.apriltag_anchor {
+        if apriltag_anchor {
             config.apriltag = Some(AprilTagAnchorConfig {
-                tag_id: args.apriltag_id,
-                tag_size_m: args.apriltag_size,
-                family: parse_tag_family(&args.apriltag_family).unwrap(),
+                tag_id: apriltag_id,
+                tag_size_m: apriltag_size,
+                family: parse_tag_family(&apriltag_family).unwrap(),
                 ..AprilTagAnchorConfig::default()
             });
         }
@@ -908,7 +1007,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // ── AprilTag metric anchor (batch Sim3 correction) ─────────────────────
     #[cfg(feature = "apriltag")]
-    if args.apriltag_anchor {
+    if apriltag_anchor {
         match system.apply_apriltag_anchor() {
             Ok(a) => eprintln!(
                 "[apriltag-anchor] scale={:.6} translation=({:.4}, {:.4}, {:.4})",
