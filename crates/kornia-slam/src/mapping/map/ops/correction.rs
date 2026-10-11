@@ -456,12 +456,7 @@ impl Map {
         }
 
         self.world_epoch = self.world_epoch.wrapping_add(1);
-        for ((keyframe, pose), velocity) in self
-            .keyframes
-            .iter_mut()
-            .zip(poses)
-            .zip(velocities)
-        {
+        for ((keyframe, pose), velocity) in self.keyframes.iter_mut().zip(poses).zip(velocities) {
             keyframe.frame.pose_world_to_cam = pose;
             keyframe.velocity_world = velocity;
         }
@@ -729,7 +724,7 @@ mod tests {
         tests::{test_frame, test_frame_with_pose},
     };
     use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+    use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 
     #[test]
     fn inertial_alignment_assigns_velocities_by_keyframe_id() {
@@ -1043,10 +1038,7 @@ use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
         let translation = Vec3F64::new(2.0, -1.5, 0.25);
 
         let mut map = Map::new();
-        let pose = Pose3d::new(
-            Mat3F64::IDENTITY,
-            Vec3F64::new(-1.0, 0.5, 3.0),
-        );
+        let pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(-1.0, 0.5, 3.0));
         map.insert_keyframe(Keyframe::from_frame(test_frame_with_pose(
             0,
             vec![[0; 32]],
@@ -1085,9 +1077,7 @@ use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
         assert!((map.map_points()[point_idx].position - expected_point).length() < 1e-9);
 
         let expected_velocity = scale * (rotation * velocity_before);
-        assert!(
-            (map.get_keyframe(0).unwrap().velocity_world - expected_velocity).length() < 1e-9
-        );
+        assert!((map.get_keyframe(0).unwrap().velocity_world - expected_velocity).length() < 1e-9);
     }
 
     #[test]
