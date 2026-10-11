@@ -1,6 +1,8 @@
 use kornia_imgproc::features::OrbMatchConfig;
 use kornia_sensors::SensorRig;
 
+#[cfg(feature = "apriltag")]
+use super::config::AprilTagAnchorMode;
 use super::config::{
     CameraSelection, FrontendConfig, LoopClosingMode, OrbFrontendConfig, OrbSlamPipeline,
     OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection, StereoCloseDepth,
@@ -79,8 +81,20 @@ impl OrbSlamPipeline {
         }
         validate_keyframes(&self.keyframes, sensors.imu)?;
         validate_loop_closing(&self.loop_closing, sensors)?;
+        #[cfg(feature = "apriltag")]
+        validate_apriltag_anchor(&self.apriltag_anchor)?;
         validate_tuning(&self.tuning, self.loop_closing.is_enabled())
     }
+}
+
+/// The anchor stage only needs its tag size checked: the typed family enum
+/// makes an unknown family unrepresentable.
+#[cfg(feature = "apriltag")]
+fn validate_apriltag_anchor(mode: &AprilTagAnchorMode) -> Result<(), ConfigError> {
+    if let AprilTagAnchorMode::Enabled { tag_size_m, .. } = mode {
+        check("apriltag_anchor.tag_size_m", *tag_size_m, POSITIVE)?;
+    }
+    Ok(())
 }
 
 fn validate_tuning(tuning: &OrbTuning, loop_closing: bool) -> Result<(), ConfigError> {

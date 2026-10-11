@@ -13,6 +13,8 @@ mod state;
 mod validation;
 
 pub use build::BuildError;
+#[cfg(feature = "apriltag")]
+pub use config::{AprilTagAnchorMode, AprilTagFamily};
 pub use config::{
     CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
     OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,
@@ -402,6 +404,12 @@ impl SlamSystem {
     /// Returns the number of active (non-culled) map points.
     pub fn num_active_map_points(&self) -> usize {
         self.map.lock().unwrap().num_active_map_points()
+    }
+
+    /// Whether an AprilTag metric-anchor stage is configured.
+    #[cfg(feature = "apriltag")]
+    pub fn apriltag_anchor_enabled(&self) -> bool {
+        self.apriltag_anchor.is_some()
     }
 
     /// Drain any debug messages accumulated since the last call.

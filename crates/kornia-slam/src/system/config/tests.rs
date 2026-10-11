@@ -614,3 +614,53 @@ mod ron_files {
         );
     }
 }
+
+#[cfg(feature = "apriltag")]
+mod apriltag_anchor_tests {
+    use super::*;
+    use crate::apriltag_anchor::TagFamilyKind;
+
+    fn enabled() -> AprilTagAnchorMode {
+        AprilTagAnchorMode::Enabled {
+            tag_id: 2,
+            tag_size_m: 0.1,
+            family: AprilTagFamily::Tag36H11,
+        }
+    }
+
+    #[test]
+    fn disabled_stage_resolves_to_no_anchor() {
+        let config = SystemConfig::default();
+        assert!(config.settings(&rig()).apriltag.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn enabled_stage_resolves_the_family_and_size() {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).apriltag_anchor = enabled();
+        assert!(config.validate().is_ok());
+
+        let anchor = config
+            .settings(&rig())
+            .apriltag
+            .expect("enabled stage resolves an anchor");
+        assert_eq!(anchor.tag_id, 2);
+        assert_eq!(anchor.tag_size_m, 0.1);
+        assert_eq!(anchor.family, TagFamilyKind::Tag36H11);
+    }
+
+    #[test]
+    fn rejects_a_non_positive_tag_size() {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).apriltag_anchor = AprilTagAnchorMode::Enabled {
+            tag_id: 0,
+            tag_size_m: 0.0,
+            family: AprilTagFamily::Tag16H5,
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidSetting { .. })
+        ));
+    }
+}

@@ -85,11 +85,11 @@ pub struct OrbSlamPipeline {
     /// defaults.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub tuning: OrbTuning,
-    /// Opt-in AprilTag metric anchor, set from Rust (e.g. a CLI flag) only:
-    /// configuration files never expose it.
+    /// Optional AprilTag metric anchor stage: observes a known tag in
+    /// keyframes and applies one post-hoc Sim3 (or gravity-preserving)
+    /// correction. Disabled leaves the map untouched.
     #[cfg(feature = "apriltag")]
-    #[cfg_attr(feature = "serde", serde(skip))]
-    pub apriltag: Option<crate::apriltag_anchor::AprilTagAnchorConfig>,
+    pub apriltag_anchor: AprilTagAnchorMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -198,6 +198,84 @@ impl LoopClosingMode {
     }
 }
 
+/// Optional AprilTag metric-anchor stage, enabled from a run file (or in Rust).
+#[cfg(feature = "apriltag")]
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub enum AprilTagAnchorMode {
+    /// No tag detection: the map keeps its arbitrary monocular scale.
+    #[default]
+    Disabled,
+    /// Observe this tag and apply one post-hoc metric correction.
+    Enabled {
+        /// Decode only this tag id.
+        tag_id: u16,
+        /// Physical tag size in metres (edge length of the black square).
+        tag_size_m: f64,
+        /// Tag family the printed tag belongs to.
+        family: AprilTagFamily,
+    },
+}
+
+/// A built-in AprilTag family a run file may name.
+#[cfg(feature = "apriltag")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AprilTagFamily {
+    Tag16H5,
+    Tag25H9,
+    Tag36H10,
+    Tag36H11,
+    TagCircle21H7,
+    TagCircle49H12,
+    TagCustom48H12,
+    TagStandard41H12,
+    TagStandard52H13,
+}
+
+#[cfg(feature = "apriltag")]
+impl AprilTagFamily {
+    /// The detector's family kind.
+    pub(crate) fn kind(self) -> crate::apriltag_anchor::TagFamilyKind {
+        use crate::apriltag_anchor::TagFamilyKind;
+        match self {
+            Self::Tag16H5 => TagFamilyKind::Tag16H5,
+            Self::Tag25H9 => TagFamilyKind::Tag25H9,
+            Self::Tag36H10 => TagFamilyKind::Tag36H10,
+            Self::Tag36H11 => TagFamilyKind::Tag36H11,
+            Self::TagCircle21H7 => TagFamilyKind::TagCircle21H7,
+            Self::TagCircle49H12 => TagFamilyKind::TagCircle49H12,
+            Self::TagCustom48H12 => TagFamilyKind::TagCustom48H12,
+            Self::TagStandard41H12 => TagFamilyKind::TagStandard41H12,
+            Self::TagStandard52H13 => TagFamilyKind::TagStandard52H13,
+        }
+    }
+}
+
+#[cfg(feature = "apriltag")]
+impl AprilTagAnchorMode {
+    /// Resolves the stage into its anchor configuration, or `None` when
+    /// disabled. Detector tuning (decision margin, Hamming distance, robust
+    /// weights) stays Rust-side, the `OrbTuning` precedent; a run file sets
+    /// only the id, size and family.
+    pub(crate) fn config(&self) -> Option<crate::apriltag_anchor::AprilTagAnchorConfig> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled {
+                tag_id,
+                tag_size_m,
+                family,
+            } => Some(crate::apriltag_anchor::AprilTagAnchorConfig {
+                tag_id: *tag_id,
+                tag_size_m: *tag_size_m,
+                family: family.kind(),
+                ..Default::default()
+            }),
+        }
+    }
+}
+
 impl SystemConfig {
     /// Resolves relative resource paths, such as the vocabulary, against
     /// `base_dir`, usually the directory of the file the configuration came
@@ -269,6 +347,18 @@ impl fmt::Display for SystemConfig {
         writeln!(f, "  local mapping: {execution}")?;
         if let Some(vocabulary) = orb.loop_closing.vocabulary() {
             writeln!(f, "  loop closing: {}", vocabulary.display())?;
+        }
+        #[cfg(feature = "apriltag")]
+        if let AprilTagAnchorMode::Enabled {
+            tag_id,
+            tag_size_m,
+            family,
+        } = &orb.apriltag_anchor
+        {
+            writeln!(
+                f,
+                "  apriltag anchor: id={tag_id} size={tag_size_m} m family={family:?}"
+            )?;
         }
         Ok(())
     }

@@ -385,7 +385,7 @@ mod keyframe_evidence {
 #[cfg(feature = "apriltag")]
 mod apriltag_anchor_tests {
     use super::*;
-    use crate::apriltag_anchor::{AprilTagAnchorConfig, AprilTagAnchorError};
+    use crate::apriltag_anchor::AprilTagAnchorError;
 
     #[test]
     fn apply_without_anchor_is_refused() {
@@ -401,7 +401,11 @@ mod apriltag_anchor_tests {
     fn apply_with_anchor_but_no_observations_reports_insufficient() {
         let mut system_config = mono();
         let PipelineDefinition::OrbSlam(orb) = &mut system_config.pipeline;
-        orb.apriltag = Some(AprilTagAnchorConfig::default());
+        orb.apriltag_anchor = AprilTagAnchorMode::Enabled {
+            tag_id: 2,
+            tag_size_m: 0.1,
+            family: AprilTagFamily::Tag36H11,
+        };
         let mut system = SlamSystem::build(system_config, stereo_imu_rig()).unwrap();
 
         let err = system.apply_apriltag_anchor().unwrap_err();
@@ -417,7 +421,7 @@ mod apriltag_anchor_tests {
 #[cfg(feature = "apriltag")]
 mod apriltag_gravity_mode_tests {
     use super::*;
-    use crate::apriltag_anchor::{AprilTagAnchorConfig, TagObservation};
+    use crate::apriltag_anchor::TagObservation;
     use crate::mapping::map::Keyframe;
     use crate::mapping::map::tests::test_frame_with_pose;
     use kornia_algebra::SO3F64;
@@ -426,7 +430,11 @@ mod apriltag_gravity_mode_tests {
     fn imu_initialized_map_gets_a_gravity_preserving_correction() {
         let mut system_config = mono();
         let PipelineDefinition::OrbSlam(orb) = &mut system_config.pipeline;
-        orb.apriltag = Some(AprilTagAnchorConfig::default());
+        orb.apriltag_anchor = AprilTagAnchorMode::Enabled {
+            tag_id: 2,
+            tag_size_m: 0.1,
+            family: AprilTagFamily::Tag36H11,
+        };
         let mut system = SlamSystem::build(system_config, stereo_imu_rig()).unwrap();
 
         // Two keyframes whose final poses carry a tilt off gravity. A full

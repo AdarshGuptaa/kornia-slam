@@ -72,7 +72,7 @@ impl SystemConfig {
                 .stereo_baseline_m
                 .and_then(|baseline| frontend.stereo_close_depth.metres(baseline)),
             #[cfg(feature = "apriltag")]
-            apriltag: orb.apriltag.clone(),
+            apriltag: orb.apriltag_anchor.config(),
         }
     }
 
