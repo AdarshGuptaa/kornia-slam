@@ -22,7 +22,9 @@ pub use kornia_apriltag::family::TagFamilyKind;
 use kornia_apriltag::{AprilTagDecoder, DecodeTagsConfig};
 use kornia_image::{Image, ImageSize};
 
-use crate::sim3::{HuberIrlsConfig, Sim3Alignment, align_sim3_robust};
+use crate::sim3::{
+    HuberIrlsConfig, Sim3Alignment, align_sim3_gravity_preserving, align_sim3_robust,
+};
 
 /// Configuration for the AprilTag anchor.
 #[derive(Debug, Clone)]
@@ -158,6 +160,12 @@ impl AprilTagAnchor {
         &self.config
     }
 
+    /// Test-only: seeds an observation directly, bypassing image decoding.
+    #[cfg(test)]
+    pub(crate) fn push_observation_for_test(&mut self, obs: TagObservation) {
+        self.observations.push(obs);
+    }
+
     /// Ensures a decoder exists for a `width`x`height` image, rebuilding it if
     /// the size changed. The decoder caches working buffers for the size it was
     /// constructed with, so a resolution change must not reuse a stale one.
@@ -274,9 +282,46 @@ impl AprilTagAnchor {
         &self,
         kf_pose: impl Fn(usize) -> Option<Pose3d>,
     ) -> Result<Sim3Alignment, AprilTagAnchorError> {
-        // Resolve every stored camera-frame tag pose into map-frame corners
-        // using the keyframe's final pose. Observations whose keyframe has no
-        // final pose (e.g. culled) are dropped.
+        let (est, gt) = self.correspondences(kf_pose)?;
+        let robust = HuberIrlsConfig {
+            delta: self.config.robust.delta.max(0.5 * self.config.tag_size_m),
+            ..self.config.robust
+        };
+        let fit = align_sim3_robust(&est, &gt, robust);
+        self.gate_fit(fit, &est, &gt)
+    }
+
+    /// Gravity-preserving variant for IMU-initialized maps: translation + a yaw
+    /// rotation about `gravity_axis`, with scale fixed at 1. An IMU-initialized
+    /// world frame is already gravity-aligned and metric, so a full Sim3 would
+    /// tilt it off gravity; this keeps the gravity direction an exact fixed
+    /// point (ORB-SLAM3's four-degree-of-freedom inertial correction).
+    pub fn solve_gravity_preserving(
+        &self,
+        kf_pose: impl Fn(usize) -> Option<Pose3d>,
+        gravity_axis: Vec3F64,
+    ) -> Result<Sim3Alignment, AprilTagAnchorError> {
+        let (est, gt) = self.correspondences(kf_pose)?;
+        let fit = align_sim3_gravity_preserving(&est, &gt, gravity_axis);
+        self.gate_fit(fit, &est, &gt)
+    }
+
+    /// Resolves every stored observation against the keyframe's final pose,
+    /// screens outliers, and flattens the survivors into corner pairs
+    /// (`corners_map[i]` -> canonical tag corner `i`).
+    ///
+    /// A pose-estimation error corrupts all four corners of an observation
+    /// together, so each observation is scored by the median distance of its
+    /// corners to the canonical tag corners and observations scoring more than
+    /// 4x the global median are dropped (residual-based robustifiers alone can
+    /// collapse toward zero scale and get stuck when a bad tag pose contributes
+    /// gross outliers). At least two distinct keyframes are required.
+    fn correspondences(
+        &self,
+        kf_pose: impl Fn(usize) -> Option<Pose3d>,
+    ) -> Result<(Vec<Vec3F64>, Vec<Vec3F64>), AprilTagAnchorError> {
+        // Observations whose keyframe has no final pose (e.g. culled) are
+        // dropped.
         let resolved: Vec<(usize, [Vec3F64; 4])> = self
             .observations
             .iter()
@@ -293,9 +338,6 @@ impl AprilTagAnchor {
         }
 
         let canonical = canonical_corners(self.config.tag_size_m);
-
-        // Score each observation by the median distance of its corners to the
-        // canonical corners, then drop observations at > 4x the median score.
         let mut scores: Vec<f64> = resolved
             .iter()
             .map(|(_, corners)| observation_score(corners, &canonical))
@@ -324,24 +366,27 @@ impl AprilTagAnchor {
             est.extend(*corners);
             gt.extend(canonical);
         }
+        Ok((est, gt))
+    }
 
-        let robust = HuberIrlsConfig {
-            delta: self.config.robust.delta.max(0.5 * self.config.tag_size_m),
-            ..self.config.robust
-        };
-        let fit = align_sim3_robust(&est, &gt, robust);
-
-        // Residuals of the fitted corners in metres. A degenerate fit that
-        // collapses every corner onto the tag center yields residuals all near
-        // the tag half-diagonal (~0.71 * tag size); a genuine fit on noisy
-        // hand-held data can scatter corners by a good fraction of the tag
-        // size (uncalibrated intrinsics dominate). The scale gate above is the
-        // reliable discriminator for the observed collapse (scale -> 0); the
-        // median residual here is only a coarse sanity check that catches
-        // genuinely broken fits (corners farther apart than the tag itself).
+    /// Rejects a degenerate fit (implausible scale, or a residual far larger
+    /// than the tag) so a bad solve never corrupts the map.
+    ///
+    /// A fit that collapses every corner onto the tag center yields residuals
+    /// all near the tag half-diagonal (~0.71 * tag size); a genuine fit on
+    /// noisy hand-held data can scatter corners by a good fraction of the tag
+    /// size (uncalibrated intrinsics dominate). The scale gate is the reliable
+    /// discriminator for the observed collapse (scale -> 0); the median
+    /// residual is a coarse sanity check that catches genuinely broken fits.
+    fn gate_fit(
+        &self,
+        fit: Sim3Alignment,
+        est: &[Vec3F64],
+        gt: &[Vec3F64],
+    ) -> Result<Sim3Alignment, AprilTagAnchorError> {
         let mut residuals: Vec<f64> = est
             .iter()
-            .zip(&gt)
+            .zip(gt)
             .map(|(e, g)| {
                 let d = fit.apply(*e) - *g;
                 (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
@@ -565,6 +610,39 @@ mod tests {
         // Different size: rebuild for the new size.
         assert!(anchor.ensure_decoder(800, 600));
         assert_eq!(anchor.decoder_size, Some((800, 600)));
+    }
+
+    #[test]
+    fn gravity_preserving_solve_keeps_scale_one_and_gravity_fixed() {
+        let tag_size_m = 0.2;
+        // A final keyframe pose with a tilt: the gravity-preserving fit must
+        // not adopt that tilt.
+        let tilt = rotation_from_axis_angle(Vec3F64::new(1.0, 0.4, 0.0), 0.6);
+        let final_pose = Pose3d::from_rt(tilt, Vec3F64::new(0.4, -0.3, 1.2));
+        let gravity = Vec3F64::new(0.1, -0.2, -9.81);
+        let g_hat = gravity / gravity.length();
+
+        let mut anchor = AprilTagAnchor::new(AprilTagAnchorConfig {
+            tag_size_m,
+            ..Default::default()
+        });
+        for kf_idx in [0, 1, 2] {
+            anchor.observations.push(TagObservation {
+                kf_idx,
+                tag_to_cam: Pose3d::IDENTITY,
+            });
+        }
+
+        let fit = anchor
+            .solve_gravity_preserving(|_| Some(final_pose), gravity)
+            .expect("gravity-preserving solve must succeed");
+        assert!((fit.scale - 1.0).abs() < 1e-12, "scale must stay 1");
+        let g_after = fit.rotation * g_hat;
+        assert!(
+            vec3_norm(g_after - g_hat) < 1e-9,
+            "gravity direction moved: {}",
+            vec3_norm(g_after - g_hat)
+        );
     }
 
     fn rotation_from_axis_angle(axis: Vec3F64, angle: f64) -> Mat3F64 {
