@@ -5,6 +5,14 @@
 //! cargo run --release -p kornia-slam-app -- --config configs/euroc.ron
 //! ```
 //!
+//! Anchor the final map to a physical AprilTag (requires `--features apriltag`):
+//!
+//! ```text
+//! cargo run --release -p kornia-slam-app --features apriltag -- \
+//!     --config configs/apriltag-video.ron --apriltag-anchor \
+//!     --apriltag-id 2 --apriltag-size 0.1 --apriltag-family tag36h11
+//! ```
+//!
 //! A run file names the source (EuRoC, Hilti, MCAP, or a live OAK-D or UVC
 //! camera) and the system to run on it; see `configs/` and [`config`].
 
@@ -17,6 +25,8 @@ mod utils;
 use config::RunConfig;
 use evaluation::associate_gt;
 use kornia_algebra::Vec3F64;
+#[cfg(feature = "apriltag")]
+use kornia_slam::apriltag_anchor::AprilTagAnchorConfig;
 use kornia_slam::system::PipelineDefinition;
 use kornia_slam::{LoopClosureEvent, SensorFrame, SlamSystem};
 use source::{FrameItem, OpenedSource};
@@ -58,6 +68,82 @@ struct Args {
     /// map-projection reject reasons, keyframe growth and fuse counters
     #[argh(switch)]
     debug: bool,
+
+    /// after the run, anchor map scale/orientation to a physical AprilTag
+    /// solved once as a Sim3 (requires building with --features apriltag)
+    #[argh(switch)]
+    apriltag_anchor: bool,
+
+    /// apriltag side length in metres (with --apriltag-anchor)
+    #[argh(option, default = "0.1")]
+    apriltag_size: f64,
+
+    /// apriltag id to anchor to (with --apriltag-anchor)
+    #[argh(option, default = "0")]
+    apriltag_id: u16,
+
+    /// tag family: tag16h5 | tag25h9 | tag36h10 | tag36h11 | tagcircle21h7 |
+    /// tagcircle49h12 | tagcustom48h12 | tagstandard41h12 | tagstandard52h13
+    /// (with --apriltag-anchor)
+    #[argh(option, default = "String::from(\"tag36h11\")")]
+    apriltag_family: String,
+}
+
+/// Maps a CLI family name (case-insensitive) to a [`TagFamilyKind`].
+#[cfg(feature = "apriltag")]
+fn parse_tag_family(name: &str) -> Option<kornia_slam::apriltag_anchor::TagFamilyKind> {
+    use kornia_slam::apriltag_anchor::TagFamilyKind::{
+        Tag16H5, Tag25H9, Tag36H10, Tag36H11, TagCircle21H7, TagCircle49H12, TagCustom48H12,
+        TagStandard41H12, TagStandard52H13,
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "tag16h5" => Some(Tag16H5),
+        "tag25h9" => Some(Tag25H9),
+        "tag36h10" => Some(Tag36H10),
+        "tag36h11" => Some(Tag36H11),
+        "tagcircle21h7" => Some(TagCircle21H7),
+        "tagcircle49h12" => Some(TagCircle49H12),
+        "tagcustom48h12" => Some(TagCustom48H12),
+        "tagstandard41h12" => Some(TagStandard41H12),
+        "tagstandard52h13" => Some(TagStandard52H13),
+        _ => None,
+    }
+}
+
+/// Rejects the AprilTag anchor flags when their inputs are invalid (or, in a
+/// build without the `apriltag` feature, whenever the flag is used at all).
+#[cfg(feature = "apriltag")]
+fn validate_apriltag_mode(
+    apriltag_anchor: bool,
+    _tag_id: u16,
+    family: &str,
+    tag_size_m: f64,
+) -> Result<(), &'static str> {
+    if !apriltag_anchor {
+        return Ok(());
+    }
+    if parse_tag_family(family).is_none() {
+        return Err(
+            "--apriltag-anchor: unknown --apriltag-family (supported: tag16h5, tag25h9, tag36h10, tag36h11, tagcircle21h7, tagcircle49h12, tagcustom48h12, tagstandard41h12, tagstandard52h13)",
+        );
+    }
+    if tag_size_m <= 0.0 {
+        return Err("--apriltag-anchor: --apriltag-size must be positive (metres)");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "apriltag"))]
+fn validate_apriltag_mode(
+    apriltag_anchor: bool,
+    _tag_id: u16,
+    _family: &str,
+    _tag_size_m: f64,
+) -> Result<(), &'static str> {
+    if apriltag_anchor {
+        return Err("--apriltag-anchor requires building with --features apriltag");
+    }
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,6 +155,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tui_active = !args.no_tui;
 
     let run = RunConfig::from_ron_file(&args.config)?;
+    if let Err(error) = validate_apriltag_mode(
+        args.apriltag_anchor,
+        args.apriltag_id,
+        &args.apriltag_family,
+        args.apriltag_size,
+    ) {
+        return Err(error.into());
+    }
+    #[cfg(feature = "apriltag")]
+    let run = {
+        let mut run = run;
+        if args.apriltag_anchor {
+            let PipelineDefinition::OrbSlam(orb) = &mut run.system.pipeline;
+            if let Some(family) = parse_tag_family(&args.apriltag_family) {
+                orb.apriltag = Some(AprilTagAnchorConfig {
+                    tag_id: args.apriltag_id,
+                    tag_size_m: args.apriltag_size,
+                    family,
+                    ..AprilTagAnchorConfig::default()
+                });
+            }
+        }
+        run
+    };
     if !tui_active {
         eprint!("{}", run.system);
     }
@@ -281,6 +391,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Done. Final map: total={total_pts}  active={active_pts}  obs_per_active_mp={obs_mean:.2}  max_obs={obs_max}"
     );
+
+    // Metric anchor: solve and apply once, then report. On IMU-initialized
+    // maps the correction is gravity-preserving (scale stays 1); otherwise it
+    // is the full Sim3 the tag geometry defines.
+    #[cfg(feature = "apriltag")]
+    if args.apriltag_anchor {
+        match system.apply_apriltag_anchor() {
+            Ok(a) => eprintln!(
+                "[apriltag-anchor] scale={:.6} translation=({:.4}, {:.4}, {:.4})",
+                a.scale, a.translation.x, a.translation.y, a.translation.z
+            ),
+            Err(e) => eprintln!("[apriltag-anchor] failed: {e}"),
+        }
+    }
+
+    // Median/max distance of active map points from the map origin, in map
+    // units: a stable telemetry signal for auditing the anchor's metric scale.
+    let (median_depth, max_depth) = system.with_map_points(|map_points| {
+        let mut depths: Vec<f64> = map_points
+            .iter()
+            .filter(|mp| !mp.culled)
+            .map(|mp| mp.position.length())
+            .collect();
+        if depths.is_empty() {
+            return (0.0, 0.0);
+        }
+        depths.sort_by(|a, b| a.total_cmp(b));
+        let median = depths[depths.len() / 2];
+        (median, *depths.last().unwrap_or(&0.0))
+    });
+    eprintln!("Map depth (map units): median={median_depth:.3}  max={max_depth:.3}");
+
     if args.evaluate {
         evaluation::report(
             &est_positions,
@@ -313,5 +455,49 @@ mod cli_tests {
         let args = parse(&["--config", "r.ron", "--evaluate", "--eval-out", "out"]).unwrap();
         assert!(args.evaluate);
         assert_eq!(args.eval_out, "out");
+    }
+}
+
+#[cfg(all(test, feature = "apriltag"))]
+mod apriltag_mode_tests {
+    use super::{parse_tag_family, validate_apriltag_mode};
+
+    #[test]
+    fn parses_builtin_families_and_rejects_unknown() {
+        for (name, valid) in [
+            ("tag16h5", true),
+            ("tag25h9", true),
+            ("tag36h10", true),
+            ("tag36h11", true),
+            ("tagcircle21h7", true),
+            ("tagcircle49h12", true),
+            ("tagcustom48h12", true),
+            ("tagstandard41h12", true),
+            ("tagstandard52h13", true),
+            ("TAG25H9", true), // case-insensitive
+            ("tag36h12", false),
+            ("", false),
+        ] {
+            assert_eq!(parse_tag_family(name).is_some(), valid, "family {name}");
+        }
+    }
+
+    #[test]
+    fn validates_family_and_positive_size() {
+        assert!(validate_apriltag_mode(true, 2, "tag36h11", 0.1).is_ok());
+        assert!(validate_apriltag_mode(true, 2, "nope", 0.1).is_err());
+        assert!(validate_apriltag_mode(true, 2, "tag36h11", 0.0).is_err());
+        assert!(validate_apriltag_mode(false, 2, "nope", 0.0).is_ok());
+    }
+}
+
+#[cfg(all(test, not(feature = "apriltag")))]
+mod apriltag_mode_tests {
+    use super::validate_apriltag_mode;
+
+    #[test]
+    fn flag_requires_building_with_feature() {
+        assert!(validate_apriltag_mode(true, 2, "tag36h11", 0.1).is_err());
+        assert!(validate_apriltag_mode(false, 2, "tag36h11", 0.1).is_ok());
     }
 }
