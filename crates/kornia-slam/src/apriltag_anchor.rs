@@ -23,7 +23,7 @@ use kornia_apriltag::{AprilTagDecoder, DecodeTagsConfig};
 use kornia_image::{Image, ImageSize};
 
 use crate::sim3::{
-    HuberIrlsConfig, Sim3Alignment, align_sim3_gravity_preserving, align_sim3_robust,
+    HuberIrlsConfig, Sim3Alignment, align_sim3, align_sim3_gravity_preserving, align_sim3_robust,
 };
 
 /// Configuration for the AprilTag anchor.
@@ -265,15 +265,9 @@ impl AprilTagAnchor {
     /// the provisional pose seen at ingest — makes the fit independent of when
     /// each keyframe was observed and of any later local-BA refinement.
     ///
-    /// Observations are screened first: a pose-estimation error corrupts all
-    /// four corners of an observation together, so each observation is scored
-    /// by the median distance of its corners to the canonical tag corners and
-    /// observations scoring more than 4x the global median are dropped
-    /// (residual-based robustifiers alone can collapse toward zero scale and
-    /// get stuck when a bad tag pose contributes gross outliers). The
-    /// survivors are flattened into corner pairs (`corners_map[i]` ->
-    /// canonical tag corner `i`) and fitted robustly with `align_sim3_robust`.
-    /// At least two distinct keyframes are required.
+    /// Observations are screened first (by implied scale), then the largest
+    /// mutually consistent group is found by RANSAC and refined with the
+    /// robust weighted fit. At least two distinct keyframes are required.
     ///
     /// The Huber threshold is floored at half the tag size, so the robustifier
     /// is never a no-op linear region for a small tag; a caller-supplied larger
@@ -282,13 +276,7 @@ impl AprilTagAnchor {
         &self,
         kf_pose: impl Fn(usize) -> Option<Pose3d>,
     ) -> Result<Sim3Alignment, AprilTagAnchorError> {
-        let (est, gt) = self.correspondences(kf_pose)?;
-        let robust = HuberIrlsConfig {
-            delta: self.config.robust.delta.max(0.5 * self.config.tag_size_m),
-            ..self.config.robust
-        };
-        let fit = align_sim3_robust(&est, &gt, robust);
-        self.gate_fit(fit, &est, &gt)
+        self.solve_mode(kf_pose, None)
     }
 
     /// Gravity-preserving variant for IMU-initialized maps: translation + a yaw
@@ -301,25 +289,54 @@ impl AprilTagAnchor {
         kf_pose: impl Fn(usize) -> Option<Pose3d>,
         gravity_axis: Vec3F64,
     ) -> Result<Sim3Alignment, AprilTagAnchorError> {
-        let (est, gt) = self.correspondences(kf_pose)?;
-        let fit = align_sim3_gravity_preserving(&est, &gt, gravity_axis);
+        self.solve_mode(kf_pose, Some(gravity_axis))
+    }
+
+    /// Shared solve path: resolve observations, keep the largest consistent
+    /// group by RANSAC, refine it, and gate the result.
+    ///
+    /// A misdecoded tag, or a far/oblique detection whose planar-pose solve is
+    /// garbage, relocates the tag's rigid square elsewhere in the map — it
+    /// agrees with the population on shape and scale but not on pose, so it
+    /// cannot be removed by per-observation screening alone, and enough of them
+    /// collapse a global fit toward zero scale. RANSAC finds the majority-
+    /// consistent group first, which the robust fit then refines.
+    fn solve_mode(
+        &self,
+        kf_pose: impl Fn(usize) -> Option<Pose3d>,
+        gravity: Option<Vec3F64>,
+    ) -> Result<Sim3Alignment, AprilTagAnchorError> {
+        let canonical = canonical_corners(self.config.tag_size_m);
+        let quads = self.resolved_quads(kf_pose, &canonical)?;
+        let (est, gt) = largest_consistent_group(&quads, &canonical, self.config.tag_size_m)?;
+
+        let fit = match gravity {
+            Some(axis) => align_sim3_gravity_preserving(&est, &gt, axis),
+            None => {
+                let robust = HuberIrlsConfig {
+                    delta: self.config.robust.delta.max(0.5 * self.config.tag_size_m),
+                    ..self.config.robust
+                };
+                align_sim3_robust(&est, &gt, robust)
+            }
+        };
         self.gate_fit(fit, &est, &gt)
     }
 
-    /// Resolves every stored observation against the keyframe's final pose,
-    /// screens outliers, and flattens the survivors into corner pairs
-    /// (`corners_map[i]` -> canonical tag corner `i`).
+    /// Resolves every stored observation against the keyframe's final pose and
+    /// drops observations implying a wildly different tag scale. At least two
+    /// distinct keyframes are required.
     ///
     /// A pose-estimation error corrupts all four corners of an observation
-    /// together, so each observation is scored by the median distance of its
-    /// corners to the canonical tag corners and observations scoring more than
-    /// 4x the global median are dropped (residual-based robustifiers alone can
-    /// collapse toward zero scale and get stuck when a bad tag pose contributes
-    /// gross outliers). At least two distinct keyframes are required.
-    fn correspondences(
+    /// together, so an observation's *shape* — the scale its corner geometry
+    /// implies relative to the canonical tag ([`implied_scale`]) — is a
+    /// unit-free first filter: a misdecoded tag implies a scale far from the
+    /// population's, whatever the map's own units are.
+    fn resolved_quads(
         &self,
         kf_pose: impl Fn(usize) -> Option<Pose3d>,
-    ) -> Result<(Vec<Vec3F64>, Vec<Vec3F64>), AprilTagAnchorError> {
+        canonical: &[Vec3F64; 4],
+    ) -> Result<Vec<[Vec3F64; 4]>, AprilTagAnchorError> {
         // Observations whose keyframe has no final pose (e.g. culled) are
         // dropped.
         let resolved: Vec<(usize, [Vec3F64; 4])> = self
@@ -337,16 +354,21 @@ impl AprilTagAnchor {
             });
         }
 
-        let canonical = canonical_corners(self.config.tag_size_m);
-        let mut scores: Vec<f64> = resolved
+        let scales: Vec<f64> = resolved
             .iter()
-            .map(|(_, corners)| observation_score(corners, &canonical))
+            .map(|(_, corners)| implied_scale(corners, canonical))
             .collect();
-        let med_score = median_of(&mut scores);
-        let screened: Vec<&(usize, [Vec3F64; 4])> = if med_score > 0.0 {
+        let mut sorted_scales = scales.clone();
+        let med_scale = median_of(&mut sorted_scales);
+        let screened: Vec<&(usize, [Vec3F64; 4])> = if med_scale > 0.0 {
             resolved
                 .iter()
-                .filter(|(_, corners)| observation_score(corners, &canonical) <= 4.0 * med_score)
+                .zip(&scales)
+                .filter(|(_, s)| {
+                    let s = **s;
+                    s > med_scale / 4.0 && s < med_scale * 4.0
+                })
+                .map(|(obs, _)| obs)
                 .collect()
         } else {
             resolved.iter().collect()
@@ -360,13 +382,7 @@ impl AprilTagAnchor {
             });
         }
 
-        let mut est = Vec::with_capacity(screened.len() * 4);
-        let mut gt = Vec::with_capacity(screened.len() * 4);
-        for (_, corners) in &screened {
-            est.extend(*corners);
-            gt.extend(canonical);
-        }
-        Ok((est, gt))
+        Ok(screened.iter().map(|(_, corners)| *corners).collect())
     }
 
     /// Rejects a degenerate fit (implausible scale, or a residual far larger
@@ -425,15 +441,97 @@ fn median_of(sorted: &mut [f64]) -> f64 {
     }
 }
 
-/// Per-observation score: median distance of the observed corners to the
-/// canonical tag corners.
-fn observation_score(corners: &[Vec3F64; 4], canonical: &[Vec3F64; 4]) -> f64 {
-    let mut ds = [0.0_f64; 4];
-    for i in 0..4 {
-        ds[i] = (corners[i] - canonical[i]).length();
+/// Largest group of observations that a single similarity reproduces.
+///
+/// Every observation is a rigid, scaled copy of the canonical tag; a
+/// hypothesis fitted from any pair (8 coplanar corners, which fix the plane
+/// normal and so the tilt) is scored by how many observations' corners it
+/// reproduces within `tol`. The winning group's correspondences are returned
+/// for refinement. A relocated tag — a misdecode, or a far/oblique detection
+/// whose planar-pose solve is garbage — agrees on shape but not on pose and is
+/// left out of the consensus.
+fn largest_consistent_group(
+    quads: &[[Vec3F64; 4]],
+    canonical: &[Vec3F64; 4],
+    tag_size_m: f64,
+) -> Result<(Vec<Vec3F64>, Vec<Vec3F64>), AprilTagAnchorError> {
+    let n = quads.len();
+
+    let mut best_inliers: Vec<usize> = Vec::new();
+    let mut best_median = f64::INFINITY;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let mut est = Vec::with_capacity(8);
+            let mut gt = Vec::with_capacity(8);
+            est.extend(quads[i]);
+            gt.extend(canonical);
+            est.extend(quads[j]);
+            gt.extend(canonical);
+            let hypothesis = align_sim3(&est, &gt);
+
+            // Dimensionless tolerance: half a tag, measured in the scale each
+            // observation itself implies. An absolute tolerance would let a
+            // collapsed hypothesis (scale -> 0, every corner near the tag
+            // centre) satisfy every observation and win the consensus.
+            let mut residuals = Vec::with_capacity(n);
+            let inliers: Vec<usize> = (0..n)
+                .filter(|&k| {
+                    let s = implied_scale(&quads[k], canonical);
+                    let tol = 0.5 * s * tag_size_m;
+                    let worst = quads[k]
+                        .iter()
+                        .zip(canonical)
+                        .map(|(c, g)| (hypothesis.apply(*c) - *g).length())
+                        .fold(0.0_f64, f64::max);
+                    residuals.push(worst);
+                    tol > 0.0 && worst <= tol
+                })
+                .collect();
+            residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = residuals.get(residuals.len() / 2).copied().unwrap_or(0.0);
+
+            // More inliers wins; ties break on the lower median residual.
+            if inliers.len() > best_inliers.len()
+                || (inliers.len() == best_inliers.len() && median < best_median)
+            {
+                best_inliers = inliers;
+                best_median = median;
+            }
+        }
     }
-    ds.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    0.5 * (ds[1] + ds[2])
+
+    if best_inliers.len() < 2 {
+        return Err(AprilTagAnchorError::InsufficientObservations {
+            keyframes: best_inliers.len(),
+        });
+    }
+
+    let mut est = Vec::with_capacity(best_inliers.len() * 4);
+    let mut gt = Vec::with_capacity(best_inliers.len() * 4);
+    for &k in &best_inliers {
+        est.extend(quads[k]);
+        gt.extend(canonical);
+    }
+    Ok((est, gt))
+}
+
+/// Scale an observation's corner geometry implies: the median pairwise
+/// distance ratio of its corners to the canonical tag corners. A rigid tag
+/// observed in map frame implies one consistent ratio; a misdecoded or
+/// degenerate quad implies a ratio far from the population's. Zero when the
+/// canonical geometry is degenerate.
+fn implied_scale(corners: &[Vec3F64; 4], canonical: &[Vec3F64; 4]) -> f64 {
+    const EDGES: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+    let mut ratios = [0.0_f64; 6];
+    for (k, (i, j)) in EDGES.iter().enumerate() {
+        let canon = (canonical[*i] - canonical[*j]).length();
+        if canon <= f64::EPSILON {
+            return 0.0;
+        }
+        ratios[k] = (corners[*i] - corners[*j]).length() / canon;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    0.5 * (ratios[2] + ratios[3])
 }
 
 #[cfg(test)]

@@ -73,7 +73,7 @@ impl Default for PipelineDefinition {
 
 /// Feature-based ORB path over a persistent map. Tracking and local mapping
 /// are always present; loop closing is optional.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
 pub struct OrbSlamPipeline {
@@ -90,20 +90,6 @@ pub struct OrbSlamPipeline {
     #[cfg(feature = "apriltag")]
     #[cfg_attr(feature = "serde", serde(skip))]
     pub apriltag: Option<crate::apriltag_anchor::AprilTagAnchorConfig>,
-}
-
-impl Default for OrbSlamPipeline {
-    fn default() -> Self {
-        Self {
-            frontend: FrontendConfig::default(),
-            keyframes: KeyframePolicy::default(),
-            mapping: MappingConfig::default(),
-            loop_closing: LoopClosingMode::default(),
-            tuning: OrbTuning::default(),
-            #[cfg(feature = "apriltag")]
-            apriltag: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
