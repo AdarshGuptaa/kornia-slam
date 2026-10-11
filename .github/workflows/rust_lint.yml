@@ -131,6 +131,13 @@ jobs:
             command: >-
               cargo clippy -p kornia-slam --all-targets -- -D warnings
 
+          # Library with the opt-in AprilTag metric anchor. The detector comes
+          # from the kornia-rs git pin until kornia-apriltag 0.2.0 publishes.
+          - name: slam-apriltag
+            apt: ""
+            command: >-
+              cargo clippy -p kornia-slam --features apriltag --all-targets -- -D warnings
+
           # App with no default features — exercises the non-viz, non-rerun
           # build path. TUI deps are now unconditional, so this also verifies
           # the app still compiles without the rerun integration.
