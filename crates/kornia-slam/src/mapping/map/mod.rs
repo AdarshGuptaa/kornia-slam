@@ -64,7 +64,7 @@ pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
 pub use ops::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, InertialAlignment, InertialAlignmentError,
     KeyframeBaCorrection, KeyframeVelocity, LocalBaMergeResult, MapPointMergeResult,
-    PoseGraphCorrectionError, PoseGraphCorrectionResult,
+    PoseGraphCorrectionError, PoseGraphCorrectionResult, WorldSimilarityError,
 };
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
