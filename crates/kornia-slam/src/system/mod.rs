@@ -285,9 +285,20 @@ impl SlamSystem {
         #[cfg(feature = "apriltag")]
         if result.status == TrackingStatus::KeyframeAccepted
             && let Some(kf_idx) = self.state.current_keyframe_idx
-            && let Some(anchor) = self.apriltag_anchor.as_mut()
         {
-            anchor.on_keyframe(kf_idx, current_image, &self.rig.camera);
+            let mut observed = None;
+            if let Some(anchor) = self.apriltag_anchor.as_mut() {
+                let before = anchor.num_observations();
+                anchor.on_keyframe(kf_idx, current_image, &self.rig.camera);
+                if anchor.num_observations() > before {
+                    observed = Some(anchor.num_observations());
+                }
+            }
+            if let Some(total) = observed {
+                self.dbg(format!(
+                    "[anchor] tag observed in kf={kf_idx} (total observations={total})"
+                ));
+            }
         }
         result
     }
