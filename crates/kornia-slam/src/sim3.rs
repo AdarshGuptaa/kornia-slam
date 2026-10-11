@@ -11,6 +11,9 @@
 
 use kornia_algebra::{Mat3F64, Vec3F64, linalg::svd::svd3_f64};
 // ── Sim3 alignment ───────────────────────────────────────────────────────
+/// A similarity transform `X' = s·R·X + t` mapping `src` coordinates onto
+/// `dst` coordinates.
+#[derive(Debug, Clone)]
 pub struct Sim3Alignment {
     pub scale: f64,
     pub rotation: Mat3F64,
@@ -208,6 +211,78 @@ pub fn align_sim3_robust(est: &[Vec3F64], gt: &[Vec3F64], cfg: HuberIrlsConfig) 
     fit
 }
 
+/// Fit `src` onto `dst` constrained to translation plus a yaw rotation about
+/// `gravity_axis`, with scale fixed at 1.
+///
+/// This is ORB-SLAM3's four-degree-of-freedom inertial-correction convention:
+/// an IMU-initialized world frame is gravity-aligned and metric, so a metric
+/// anchor must not tilt it off gravity or re-scale it. The rotation is the
+/// best in-plane rotation (2D Procrustes on the plane perpendicular to
+/// gravity), which leaves the gravity direction an exact fixed point.
+pub fn align_sim3_gravity_preserving(
+    src: &[Vec3F64],
+    dst: &[Vec3F64],
+    gravity_axis: Vec3F64,
+) -> Sim3Alignment {
+    let g_len = gravity_axis.length();
+    let g = if g_len > f64::EPSILON {
+        gravity_axis / g_len
+    } else {
+        Vec3F64::new(0.0, 0.0, 1.0)
+    };
+
+    // An orthonormal basis (u, v, g), right-handed: v = g x u.
+    let seed = if g.x.abs() <= g.y.abs() && g.x.abs() <= g.z.abs() {
+        Vec3F64::new(1.0, 0.0, 0.0)
+    } else if g.y.abs() <= g.z.abs() {
+        Vec3F64::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3F64::new(0.0, 0.0, 1.0)
+    };
+    let u_raw = cross(&seed, &g);
+    let u = u_raw / u_raw.length().max(f64::EPSILON);
+    let v = cross(&g, &u);
+
+    let n = src.len() as f64;
+    let mut mu_src = Vec3F64::ZERO;
+    let mut mu_dst = Vec3F64::ZERO;
+    for i in 0..src.len() {
+        mu_src += src[i];
+        mu_dst += dst[i];
+    }
+    mu_src /= n;
+    mu_dst /= n;
+
+    // Best in-plane rotation: 2D Procrustes of the perpendicular components.
+    let mut dot = 0.0_f64;
+    let mut cross_xy = 0.0_f64;
+    for i in 0..src.len() {
+        let a = src[i] - mu_src;
+        let b = dst[i] - mu_dst;
+        let (ax, ay) = (a.dot(u), a.dot(v));
+        let (bx, by) = (b.dot(u), b.dot(v));
+        dot += ax * bx + ay * by;
+        cross_xy += ax * by - ay * bx;
+    }
+    let alpha = cross_xy.atan2(dot);
+    let rotation = kornia_algebra::SO3F64::exp(g * alpha).matrix();
+    let translation = mu_dst - rotation * mu_src;
+
+    Sim3Alignment {
+        scale: 1.0,
+        rotation,
+        translation,
+    }
+}
+
+fn cross(a: &Vec3F64, b: &Vec3F64) -> Vec3F64 {
+    Vec3F64::new(
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    )
+}
+
 /// Median of a slice, sorted in place.
 fn median_of(sorted: &mut [f64]) -> f64 {
     let m = sorted.len() / 2;
@@ -219,7 +294,6 @@ fn median_of(sorted: &mut [f64]) -> f64 {
         0.0
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,5 +595,50 @@ mod tests {
         assert!((weighted_const_fit.scale - plain_fit.scale).abs() < 1e-12);
         assert!(mat3_frobenius_diff(&weighted_const_fit.rotation, &plain_fit.rotation) < 1e-12);
         assert!(vec3_norm(weighted_const_fit.translation - plain_fit.translation) < 1e-12);
+    }
+
+    #[test]
+    fn gravity_preserving_recovers_pure_yaw_and_translation() {
+        let mut rng = SimpleRng::new(9);
+        let gravity = Vec3F64::new(0.0, 0.0, -9.81);
+        let g_hat = gravity / gravity.length();
+        let angle = 1.2_f64;
+        let yaw = rotation_from_axis_angle(g_hat, angle);
+        let t = Vec3F64::new(1.0, -2.0, 0.5);
+
+        let n = 24;
+        let src = random_points(&mut rng, n);
+        let dst: Vec<Vec3F64> = src.iter().map(|&p| (yaw * p) + t).collect();
+
+        let fit = align_sim3_gravity_preserving(&src, &dst, gravity);
+        assert!((fit.scale - 1.0).abs() < 1e-12);
+        assert!(mat3_frobenius_diff(&fit.rotation, &yaw) < 1e-9, "yaw error");
+        assert!(vec3_norm(fit.translation - t) < 1e-9, "translation error");
+        for i in 0..n {
+            assert!(vec3_norm(fit.apply(src[i]) - dst[i]) < 1e-9);
+        }
+    }
+
+    #[test]
+    fn gravity_preserving_leaves_gravity_a_fixed_point() {
+        let mut rng = SimpleRng::new(31);
+        let gravity = Vec3F64::new(0.2, -0.3, -9.8);
+        let g_hat = gravity / gravity.length();
+
+        // Destinations come from an arbitrary (tilting) rotation; the fit must
+        // still return a yaw-only rotation that keeps gravity fixed and scale 1.
+        let tilt = rotation_from_axis_angle(Vec3F64::new(1.0, 0.5, 0.0), 0.7);
+        let n = 20;
+        let src = random_points(&mut rng, n);
+        let dst: Vec<Vec3F64> = src.iter().map(|&p| tilt * p).collect();
+
+        let fit = align_sim3_gravity_preserving(&src, &dst, gravity);
+        assert!((fit.scale - 1.0).abs() < 1e-12);
+        let g_after = fit.rotation * g_hat;
+        assert!(
+            vec3_norm(g_after - g_hat) < 1e-9,
+            "gravity direction moved: {}",
+            vec3_norm(g_after - g_hat)
+        );
     }
 }
