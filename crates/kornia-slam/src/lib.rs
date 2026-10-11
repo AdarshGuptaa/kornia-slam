@@ -52,6 +52,7 @@ pub mod initialization;
 pub mod loop_closure;
 pub mod mapping;
 mod pose_conversion;
+pub mod sim3;
 pub mod stereo;
 pub mod system;
 pub mod tracking;
@@ -61,6 +62,7 @@ pub use frontend::FrontendObservation;
 pub use kornia_imgproc::features::OrbFeatures;
 pub use kornia_sensors::{ImuCalibration, SensorFrame, SensorRig};
 pub use loop_closure::{LoopClosingConfig, LoopClosureEvent};
+pub use sim3::{HuberIrlsConfig, Sim3Alignment, align_sim3, align_sim3_robust};
 #[cfg(feature = "serde")]
 pub use system::LoadError;
 pub use system::{
