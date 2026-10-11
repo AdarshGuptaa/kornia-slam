@@ -20,13 +20,20 @@ categories = ["computer-vision", "science::robotics"]
 kornia-sensors = { path = "crates/kornia-sensors", version = "0.2.0" }
 kornia-slam = { path = "crates/kornia-slam", version = "0.2.0" }
 
-kornia-3d = "0.2.0"
-kornia-algebra = "0.2.0"
-kornia-bow = "0.2.0"
-kornia-image = "0.2.0"
-kornia-imgproc = "0.2.0"
-kornia-io = "0.2.0"
-kornia-tensor = "0.2.0"
+# The 0.2.0 core crates are published, but kornia-apriltag 0.2.0 is not
+# (crates.io tops out at 0.1.10, which depends on kornia-image 0.1.x and would
+# not unify with the 0.2.0 types). Pin the whole kornia stack to the v0.2.0
+# revision so every crate — including kornia-apriltag — shares one source and
+# one set of types. Switch back to `"0.2.0"` (crates.io) once kornia-apriltag
+# 0.2.0 is published; no source changes are needed to do so.
+kornia-3d = { git = "https://github.com/kornia/kornia-rs", rev = "befcbe18b66f5fa71f5aea7745a1de1ffe4bdb8d" }
+kornia-algebra = { git = "https://github.com/kornia/kornia-rs", rev = "befcbe18b66f5fa71f5aea7745a1de1ffe4bdb8d" }
+kornia-apriltag = { git = "https://github.com/kornia/kornia-rs", rev = "befcbe18b66f5fa71f5aea7745a1de1ffe4bdb8d" }
+kornia-bow = { git = "https://github.com/kornia/kornia-rs", rev = "befcbe18b66f5fa71f5aea7745a1de1ffe4bdb8d" }
+kornia-image = { git = "https://github.com/kornia/kornia-rs", rev = "befcbe18b66f5fa71f5aea7745a1de1ffe4bdb8d" }
+kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", rev = "befcbe18b66f5fa71f5aea7745a1de1ffe4bdb8d" }
+kornia-io = { git = "https://github.com/kornia/kornia-rs", rev = "befcbe18b66f5fa71f5aea7745a1de1ffe4bdb8d" }
+kornia-tensor = { git = "https://github.com/kornia/kornia-rs", rev = "befcbe18b66f5fa71f5aea7745a1de1ffe4bdb8d" }
 
 # Release binaries only (binary_release.yml). Kept out of `release` so local
 # benchmark builds stay fast and comparable with earlier runs.
