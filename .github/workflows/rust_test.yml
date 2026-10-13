@@ -103,7 +103,7 @@ jobs:
         run: ${{ matrix.test_cmd }}
 
       - name: Build / smoke-run
-        if: env.RUST_CHANGED == 'true'
+        if: env.RUST_CHANGED == 'true' && matrix.build_cmd != ''
         run: ${{ matrix.build_cmd }}
 
       - name: Show sccache stats

@@ -24,6 +24,7 @@ use kornia_image::{Image, ImageSize};
 
 use crate::sim3::{
     HuberIrlsConfig, Sim3Alignment, align_sim3, align_sim3_gravity_preserving, align_sim3_robust,
+    median_of,
 };
 
 /// Configuration for the AprilTag anchor.
@@ -358,8 +359,7 @@ impl AprilTagAnchor {
             .iter()
             .map(|(_, corners)| implied_scale(corners, canonical))
             .collect();
-        let mut sorted_scales = scales.clone();
-        let med_scale = median_of(&mut sorted_scales);
+        let med_scale = median_of(&scales);
         let screened: Vec<&(usize, [Vec3F64; 4])> = if med_scale > 0.0 {
             resolved
                 .iter()
@@ -429,18 +429,6 @@ impl AprilTagAnchor {
     }
 }
 
-/// Median of four = average of the two middle values after sorting.
-fn median_of(sorted: &mut [f64]) -> f64 {
-    let m = sorted.len() / 2;
-    if sorted.len() % 2 == 1 {
-        sorted[m]
-    } else if m > 0 {
-        0.5 * (sorted[m - 1] + sorted[m])
-    } else {
-        0.0
-    }
-}
-
 /// Largest group of observations that a single similarity reproduces.
 ///
 /// Every observation is a rigid, scaled copy of the canonical tag; a
@@ -469,15 +457,17 @@ fn largest_consistent_group(
             gt.extend(canonical);
             let hypothesis = align_sim3(&est, &gt);
 
-            // Dimensionless tolerance: half a tag, measured in the scale each
-            // observation itself implies. An absolute tolerance would let a
-            // collapsed hypothesis (scale -> 0, every corner near the tag
-            // centre) satisfy every observation and win the consensus.
+            // The hypothesis maps map coordinates onto the canonical tag frame,
+            // so `worst` is in metres — and half a tag is a fixed metric
+            // tolerance, independent of the map's arbitrary scale. A collapsed
+            // hypothesis (scale -> 0, every corner near the tag centre) has a
+            // worst-corner residual of at least `tag_size / sqrt(2)` (~0.707 of
+            // a tag), so it can never pass this tolerance; scaling the
+            // tolerance by the map scale would let it pass on large maps.
+            let tol = 0.5 * tag_size_m;
             let mut residuals = Vec::with_capacity(n);
             let inliers: Vec<usize> = (0..n)
                 .filter(|&k| {
-                    let s = implied_scale(&quads[k], canonical);
-                    let tol = 0.5 * s * tag_size_m;
                     let worst = quads[k]
                         .iter()
                         .zip(canonical)

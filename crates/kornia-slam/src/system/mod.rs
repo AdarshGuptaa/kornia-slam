@@ -362,12 +362,18 @@ impl SlamSystem {
             alignment.translation,
         )?;
 
-        // Keep the runtime tracking pose consistent with the corrected map.
+        // Keep the runtime tracking state consistent with the corrected map:
+        // the pose and the metric world velocity live in the world frame, so
+        // both take the same similarity. `state.velocity` is a *relative* pose
+        // between consecutive camera frames, which a world similarity leaves
+        // unchanged, so it needs no correction.
         let cam_to_world = self.state.pose_world_to_cam.inverse();
         let new_translation = alignment.scale * (alignment.rotation * cam_to_world.translation)
             + alignment.translation;
         let new_rotation = alignment.rotation * cam_to_world.rotation;
         self.state.pose_world_to_cam = Pose3d::from_rt(new_rotation, new_translation).inverse();
+        self.state.velocity_world =
+            alignment.scale * (alignment.rotation * self.state.velocity_world);
 
         // Clear the observation set so a second call cannot re-apply.
         self.apriltag_anchor = Some(AprilTagAnchor::new(config));

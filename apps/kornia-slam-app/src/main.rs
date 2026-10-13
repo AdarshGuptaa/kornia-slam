@@ -293,16 +293,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Metric anchor: solve and apply once, then report. On IMU-initialized
     // maps the correction is gravity-preserving (scale stays 1); otherwise it
     // is the full Sim3 the tag geometry defines.
+    //
+    // When the stage is enabled the anchor is the alignment of record: the
+    // recorded trajectory is corrected by the same Sim3 the map received, and
+    // the evaluation trusts it (no second best-fit to ground truth), so the
+    // reported errors show whether the tag made the map metric. A failed solve
+    // is still reported without a second fit, with a warning: the stage was
+    // requested, so the raw map is reported as-is rather than silently aligned.
     #[cfg(feature = "apriltag")]
-    if system.apriltag_anchor_enabled() {
+    let anchor_trusted = if system.apriltag_anchor_enabled() {
         match system.apply_apriltag_anchor() {
-            Ok(a) => eprintln!(
-                "[apriltag-anchor] scale={:.6} translation=({:.4}, {:.4}, {:.4})",
-                a.scale, a.translation.x, a.translation.y, a.translation.z
-            ),
-            Err(e) => eprintln!("[apriltag-anchor] failed: {e}"),
+            Ok(a) => {
+                est_positions = est_positions.iter().map(|&p| a.apply(p)).collect();
+                eprintln!(
+                    "[apriltag-anchor] scale={:.6} translation=({:.4}, {:.4}, {:.4})",
+                    a.scale, a.translation.x, a.translation.y, a.translation.z
+                );
+                true
+            }
+            Err(e) => {
+                eprintln!("[apriltag-anchor] failed: {e} (map left unanchored)");
+                true
+            }
         }
-    }
+    } else {
+        false
+    };
+    #[cfg(not(feature = "apriltag"))]
+    let anchor_trusted = false;
 
     // Median/max distance of active map points from the map origin, in map
     // units: a stable telemetry signal for auditing the anchor's metric scale.
@@ -326,6 +344,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &est_positions,
             &gt_positions,
             std::path::Path::new(&args.eval_out),
+            anchor_trusted,
         )?;
     }
     Ok(())

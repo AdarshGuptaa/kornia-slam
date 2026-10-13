@@ -62,28 +62,46 @@ pub fn compute_drift(est: &[Vec3F64], gt: &[Vec3F64]) -> f64 {
 
 // ── Reporting ────────────────────────────────────────────────────────────
 
-/// Aligns the estimated trajectory to ground truth (Sim3), writes the raw and
-/// aligned trajectories as CSVs under `out_dir` (created if missing), and
+/// Writes the trajectory as CSVs under `out_dir` (created if missing) and
 /// prints ATE/RPE/drift. A no-op for fewer than two samples or a length
 /// mismatch.
-pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Result<()> {
+///
+/// `anchored` says the positions already carry the AprilTag metric correction
+/// (the app applied the anchor's Sim3 to them), so they are scored as-is — no
+/// second best-fit Sim3, which would otherwise hide whether the anchor
+/// succeeded. When `false`, the trajectory is still in the map's arbitrary
+/// monocular frame and is first aligned to ground truth by a best-fit Sim3.
+pub fn report(
+    est: &[Vec3F64],
+    gt: &[Vec3F64],
+    out_dir: &Path,
+    anchored: bool,
+) -> std::io::Result<()> {
     if est.len() < 2 || gt.len() != est.len() {
         return Ok(());
     }
     std::fs::create_dir_all(out_dir)?;
 
-    // Raw (unaligned, monocular-scale) trajectory.
+    // Raw trajectory as recorded (post-anchor when the anchor applied).
     let mut raw = std::fs::File::create(out_dir.join("kornia_slam_raw.csv"))?;
     writeln!(raw, "idx,x,y,z")?;
     for (i, p) in est.iter().enumerate() {
         writeln!(raw, "{i},{:.9},{:.9},{:.9}", p.x, p.y, p.z)?;
     }
 
-    let a = align_sim3(est, gt);
-    let aligned: Vec<Vec3F64> = est
-        .iter()
-        .map(|p| a.translation + (a.rotation * *p) * a.scale)
-        .collect();
+    let (aligned, alignment_label): (Vec<Vec3F64>, String) = if anchored {
+        (est.to_vec(), "none (AprilTag metric anchor)".to_string())
+    } else {
+        let a = align_sim3(est, gt);
+        let aligned = est
+            .iter()
+            .map(|p| a.translation + (a.rotation * *p) * a.scale)
+            .collect();
+        (
+            aligned,
+            format!("best-fit Sim3 to ground truth (scale {:.6})", a.scale),
+        )
+    };
 
     let mut af = std::fs::File::create(out_dir.join("kornia_slam_aligned.csv"))?;
     writeln!(af, "idx,x,y,z,gt_x,gt_y,gt_z")?;
@@ -98,7 +116,7 @@ pub fn report(est: &[Vec3F64], gt: &[Vec3F64], out_dir: &Path) -> std::io::Resul
     eprintln!();
     eprintln!("================ Trajectory Evaluation ================");
     eprintln!("Frames evaluated : {}", aligned.len());
-    eprintln!("Scale            : {:.6}", a.scale);
+    eprintln!("Alignment        : {alignment_label}");
     eprintln!("ATE RMSE         : {:.4} m", compute_ate(&aligned, gt));
     eprintln!("RPE RMSE         : {:.4} m", compute_rpe(&aligned, gt));
     eprintln!(

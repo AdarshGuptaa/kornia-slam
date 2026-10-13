@@ -184,10 +184,9 @@ pub fn align_sim3_robust(est: &[Vec3F64], gt: &[Vec3F64], cfg: HuberIrlsConfig) 
         .collect();
 
     // Robust residual scale: 1.4826 x MAD (pseudo-sigma under Gaussian noise).
-    let mut dev = residuals.clone();
-    let med = median_of(&mut dev);
-    let mut abs_dev: Vec<f64> = residuals.iter().map(|r| (r - med).abs()).collect();
-    let mad = median_of(&mut abs_dev);
+    let med = median_of(&residuals);
+    let abs_dev: Vec<f64> = residuals.iter().map(|r| (r - med).abs()).collect();
+    let mad = median_of(&abs_dev);
     let sigma = 1.4826 * mad;
 
     // Drop gross outliers (residual > 3.5 sigma) and re-fit on the inliers.
@@ -283,15 +282,19 @@ fn cross(a: &Vec3F64, b: &Vec3F64) -> Vec3F64 {
     )
 }
 
-/// Median of a slice, sorted in place.
-fn median_of(sorted: &mut [f64]) -> f64 {
+/// Median of a slice. Sorts a copy, so the input order never matters; an empty
+/// slice returns `0`. `f64::total_cmp` gives NaN a deterministic position.
+pub(crate) fn median_of(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(f64::total_cmp);
     let m = sorted.len() / 2;
     if sorted.len() % 2 == 1 {
         sorted[m]
-    } else if m > 0 {
-        0.5 * (sorted[m - 1] + sorted[m])
     } else {
-        0.0
+        0.5 * (sorted[m - 1] + sorted[m])
     }
 }
 #[cfg(test)]
@@ -640,5 +643,40 @@ mod tests {
             "gravity direction moved: {}",
             vec3_norm(g_after - g_hat)
         );
+    }
+
+    #[test]
+    fn median_of_sorts_its_copy_and_ignores_input_order() {
+        // Unsorted on purpose: the middle element is not the median.
+        assert_eq!(median_of(&[5.0, 1.0, 3.0]), 3.0);
+        assert_eq!(median_of(&[1.0, 3.0, 5.0]), 3.0);
+        assert_eq!(median_of(&[4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert_eq!(median_of(&[]), 0.0);
+        assert_eq!(median_of(&[7.5]), 7.5);
+    }
+
+    #[test]
+    fn robust_fit_rejects_outliers_with_unsorted_residual_order() {
+        // Outliers come first in the arrays, so an unsorted "median" would miss
+        // them and the MAD gate would keep the fit biased toward them.
+        let mut rng = SimpleRng::new(5);
+        let true_scale = 1.3;
+        let true_r = rotation_from_axis_angle(Vec3F64::new(0.0, 1.0, 0.0), 0.8);
+        let true_t = Vec3F64::new(-1.0, 0.5, 2.0);
+
+        let n_bad = 6;
+        let n_good = 24;
+        let src = random_points(&mut rng, n_bad + n_good);
+        let mut dst: Vec<Vec3F64> = src
+            .iter()
+            .map(|&p| apply_transform(true_scale, &true_r, true_t, p))
+            .collect();
+        for d in dst.iter_mut().take(n_bad) {
+            *d += Vec3F64::new(30.0, -25.0, 40.0);
+        }
+
+        let fit = align_sim3_robust(&src, &dst, HuberIrlsConfig::default());
+        assert!((fit.scale - true_scale).abs() < 1e-2, "scale {}", fit.scale);
+        assert!(mat3_frobenius_diff(&fit.rotation, &true_r) < 5e-2);
     }
 }
