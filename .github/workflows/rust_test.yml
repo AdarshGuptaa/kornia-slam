@@ -55,8 +55,7 @@ jobs:
             test_cmd: cargo test -p kornia-slam
             build_cmd: cargo build -p kornia-slam
 
-          # Library with the opt-in AprilTag metric anchor (detector from the
-          # kornia-rs git pin until kornia-apriltag 0.2.0 publishes).
+          # Library with the opt-in AprilTag metric anchor.
           - name: slam-apriltag
             apt: ""
             test_cmd: cargo test -p kornia-slam --features apriltag

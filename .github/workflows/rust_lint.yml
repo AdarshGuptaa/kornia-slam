@@ -131,8 +131,7 @@ jobs:
             command: >-
               cargo clippy -p kornia-slam --all-targets -- -D warnings
 
-          # Library with the opt-in AprilTag metric anchor. The detector comes
-          # from the kornia-rs git pin until kornia-apriltag 0.2.0 publishes.
+          # Library with the opt-in AprilTag metric anchor.
           - name: slam-apriltag
             apt: ""
             command: >-
