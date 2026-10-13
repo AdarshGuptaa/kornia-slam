@@ -66,11 +66,12 @@ pub fn compute_drift(est: &[Vec3F64], gt: &[Vec3F64]) -> f64 {
 /// prints ATE/RPE/drift. A no-op for fewer than two samples or a length
 /// mismatch.
 ///
-/// `anchored` says the positions already carry the AprilTag metric correction
-/// (the app applied the anchor's Sim3 to them), so they are scored as-is — no
-/// second best-fit Sim3, which would otherwise hide whether the anchor
-/// succeeded. When `false`, the trajectory is still in the map's arbitrary
-/// monocular frame and is first aligned to ground truth by a best-fit Sim3.
+/// `anchored` is true only when the AprilTag metric correction was actually
+/// applied to the positions (its Sim3 is already in them), so they are scored
+/// as-is — no second best-fit Sim3, which would otherwise hide whether the
+/// anchor succeeded. When `false` — no stage, or the solve failed — the
+/// trajectory is still in the map's arbitrary monocular frame and is first
+/// aligned to ground truth by a best-fit Sim3.
 pub fn report(
     est: &[Vec3F64],
     gt: &[Vec3F64],
