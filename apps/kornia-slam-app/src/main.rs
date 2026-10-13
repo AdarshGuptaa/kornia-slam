@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! cargo run --release -p kornia-slam-app --features apriltag -- \
-//!     --config configs/apriltag-video.ron
+//!     --config configs/apriltag-anchor.ron
 //! ```
 //!
 //! A run file names the source (EuRoC, Hilti, MCAP, or a live OAK-D or UVC

@@ -252,7 +252,7 @@ fn shipped_run_files_load() {
             if !cfg!(feature = "apriltag")
                 && path
                     .file_name()
-                    .is_some_and(|name| name == "apriltag-video.ron")
+                    .is_some_and(|name| name == "apriltag-anchor.ron")
             {
                 continue;
             }
@@ -268,7 +268,7 @@ fn shipped_run_files_load() {
 #[test]
 fn apriltag_run_file_enables_the_stage() {
     use kornia_slam::system::{AprilTagAnchorMode, AprilTagFamily};
-    let run = RunConfig::from_ron_file(configs_dir().join("apriltag-video.ron")).unwrap();
+    let run = RunConfig::from_ron_file(configs_dir().join("apriltag-anchor.ron")).unwrap();
     let PipelineDefinition::OrbSlam(orb) = &run.system.pipeline;
     assert_eq!(
         orb.apriltag_anchor,
