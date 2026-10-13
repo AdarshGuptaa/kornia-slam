@@ -585,7 +585,7 @@ fn valid_rotation(rotation: &SO3F64) -> bool {
 /// acceptable; a negative or non-finite duration is not. Covariance
 /// definiteness and calibration policy are deliberately out of scope here —
 /// this is a finiteness gate, not a sensor-model review.
-fn valid_preintegration(preintegrated: &kornia_sensors::imu::PreintegratedImu) -> bool {
+pub(super) fn valid_preintegration(preintegrated: &kornia_sensors::imu::PreintegratedImu) -> bool {
     preintegrated.dt.is_finite()
         && preintegrated.dt >= 0.0
         && finite_mat3(&preintegrated.delta_rotation)
@@ -1342,6 +1342,7 @@ mod validation_tests {
             raw_samples: Vec::new(),
             t0: 0.0,
             t1: 0.1,
+            bias_walk_extra_s: 0.0,
         }
     }
 

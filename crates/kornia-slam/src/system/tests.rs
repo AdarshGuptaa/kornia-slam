@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_algebra::Vec3F64;
+use kornia_image::ImageSize;
 
 use super::*;
 use crate::frontend::OrbFrontend;
@@ -213,6 +214,53 @@ fn stereo_input_without_a_right_image_changes_nothing() {
     assert!(system.frontend_observation().stereo_matched.unwrap() > 0);
 }
 
+/// A rig that never bootstraps (a dark room) inserts no keyframe, yet must
+/// not buffer IMU samples for as long as that lasts.
+#[test]
+fn imu_buffer_stays_bounded_while_bootstrap_keeps_failing() {
+    let dark = Image::from_size_val(
+        ImageSize {
+            width: 376,
+            height: 240,
+        },
+        0u8,
+    )
+    .unwrap();
+    let frame_samples = |idx: usize| -> Vec<ImuMeasurement> {
+        // 10 samples at 200 Hz ending at the frame's stamp.
+        (0..10)
+            .map(|k| ImuMeasurement {
+                timestamp: idx as f64 * 0.05 - 0.045 + k as f64 * 0.005,
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect()
+    };
+    // Stereo: keypoints on the left, none matched on the right, so the
+    // single-frame stereo bootstrap fails on too few stereo points. Mono:
+    // no keypoints at all, so no bootstrap reference is ever held.
+    let left = textured(0);
+    for cameras in [CameraSelection::Stereo, CameraSelection::Mono] {
+        let stereo = matches!(cameras, CameraSelection::Stereo);
+        let config = config(cameras, true, LoopClosingMode::Disabled);
+        let mut system = SlamSystem::build(config, stereo_imu_rig()).unwrap();
+        for idx in 0..400 {
+            let samples = frame_samples(idx);
+            let frame = SensorFrame {
+                right_image: stereo.then_some(&dark),
+                ..input(idx, if stereo { &left } else { &dark }, &samples)
+            };
+            let result = system.process(frame).unwrap();
+            assert_eq!(result.status, TrackingStatus::Skipped);
+            assert!(
+                system.inertial.pending_sample_count() <= 10,
+                "{cameras:?} frame {idx}: {} samples buffered",
+                system.inertial.pending_sample_count()
+            );
+        }
+    }
+}
+
 #[test]
 fn image_history_follows_successful_frames_only() {
     let mut system = SlamSystem::build(mono(), stereo_imu_rig()).unwrap();
@@ -242,4 +290,94 @@ fn image_history_follows_successful_frames_only() {
         system.previous_image.as_ref().unwrap().as_slice(),
         third.as_slice()
     );
+}
+
+mod keyframe_evidence {
+    use super::*;
+    use crate::tracking::parallax::tests::{
+        all_matches, camera, frame_seeing_points, map_with_keyframe_at,
+    };
+    use kornia_algebra::{Mat3F64, SO3F64};
+
+    /// A system whose map holds keyframe 0 at the identity and keyframe 1, the
+    /// tracking reference, at `ref_pose` observing nothing, with the camera
+    /// tracked at `tracked` after the last keyframe 0.
+    fn system_tracked_at(min_parallax_px: Option<f64>, tracked: Pose3d) -> SlamSystem {
+        let mut config = mono();
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.keyframes.min_parallax_px = min_parallax_px;
+        let mut system = SlamSystem::build(config, SensorRig::new(camera())).unwrap();
+        let mut map = map_with_keyframe_at(Pose3d::IDENTITY);
+        let ref_pose = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.5, 0.0, 0.0));
+        map.insert_keyframe(Keyframe::from_frame(frame_seeing_points(1, ref_pose, &[])))
+            .unwrap();
+        *system.map.lock().unwrap() = map;
+        system.state.last_keyframe_idx = Some(0);
+        system.state.current_keyframe_idx = Some(1);
+        system.state.pose_world_to_cam = tracked;
+        system
+    }
+
+    #[test]
+    fn measures_parallax_against_the_last_keyframe_at_the_tracked_pose() {
+        // The head yawed 0.08 rad without moving: about 32 px of raw pixel
+        // motion, zero parallax once the rotation is compensated.
+        let yaw = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.08, 0.0)).matrix(),
+            Vec3F64::ZERO,
+        );
+        let points = map_with_keyframe_at(Pose3d::IDENTITY)
+            .map_points()
+            .iter()
+            .map(|mp| mp.position)
+            .collect::<Vec<_>>();
+        // The frame's own pose is the pre-tracking one, still at the keyframe;
+        // the keypoints are where the tracked (yawed) camera sees the points.
+        let mut frame = frame_seeing_points(7, yaw, &points);
+        frame.pose_world_to_cam = Pose3d::IDENTITY;
+
+        let system = system_tracked_at(Some(10.0), yaw);
+        let evidence = system.keyframe_evidence(&frame, 9, &all_matches());
+        assert_eq!(evidence.curr_idx, 7);
+        assert_eq!(evidence.last_keyframe_idx, Some(0));
+        assert_eq!(evidence.tracked_inliers, 9);
+        assert_eq!(evidence.n_ref_map_points, 0, "the reference is keyframe 1");
+        let parallax = evidence
+            .median_parallax_px
+            .expect("measured against keyframe 0, which observes the matches");
+        assert!(parallax < 1e-3, "{parallax}");
+
+        let off = system_tracked_at(None, yaw);
+        assert_eq!(
+            off.keyframe_evidence(&frame, 9, &all_matches())
+                .median_parallax_px,
+            None,
+            "not measured unless the policy reads it"
+        );
+    }
+    /// A parked camera earns no keyframe from the motion policy; the time
+    /// bound still forces one, measured from the last keyframe's timestamp.
+    #[test]
+    fn the_time_bound_forces_a_keyframe_on_a_parked_camera() {
+        let mut config = mono();
+        let PipelineDefinition::OrbSlam(orb) = &mut config.pipeline;
+        orb.keyframes.max_frames_between = usize::MAX;
+        orb.keyframes.min_parallax_px = Some(10.0);
+        orb.keyframes.max_interval_sec = Some(0.5);
+        let mut system = SlamSystem::build(config, SensorRig::new(camera())).unwrap();
+        system.state.last_keyframe_idx = Some(100);
+        system.inertial.last_keyframe_timestamp_sec = Some(10.0);
+        let parked = KeyframeEvidence {
+            curr_idx: 1100,
+            last_keyframe_idx: Some(100),
+            tracked_inliers: 80,
+            n_ref_map_points: 100,
+            median_parallax_px: Some(0.3),
+        };
+        assert!(!system.keyframe_policy.should_insert_with(&parked));
+        assert!(!system.keyframe_due(&parked, 10.49));
+        assert!(system.keyframe_due(&parked, 10.5));
+        system.keyframe_policy.max_interval_sec = None;
+        assert!(!system.keyframe_due(&parked, 1e6), "no bound unless set");
+    }
 }

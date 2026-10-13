@@ -64,11 +64,160 @@ gates the runtime used (`max_midpoint_gap` 0.25, `max_reprojection_error` 3.0).
 fixed seed, so runs with loop correction and synchronous local mapping
 reproduce exactly.
 
+**Keyframe culling.** The keyframe count no longer has to grow without bound.
+`mapping::culling::cull_redundant_keyframes` removes keyframes whose live
+landmarks are, by at least 90 %, each seen by three other keyframes at most one
+pyramid level coarser (ORB-SLAM3's local-mapping code; set
+`scale_level_tolerance = 0` for its paper's "same or finer scale"), never the
+first keyframe nor the newest few. Removal is a canonical map operation, `Map::remove_keyframe`:
+every landmark record, reference and derived geometry is repaired, and the IMU
+edges on each side are merged into one, re-preintegrated from their raw samples
+(ORB-SLAM3's `MergePrevious`); a keyframe at an end of the IMU chain is refused.
+Wheel-odometry factors, which the caller holds, are composed across a removed
+keyframe (`WheelOdomFactor::compose`, with first-order covariance
+propagation), or the keyframe is kept. Opt-in: nothing calls it by default.
+Landmarks are not bounded by it: a retired landmark keeps its slot in
+`Map::map_points` (ids are never compacted or reused) and `remove_keyframe`
+walks every slot, so a map that only ever culls still grows by one slot per
+landmark created, and each removal costs time in that count. A long-running
+caller still needs a whole-map reset (`clear_active`) on some bound, such as
+`map_points().len()`. The `max_merged_imu_span_sec` default (3 s) is
+ORB-SLAM3's limit for an initialized IMU; cull before initialization only with
+0.5 s. In stereo keyframes the redundancy count covers every live landmark
+unless `stereo_close_depth_m` is set: set it to the frontend's stereo close
+depth for ORB-SLAM3's rule, which counts only close stereo points so that far
+and mono-only points cannot cull the keyframe holding the only close ones.
+`KeyframeRemoval`, what `remove_keyframe` reports, is `#[non_exhaustive]`.
+**Behaviour change for culling callers:** keyframe slots were stable before
+(nothing removed a keyframe); `remove_keyframe` shifts every slot after the
+removed one down, so a caller that enables culling must not hold slot
+positions across it (keyframe ids keep their meaning). Otherwise additive.
+
+**Parallax-based keyframe insertion.** `KeyframePolicy::min_parallax_px`
+inserts a keyframe once the median rotation-compensated parallax since the last
+one reaches a threshold (`tracking::median_parallax_px` measures it;
+`tracking::median_compensated_parallax_px` is the same median over pixel
+pairs a caller already has), so with `max_frames_between = usize::MAX` a
+parked camera stops adding keyframes. The reference-ratio and weak-tracking
+rules still apply. Off by default, so insertion is unchanged; `SlamSystem`
+measures parallax only when it is set. In a system file it is
+`keyframes.min_parallax_px` (`None` by default, checked finite and positive
+when set). `KeyframePolicy::max_interval_sec` forces a keyframe once that long
+has passed since the last one (`keyframes.max_interval_sec`, `None` by
+default). An inertial system with `max_frames_between = usize::MAX` needs it,
+and is refused without it (`ConfigError::UnboundedInertialKeyframes`): IMU
+samples are buffered until the next keyframe, so a parked rig with no bound
+would buffer and rescan the whole stop and bridge it with one IMU edge.
+ORB-SLAM3 forces a keyframe every 0.5 s in its inertial modes.
+**Breaking:** `KeyframePolicy` gains two public fields, so a struct literal
+needs `..KeyframePolicy::default()`. `should_insert_with` takes the new
+`KeyframeEvidence`; `should_insert` is unchanged.
+
 **Local BA no longer copies the whole map.** Each local bundle adjustment
 captured every keyframe, landmark and IMU factor under the map lock, so its
 cost, and the stall it caused tracking, grew with the map. It now captures only
-the local window. **Breaking:** `Map::ba_snapshot` takes a `BaWindow`; use
-`mapping::bundle_adjustment::local_window` for the standard selection.
+the local window. `BaUpdate::keyframe_biases` reads the bias an update would
+write on each captured keyframe, so a caller can refuse an implausible one
+before `Map::apply_ba_update`. **Breaking:** `Map::ba_snapshot` takes a
+`BaWindow`; use `mapping::bundle_adjustment::local_window` for the standard
+selection.
+
+**Wheel odometry in visual-inertial BA.** A ground robot can now constrain
+local VI-BA with the planar base motion its wheels measure between keyframes.
+`mapping::wheel_odom::WheelOdomFactor` carries the `(dx, dy, dθ)` delta and its
+covariance, holds z, roll and pitch stiff, takes the base-to-camera extrinsic
+at each end (a moving head makes it time-varying), and has an optional Huber
+kernel. Its Jacobians are analytic. The covariance is over `(dx, dy, dθ)` in
+base-i axes; `WheelOdomMeasurement::information` rotates it into the
+residual's predicted base-j axes, so the chi² is the Mahalanobis distance of
+the planar error whatever the turn between the keyframes. With no factors the
+solve is unchanged, bit for bit. `visual_inertial_bundle_adjust` refuses a
+factor with a non-finite delta or extrinsic or a covariance that is not
+positive definite; `run_local_inertial_ba` drops such a factor
+(`WheelOdomFactor::is_valid`) instead of losing the whole window update.
+**Breaking:** `run_local_inertial_ba` takes a `wheel_factors` slice (indexed
+by `Frame::idx`) and `visual_inertial_bundle_adjust` a `wheel_edges` slice
+(indexed by keyframe slot); pass `&[]` to keep the old behaviour. `ViBaError`
+gains three variants. The workspace version moves to 0.2.0.
+
+**Stationary edges for parked robots.** Two keyframes of one stop can now be
+linked without IMU preintegration. `mapping::stationary::StationaryFactor`
+(with `StationaryGyro`) constrains zero relative pose, zero velocity at both
+ends, bias continuity with a random walk scaled by the span, and, when the
+caller supplies the mean raw gyro rate of the still span, the gyro bias to that
+mean (variance `σ_g²/T + σ_bg²·span/12`); there is deliberately no
+accelerometer row, as tilt and accelerometer bias are not separable at rest.
+Its pose Jacobians are analytic (the wheel factor's with identity extrinsics)
+and checked numerically. It has no span limit:
+`cull_redundant_keyframes` composes two stationary factors through a removed
+keyframe (`StationaryFactor::compose`) however long the parked span, while
+`max_merged_imu_span_sec` keeps capping IMU merges only, so a parked map no
+longer fills with keyframes whose ~10 s IMU edges cannot merge. A keyframe at
+the boundary between a stationary factor and an IMU edge is removable too: the
+stationary factor is dropped and the IMU edge moves onto the still neighbour
+(`Map::remove_keyframe_beside_still`, with `StillNeighbour` / `StillSide`),
+keeping its interval and samples, so the boundaries every stop leaves no longer
+pin keyframes until the map is dropped. Boundaries are judged after every other
+candidate, each once per call, so a stop's chain is composed before an IMU edge
+takes it over; only a bare chain end is kept.
+`KeyframeCullReport::stationary_edges_merged` and
+`stationary_boundaries_removed` count both. An IMU edge whose bias link spans
+still time outside its samples (a tail edge after a stop, or one moved across
+a boundary) records it in `ImuFactor::bias_walk_extra_s`; keyframe merges and
+VI-BA repropagation re-preintegrate through `ImuFactor::repreintegrate`, which
+adds that walk back (`PreintegratedImu::widen_bias_walk`), instead of
+rebuilding a bias link from the samples alone that was orders of magnitude too
+stiff. Like wheel factors, stationary factors are held by the
+caller, keyed by `Frame::idx`; `bundle_adjustment::local_window_with_neighbors`
+captures a window in which a stationary neighbour of the active keyframes is
+fixed context, and `run_local_inertial_ba` drops an invalid factor
+(`StationaryFactor::is_valid`) instead of losing the window update. With no
+stationary factors every solve and every cull is unchanged.
+**Breaking:** `visual_inertial_bundle_adjust` takes a `stationary_edges` slice
+(after `wheel_edges`), `run_local_inertial_ba` a `stationary_factors` slice
+and `cull_redundant_keyframes` an `Option<&mut Vec<StationaryFactor>>` (pass
+`&[]` / `None` for the old behaviour); `ViBaError` gains
+`StationaryFactorOutOfRange` and `InvalidStationaryFactor`; `map::ImuFactor`
+gains the public field `bias_walk_extra_s` (set it to `0.0` for an ordinary
+edge) and `KeyframeRemovalError` the variant `InvalidStillNeighbour`. Additive:
+`local_window_with_neighbors`, `KeyframeCullReport::stationary_edges_merged`
+(the report is `#[non_exhaustive]`), and `kornia_sensors::imu::ImuCalib`
+derives `PartialEq`. All of this rides on the already-breaking 0.2.0; none of
+it belongs in a 0.1.x.
+
+**The IMU buffer stays bounded while bootstrap fails.** `SlamSystem` dropped
+buffered IMU samples only once a map existed or a monocular bootstrap
+reference was stored, so a rig that could not bootstrap (a dark room: too few
+stereo points, or no keypoints at all) buffered every sample for as long as
+that lasted. Samples older than the current frame are now dropped on every
+failed stereo bootstrap and whenever no monocular reference is held. While a
+monocular reference is held the samples since it are still kept, as the first
+edge needs them.
+
+**Inertial initialization while stationary.** A stereo-inertial rig no
+longer has to move before the IMU joins the estimate: the motion-based
+initializer needs displacement to see gravity, but a stereo map is already
+metric, so a still window is enough. `ImuInitializer::initialize_stationary`
+takes the window's `ImuWindowStats` (mean and vector spread of the raw
+samples) and returns an ordinary `ImuInitResult` for `apply_initialization`:
+gravity from the mean specific force through the newest keyframe's attitude
+and `T_BC`, gyro bias from the mean rate, zero velocities, and the
+accelerometer bias corrected along gravity by `|f| - g` (the across-gravity
+part is unobservable at rest and stays at the prior). Deciding that the window
+was still is left to the caller. Monocular windows and a mean specific force
+far from standard gravity are refused (`StationaryInitError`). Both new types
+are `#[non_exhaustive]`. Additive; no existing signature changes.
+
+**Solver diagnostics are opt-in.** The per-solve diagnostic lines of BA,
+VI-BA and IMU initialization (including refused IMU
+alignments and rejected IMU inits) print to stderr only when the
+`KORNIA_SLAM_DEBUG` environment variable is set; it is read once, at the first
+diagnostic, so set it before starting. They were unconditional, about a
+hundred unbuffered writes a keyframe, which on an embedded host logging to
+eMMC blocked the solve thread for seconds. `SlamSystem::set_debug` does not
+control them (it never did). Faults still print unconditionally: a panicked
+local-mapping worker, and the first singular IMU covariance VI-BA falls back
+from (later ones only with the variable set).
 
 ## [0.1.0] — 2026-09-27
 

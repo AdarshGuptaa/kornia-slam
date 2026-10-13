@@ -56,6 +56,10 @@ fn display_describes_the_pipeline() {
     };
     let mut inertial_loop = with_loop_closing(loop_closing(), sensors(CameraSelection::Mono, true));
     orb_mut(&mut inertial_loop).mapping.execution = LocalMappingMode::Synchronous;
+    let mut parallax = SystemConfig::default();
+    let keyframes = &mut orb_mut(&mut parallax).keyframes;
+    keyframes.max_frames_between = usize::MAX;
+    keyframes.min_parallax_px = Some(10.0);
     for (config, expected) in [
         (
             SystemConfig::default(),
@@ -85,6 +89,15 @@ fn display_describes_the_pipeline() {
   keyframes: every 3..=8 frames, ref ratio 0.6
   local mapping: synchronous
   loop closing: ORBvoc.txt
+",
+        ),
+        (
+            parallax,
+            "OrbSlam pipeline (config version 1)
+  frontend: ORB, 1000 keypoints
+  tracking
+  keyframes: every 3..=unbounded frames, ref ratio 0.6, parallax 10 px
+  local mapping: asynchronous
 ",
         ),
     ] {
@@ -142,6 +155,59 @@ fn frontend_and_keyframe_settings_are_range_checked() {
             "ratio {ref_ratio}"
         );
     }
+
+    let parallax = |min_parallax_px| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).keyframes.min_parallax_px = min_parallax_px;
+        invalid_setting(&config)
+    };
+    assert_eq!(parallax(None), None);
+    assert_eq!(parallax(Some(10.0)), None);
+    for px in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            parallax(Some(px)).as_deref(),
+            Some("keyframes.min_parallax_px"),
+            "parallax {px}"
+        );
+    }
+
+    let interval = |max_interval_sec| {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).keyframes.max_interval_sec = max_interval_sec;
+        invalid_setting(&config)
+    };
+    assert_eq!(interval(Some(0.5)), None);
+    for secs in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            interval(Some(secs)).as_deref(),
+            Some("keyframes.max_interval_sec"),
+            "interval {secs}"
+        );
+    }
+}
+
+/// A parked inertial rig with no keyframe bound would buffer IMU samples, and
+/// grow the next IMU edge, for the whole stop.
+#[test]
+fn an_inertial_system_needs_a_keyframe_bound() {
+    let parked = |imu, max_frames_between, max_interval_sec| {
+        let mut config = SystemConfig {
+            sensors: sensors(CameraSelection::Stereo, imu),
+            ..SystemConfig::default()
+        };
+        let keyframes = &mut orb_mut(&mut config).keyframes;
+        keyframes.max_frames_between = max_frames_between;
+        keyframes.min_parallax_px = Some(10.0);
+        keyframes.max_interval_sec = max_interval_sec;
+        config.validate()
+    };
+    assert_eq!(
+        parked(true, usize::MAX, None),
+        Err(ConfigError::UnboundedInertialKeyframes)
+    );
+    assert_eq!(parked(true, usize::MAX, Some(0.5)), Ok(()));
+    assert_eq!(parked(true, 30, None), Ok(()));
+    assert_eq!(parked(false, usize::MAX, None), Ok(()));
 }
 
 fn invalid_setting(config: &SystemConfig) -> Option<String> {
@@ -290,6 +356,8 @@ mod runtime_settings {
             min_frames_between: 2,
             max_frames_between: 5,
             ref_ratio: 0.8,
+            min_parallax_px: Some(12.0),
+            max_interval_sec: Some(0.5),
         };
         orb.mapping.execution = LocalMappingMode::Synchronous;
         orb.tuning.initialization.acceptance_config.min_inliers = 40;
@@ -388,6 +456,14 @@ mod ron_files {
             ..OrbFrontendConfig::default()
         });
         assert_eq!(ron(&config), ron(&expected));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((keyframes: (max_frames_between: 18446744073709551615, min_parallax_px: Some(10.0), max_interval_sec: Some(0.5)))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&config).keyframes.max_frames_between, usize::MAX);
+        assert_eq!(orb(&config).keyframes.min_parallax_px, Some(10.0));
+        assert_eq!(orb(&config).keyframes.max_interval_sec, Some(0.5));
     }
 
     /// Tuning is not part of the file format, so a file cannot set it.

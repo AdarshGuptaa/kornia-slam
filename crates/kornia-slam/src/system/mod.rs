@@ -27,7 +27,9 @@ pub use validation::ConfigError;
 use crate::frontend::{FrontendObservation, OrbFrontend};
 use state::{SystemMode, SystemState};
 
-use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
+use crate::tracking::{
+    KeyframeEvidence, KeyframePolicy, TrackingLossRecoveryPolicy, median_parallax_px,
+};
 
 use crate::tracking::local_map::{LocalMapSelectionConfig, select_local_map_points};
 use crate::tracking::motion::{InertialPrediction, predict_pose};
@@ -332,6 +334,11 @@ impl SlamSystem {
 
     /// Single-frame metric initialization from stereo depth.
     fn bootstrap_stereo(&mut self, mut curr_frame: Frame, timestamp_sec: f64) -> TrackingResult {
+        // The map will start at this frame or a later one, so older samples
+        // can never enter an edge; a failed attempt (too few stereo points,
+        // as in the dark) must not keep them, or the buffer grows for as
+        // long as bootstrap keeps failing.
+        self.prune_imu_before(timestamp_sec);
         // Build the new map in the current odometry frame (identity at start,
         // or the recovery pose after a tracking loss).
         curr_frame.pose_world_to_cam = self.state.pose_world_to_cam;
@@ -396,6 +403,8 @@ impl SlamSystem {
                     curr_frame.idx, keypoints, MIN_KEYPOINTS_FOR_BOOTSTRAP,
                 ));
                 self.state.bootstrap_frame = None;
+                // No reference is held: the next one is a later frame.
+                self.prune_imu_before(timestamp_sec);
                 return self.frame_result(TrackingStatus::Skipped);
             }
             BootstrapDecision::StoreAsReference => {
@@ -879,6 +888,61 @@ impl SlamSystem {
         self.frame_result(status)
     }
 
+    /// What the keyframe policy is shown for `frame`: the parallax is taken
+    /// against the last keyframe at the tracked pose `state.pose_world_to_cam`,
+    /// not at the frame's own (pre-tracking) pose.
+    fn keyframe_evidence(
+        &self,
+        frame: &Frame,
+        tracked_inliers: usize,
+        matches: &[(usize, usize)],
+    ) -> KeyframeEvidence {
+        let map = self.map.lock().unwrap();
+        let n_ref_map_points = self
+            .state
+            .current_keyframe_idx
+            .and_then(|ki| map.get_keyframe(ki))
+            .map(|kf| kf.num_associated_points())
+            .unwrap_or(0);
+        // Measured only when the policy reads it: it walks every match.
+        let median_parallax_px = self
+            .keyframe_policy
+            .min_parallax_px
+            .zip(self.state.last_keyframe_idx)
+            .and_then(|(_, last)| {
+                median_parallax_px(
+                    &map,
+                    last,
+                    frame,
+                    &self.state.pose_world_to_cam,
+                    matches,
+                    &self.rig.camera,
+                )
+            });
+        KeyframeEvidence {
+            curr_idx: frame.idx,
+            last_keyframe_idx: self.state.last_keyframe_idx,
+            tracked_inliers,
+            n_ref_map_points,
+            median_parallax_px,
+        }
+    }
+
+    /// The policy's decision, or `max_interval_sec` elapsed since the last
+    /// keyframe's timestamp.
+    fn keyframe_due(&self, evidence: &KeyframeEvidence, timestamp_sec: f64) -> bool {
+        let interval_elapsed = evidence
+            .last_keyframe_idx
+            .zip(self.inertial.last_keyframe_timestamp_sec)
+            .is_some_and(|(last_idx, last_ts)| {
+                self.keyframe_policy.interval_elapsed(
+                    evidence.curr_idx.saturating_sub(last_idx),
+                    timestamp_sec - last_ts,
+                )
+            });
+        interval_elapsed || self.keyframe_policy.should_insert_with(evidence)
+    }
+
     fn try_insert_keyframe(
         &mut self,
         frame: &Frame,
@@ -886,21 +950,8 @@ impl SlamSystem {
         tracked_inliers: usize,
         matches: &[(usize, usize)],
     ) -> bool {
-        let n_ref_map_points = if let Some(ki) = self.state.current_keyframe_idx {
-            let map = self.map.lock().unwrap();
-            map.get_keyframe(ki)
-                .map(|kf| kf.num_associated_points())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        if !self.keyframe_policy.should_insert(
-            frame.idx,
-            self.state.last_keyframe_idx,
-            tracked_inliers,
-            n_ref_map_points,
-        ) {
+        let evidence = self.keyframe_evidence(frame, tracked_inliers, matches);
+        if !self.keyframe_due(&evidence, timestamp_sec) {
             return false;
         }
 

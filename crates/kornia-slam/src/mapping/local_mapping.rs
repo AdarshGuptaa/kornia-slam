@@ -49,6 +49,8 @@ fn solve_snapshot(snapshot: BaSnapshot, camera: &PinholeCamera, job: &KeyframeJo
             camera,
             job.imu_t_bc,
             job.gravity_world,
+            &[],
+            &[],
         )
     } else {
         super::bundle_adjustment::run_local_ba(snapshot, camera)
@@ -298,7 +300,9 @@ impl Drop for LocalMappingHandle {
         if let Some(handle) = self.join_handle.take()
             && handle.join().is_err()
         {
-            eprintln!("local-mapping worker panicked");
+            // A fault, not solver chatter: always reported, since a host's
+            // panic hook may not write the panic itself to stderr.
+            eprintln!("kornia-slam: local-mapping worker panicked; mapping had stopped");
         }
     }
 }

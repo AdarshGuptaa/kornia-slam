@@ -6,13 +6,14 @@
 use crate::mapping::map::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR,
 };
+use crate::mapping::stationary::StationaryFactor;
+use crate::mapping::wheel_odom::WheelOdomFactor;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
 use kornia_3d::ransac::RobustKernelKind;
 use kornia_algebra::Vec3F64;
-use kornia_sensors::imu::PreintegratedImu;
 use std::collections::{HashMap, HashSet};
 
 /// Relative standard deviation of a stereo depth measurement, as a fraction of
@@ -34,6 +35,20 @@ const MAX_ACTIVE_KFS: usize = 3;
 /// always precede the active ones in slot order, because the active keyframes
 /// are the newest.
 pub fn local_window(map: &Map) -> BaWindow {
+    local_window_with_neighbors(map, [])
+}
+
+/// [`local_window`], with the caller's own keyframe links (`(from, to)` by
+/// `Frame::idx`, such as the stationary factors it holds) treated like IMU
+/// edges: an endpoint in the active set pulls the other in as fixed context.
+///
+/// Without it a keyframe linked to the active window only by a caller-held
+/// factor, and observing none of its landmarks, would be left out, and the
+/// factor dropped with it.
+pub fn local_window_with_neighbors(
+    map: &Map,
+    neighbors: impl IntoIterator<Item = (usize, usize)>,
+) -> BaWindow {
     let keyframes = map.keyframes();
     let active_start = keyframes.len().saturating_sub(MAX_ACTIVE_KFS);
     let active = &keyframes[active_start..];
@@ -44,10 +59,14 @@ pub fn local_window(map: &Map) -> BaWindow {
         .iter()
         .flat_map(|&id| map.map_points()[id].observer_keyframes())
         .collect();
-    for factor in map.imu_factors() {
-        if active_ids.contains(&factor.prev_kf_idx) || active_ids.contains(&factor.curr_kf_idx) {
-            context.insert(factor.prev_kf_idx);
-            context.insert(factor.curr_kf_idx);
+    let imu_links = map
+        .imu_factors()
+        .iter()
+        .map(|f| (f.prev_kf_idx, f.curr_kf_idx));
+    for (from, to) in imu_links.chain(neighbors) {
+        if active_ids.contains(&from) || active_ids.contains(&to) {
+            context.insert(from);
+            context.insert(to);
         }
     }
 
@@ -173,14 +192,14 @@ pub fn run_initial_ba(
     let (sq_err_after, depth_after, kf1_t_after) =
         initial_ba_diagnostics(&ba_result.poses, &ba_result.points, &observations, camera);
 
-    eprintln!(
+    debug_eprintln!(
         "[init_ba] before: reproj_rms={:.3}px median_depth={:.3} kf1_t_norm={:.3} obs={}",
         sq_err_before.sqrt(),
         depth_before,
         kf1_t_before,
         observations.len()
     );
-    eprintln!(
+    debug_eprintln!(
         "[init_ba] after:  reproj_rms={:.3}px median_depth={:.3} kf1_t_norm={:.3} iters={} converged={}",
         sq_err_after.sqrt(),
         depth_after,
@@ -199,9 +218,11 @@ pub fn run_initial_ba(
     {
         let normal_len = mp.mean_viewing_direction.length();
         let predicted = mp.predict_scale(depth_after.max(1e-6), ORB_SCALE_FACTOR, ORB_N_LEVELS);
-        eprintln!(
+        debug_eprintln!(
             "[init_ba] scale_state[mp{sample}]: min_dist={:.3} max_dist={:.3} normal_len={:.3} predict_scale@median={predicted}",
-            mp.min_distance, mp.max_distance, normal_len,
+            mp.min_distance,
+            mp.max_distance,
+            normal_len,
         );
     }
 
@@ -272,11 +293,23 @@ pub fn run_local_ba(snapshot: BaSnapshot, camera: &PinholeCamera) -> BaUpdate {
 
 /// Solves the same local window with velocity, bias and active IMU edges.
 /// Repropagated preintegrations remain in the returned update even if solving fails.
+///
+/// `wheel_factors` index keyframes by `Frame::idx`, like the map's IMU
+/// factors; those with an endpoint outside the window, or with both endpoints
+/// fixed, are dropped, and so is any that fails [`WheelOdomFactor::is_valid`]
+/// (one such factor would otherwise fail the whole solve).
+///
+/// `stationary_factors` are filtered the same way (by
+/// [`StationaryFactor::is_valid`]). Capture the window with
+/// [`local_window_with_neighbors`] so a stationary neighbour of the active
+/// keyframes is in it.
 pub fn run_local_inertial_ba(
     snapshot: BaSnapshot,
     camera: &PinholeCamera,
     imu_t_bc: Option<Pose3d>,
     gravity_world: Vec3F64,
+    wheel_factors: &[WheelOdomFactor],
+    stationary_factors: &[StationaryFactor],
 ) -> BaUpdate {
     let mut update = snapshot.into_update();
     let snapshot = &update.snapshot;
@@ -358,13 +391,9 @@ pub fn run_local_inertial_ba(
         let d_accel = (current_bias.accel - preintegrated.bias.accel).length();
         let d_gyro = (current_bias.gyro - preintegrated.bias.gyro).length();
         if d_accel > REPROPAGATE_BIAS_THRESHOLD || d_gyro > REPROPAGATE_BIAS_THRESHOLD {
-            *preintegrated = PreintegratedImu::from_measurements(
-                current_bias,
-                preintegrated.calib,
-                &factor.raw_samples,
-                factor.t0,
-                factor.t1,
-            );
+            // Keeps the walk over the edge's still time, which the samples
+            // alone do not cover.
+            *preintegrated = factor.repreintegrate(current_bias);
         }
     }
 
@@ -387,6 +416,56 @@ pub fn run_local_inertial_ba(
         })
         .collect();
 
+    let wheel_edges: Vec<WheelOdomFactor> = wheel_factors
+        .iter()
+        .filter_map(|f| {
+            let from = *frame_idx_to_slot.get(&f.from_idx)?;
+            let to = *frame_idx_to_slot.get(&f.to_idx)?;
+            if from < active_start && to < active_start {
+                return None;
+            }
+            // One bad factor would fail the whole solve, losing every
+            // window update for as long as it stays in the window: drop it.
+            if !f.is_valid() {
+                debug_eprintln!(
+                    "[vi_ba] skipping wheel factor {} -> {}: non-finite or not positive definite",
+                    f.from_idx,
+                    f.to_idx
+                );
+                return None;
+            }
+            Some(WheelOdomFactor {
+                from_idx: from,
+                to_idx: to,
+                ..*f
+            })
+        })
+        .collect();
+
+    let stationary_edges: Vec<StationaryFactor> = stationary_factors
+        .iter()
+        .filter_map(|f| {
+            let from = *frame_idx_to_slot.get(&f.from_idx)?;
+            let to = *frame_idx_to_slot.get(&f.to_idx)?;
+            if from < active_start && to < active_start {
+                return None;
+            }
+            if !f.is_valid() {
+                debug_eprintln!(
+                    "[vi_ba] skipping stationary factor {} -> {}: invalid",
+                    f.from_idx,
+                    f.to_idx
+                );
+                return None;
+            }
+            Some(StationaryFactor {
+                from_idx: from,
+                to_idx: to,
+                ..*f
+            })
+        })
+        .collect();
+
     // 15-DOF-per-keyframe state (pose+velocity+bias) with information
     // entries spanning many more orders of magnitude than the pure
     // visual 6-DOF problem (see the Marquardt-damping note in
@@ -400,6 +479,8 @@ pub fn run_local_inertial_ba(
         &window.positions,
         &observations,
         &imu_edges,
+        &wheel_edges,
+        &stationary_edges,
         camera,
         &ViBaParams {
             imu_t_bc,
@@ -409,7 +490,10 @@ pub fn run_local_inertial_ba(
         },
     ) {
         Ok(r) => r,
-        Err(_) => return update,
+        Err(error) => {
+            debug_eprintln!("[vi_ba] local inertial BA failed, window unchanged: {error}");
+            return update;
+        }
     };
 
     // Write back optimised poses, velocities, and biases for active keyframes.

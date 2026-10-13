@@ -3,7 +3,7 @@ use super::{
 };
 use crate::mapping::map::{
     Keyframe, Map, ORB_N_LEVELS, ORB_SCALE_FACTOR, ObservationKey,
-    tests::{test_frame, test_frame_with_pose},
+    tests::{assert_map_consistent, test_frame, test_frame_with_pose},
 };
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
@@ -217,114 +217,6 @@ fn seed(kf: usize, feature: usize, z: f64) -> LandmarkSeed {
             keyframe_idx: kf,
             feature_idx: feature,
         },
-    }
-}
-
-/// Every link is mirrored on both sides, and no feature or landmark is
-/// claimed twice within a keyframe.
-/// The full documented invariant, not a subset. Every rule here is one the
-/// module doc promises, so a fixture that violates one is a broken fixture
-/// rather than a tolerated shape.
-fn assert_map_consistent(map: &Map) {
-    // Keyframe side: each association is mirrored by a record, targets an
-    // active landmark, and no landmark is claimed twice in one keyframe.
-    for kf in map.keyframes() {
-        let mut seen: HashSet<usize> = HashSet::new();
-        for (feature, slot) in kf.map_point_by_desc_idx.iter().enumerate() {
-            let Some(mp_idx) = *slot else { continue };
-            let mp = &map.map_points()[mp_idx];
-            assert!(!mp.culled, "kf {} links retired {mp_idx}", kf.frame.idx);
-            assert!(
-                mp.observations()
-                    .iter()
-                    .any(|o| o.key.keyframe_idx == kf.frame.idx && o.key.feature_idx == feature),
-                "kf {} feature {feature} -> {mp_idx} has no matching record",
-                kf.frame.idx
-            );
-            assert!(
-                seen.insert(mp_idx),
-                "landmark {mp_idx} claimed twice in one keyframe"
-            );
-        }
-    }
-
-    for (mp_idx, mp) in map.map_points().iter().enumerate() {
-        if mp.culled {
-            // Retirement is logical (develop's behaviour): a retired landmark
-            // keeps its records and derived geometry. What must hold is that no
-            // keyframe still links it, which the keyframe-side pass checks.
-            continue;
-        }
-
-        // An active landmark is observed, and its reference is one of those
-        // observations rather than a dangling id.
-        assert!(
-            !mp.observations().is_empty(),
-            "active {mp_idx} has no observations"
-        );
-        assert!(
-            mp.is_observed_by(mp.keyframe_idx),
-            "active {mp_idx} references kf {} without observing it",
-            mp.keyframe_idx
-        );
-
-        let mut kfs: HashSet<usize> = HashSet::new();
-        for obs in mp.observations() {
-            assert!(kfs.insert(obs.key.keyframe_idx), "duplicate observer");
-            let kf = map
-                .get_keyframe(obs.key.keyframe_idx)
-                .expect("observer exists");
-            assert_eq!(kf.map_point(obs.key.feature_idx), Some(mp_idx));
-
-            // The referenced feature exists in both arrays, and the record
-            // carries that feature's own descriptor.
-            assert!(
-                obs.key.feature_idx < kf.frame.features.descriptors.len()
-                    && obs.key.feature_idx < kf.frame.features.keypoints_xy.len(),
-                "record on kf {} feature {} is outside the feature arrays",
-                obs.key.keyframe_idx,
-                obs.key.feature_idx
-            );
-            assert_eq!(
-                obs.descriptor, kf.frame.features.descriptors[obs.key.feature_idx],
-                "record on kf {} feature {} carries a foreign descriptor",
-                obs.key.keyframe_idx, obs.key.feature_idx
-            );
-
-            // The reference octave agrees with its feature, with the same
-            // fallback insertion uses when octave data is absent.
-            if obs.key.keyframe_idx == mp.keyframe_idx {
-                let expected = kf
-                    .frame
-                    .features
-                    .octaves
-                    .get(obs.key.feature_idx)
-                    .copied()
-                    .unwrap_or(0);
-                assert_eq!(
-                    mp.reference_octave, expected,
-                    "landmark {mp_idx} reference octave disagrees with its feature"
-                );
-            }
-        }
-    }
-
-    // IMU edges connect stored keyframes, and each directed edge is unique.
-    let mut edges: HashSet<(usize, usize)> = HashSet::new();
-    for factor in map.imu_factors() {
-        assert!(
-            map.get_keyframe(factor.prev_kf_idx).is_some()
-                && map.get_keyframe(factor.curr_kf_idx).is_some(),
-            "imu edge {} -> {} has a missing endpoint",
-            factor.prev_kf_idx,
-            factor.curr_kf_idx
-        );
-        assert!(
-            edges.insert((factor.prev_kf_idx, factor.curr_kf_idx)),
-            "duplicate imu edge {} -> {}",
-            factor.prev_kf_idx,
-            factor.curr_kf_idx
-        );
     }
 }
 
@@ -618,6 +510,7 @@ fn an_invalid_imu_edge_rejects_the_batch() {
         raw_samples: Vec::new(),
         t0,
         t1,
+        bias_walk_extra_s: 0.0,
     };
     let mut request = MapInsertion {
         keyframes: vec![detached(1, 1)],
@@ -801,6 +694,7 @@ fn a_duplicate_imu_edge_within_one_batch_is_refused() {
         raw_samples: Vec::new(),
         t0: 0.0,
         t1: 1.0,
+        bias_walk_extra_s: 0.0,
     };
     let before = map.state_fingerprint_for_test();
 
@@ -1038,4 +932,29 @@ fn two_landmarks_naming_one_feature_refuse_the_whole_batch() {
         .expect("distinct features publish");
     assert_eq!(result.landmark_ids.len(), 2);
     assert_map_consistent(&map);
+}
+
+/// `BaUpdate::keyframe_biases` reports, in capture order, the bias the update would write: a
+/// caller refusing an implausible bias must read the estimate, not the map it was captured from.
+#[test]
+fn ba_update_reports_the_bias_it_would_write() {
+    use crate::mapping::map::ops::BaWindow;
+    use kornia_sensors::imu::ImuBias;
+    let mut map = Map::new();
+    for (idx, gz) in [(0usize, 0.001), (1, 0.002)] {
+        let mut kf = detached(idx, 2);
+        kf.imu_bias = ImuBias {
+            gyro: Vec3F64::new(0.0, 0.0, gz),
+            accel: Vec3F64::ZERO,
+        };
+        map.insert_keyframe(kf).unwrap();
+    }
+    let window = BaWindow {
+        keyframe_slots: vec![0, 1],
+        landmark_ids: Vec::new(),
+    };
+    let mut update = map.ba_snapshot(&window).into_update();
+    update.keyframes[1].imu_bias.gyro.z = 0.3;
+    let gz: Vec<f64> = update.keyframe_biases().map(|b| b.gyro.z).collect();
+    assert_eq!(gz, vec![0.001, 0.3]);
 }
