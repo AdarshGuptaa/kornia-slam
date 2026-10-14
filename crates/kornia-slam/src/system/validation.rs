@@ -45,6 +45,9 @@ pub enum ConfigError {
     EmptyVocabularyPath,
     #[error("loop closing needs metric input: enable stereo cameras or the IMU")]
     LoopClosingWithoutMetricScale,
+    /// Only constructible when the anchor stage exists, so gated with it: a
+    /// build without the feature keeps the previous set of variants.
+    #[cfg(feature = "apriltag")]
     #[error("unknown AprilTag family '{0}' (use a kornia-apriltag canonical name, e.g. tag36_h11)")]
     UnknownTagFamily(String),
     #[error("configuration requests {0}, but the source does not provide it")]

@@ -17,7 +17,7 @@ use kornia_algebra::{Mat3F64, Vec3F64, linalg::svd::svd3_f64};
 // ── Sim3 alignment ───────────────────────────────────────────────────────
 /// A similarity transform `X' = s·R·X + t` mapping `src` coordinates onto
 /// `dst` coordinates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Sim3Alignment {
     pub scale: f64,
     pub rotation: Mat3F64,
@@ -95,22 +95,54 @@ fn umeyama_weighted(src: &[Vec3F64], dst: &[Vec3F64], w: &[f64]) -> Sim3Alignmen
     }
 }
 
+/// A Sim3 alignment that cannot be performed.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum Sim3Error {
+    /// Both point sets must carry one correspondence per point.
+    #[error("Sim3 alignment needs equally sized point sets (src {src}, dst {dst})")]
+    MismatchedInputLengths {
+        /// Number of source points.
+        src: usize,
+        /// Number of destination points.
+        dst: usize,
+    },
+}
+
+/// Rejects mismatched correspondence counts before either solver runs.
+fn check_lengths(src: usize, dst: usize) -> Result<(), Sim3Error> {
+    if src == dst {
+        Ok(())
+    } else {
+        Err(Sim3Error::MismatchedInputLengths { src, dst })
+    }
+}
+
 /// Umeyama Sim3 fit mapping `est` onto `gt` (least-squares scale, rotation,
 /// translation).
 ///
 /// Delegates to `kornia-algebra`'s f64 Umeyama, which computes the SVD
 /// numerically robustly. The weighted core below is only the fallback for the
 /// SVD error that upstream API reports, so this stays infallible.
-pub fn align_sim3(est: &[Vec3F64], gt: &[Vec3F64]) -> Sim3Alignment {
+pub fn align_sim3(est: &[Vec3F64], gt: &[Vec3F64]) -> Result<Sim3Alignment, Sim3Error> {
+    check_lengths(est.len(), gt.len())?;
     match kornia_algebra::linalg::rigid::umeyama_f64(est, gt, true) {
-        Ok((rotation, translation, scale)) => Sim3Alignment {
+        Ok((rotation, translation, scale)) => Ok(Sim3Alignment {
             scale,
             rotation,
             translation,
-        },
+        }),
+        // Lengths were checked above; upstream echoing the mismatch is handled
+        // explicitly rather than swallowed. Only the SVD failures are
+        // recoverable and fall through to the weighted solver.
+        Err(kornia_algebra::linalg::rigid::UmeyamaError::MismatchedInputLengths) => {
+            Err(Sim3Error::MismatchedInputLengths {
+                src: est.len(),
+                dst: gt.len(),
+            })
+        }
         Err(_) => {
             let w = vec![1.0_f64; est.len()];
-            umeyama_weighted(est, gt, &w)
+            Ok(umeyama_weighted(est, gt, &w))
         }
     }
 }
@@ -144,7 +176,12 @@ impl Default for HuberIrlsConfig {
 /// outliers and dropped; the weighted Umeyama solve is then recomputed on
 /// the remaining inliers. This hard rejection prevents gross outliers from
 /// biasing the final result even after the Huber downweighting.
-pub fn align_sim3_robust(est: &[Vec3F64], gt: &[Vec3F64], cfg: HuberIrlsConfig) -> Sim3Alignment {
+pub fn align_sim3_robust(
+    est: &[Vec3F64],
+    gt: &[Vec3F64],
+    cfg: HuberIrlsConfig,
+) -> Result<Sim3Alignment, Sim3Error> {
+    check_lengths(est.len(), gt.len())?;
     let n = est.len();
     let mut w = vec![1.0_f64; n];
     let mut fit = umeyama_weighted(est, gt, &w);
@@ -224,7 +261,7 @@ pub fn align_sim3_robust(est: &[Vec3F64], gt: &[Vec3F64], cfg: HuberIrlsConfig) 
         }
     }
 
-    fit
+    Ok(fit)
 }
 
 /// Fit `src` onto `dst` constrained to translation plus a yaw rotation about
@@ -239,7 +276,8 @@ pub fn align_sim3_gravity_preserving(
     src: &[Vec3F64],
     dst: &[Vec3F64],
     gravity_axis: Vec3F64,
-) -> Sim3Alignment {
+) -> Result<Sim3Alignment, Sim3Error> {
+    check_lengths(src.len(), dst.len())?;
     let g_len = gravity_axis.length();
     let g = if g_len > f64::EPSILON {
         gravity_axis / g_len
@@ -284,11 +322,11 @@ pub fn align_sim3_gravity_preserving(
     let rotation = kornia_algebra::SO3F64::exp(g * alpha).matrix();
     let translation = mu_dst - rotation * mu_src;
 
-    Sim3Alignment {
+    Ok(Sim3Alignment {
         scale: 1.0,
         rotation,
         translation,
-    }
+    })
 }
 
 /// Median of a slice. Sorts a copy, so the input order never matters; an empty
@@ -434,7 +472,7 @@ mod tests {
             .collect();
 
         // Plain solver.
-        let fit = align_sim3(&src, &dst);
+        let fit = align_sim3(&src, &dst).unwrap();
         assert!(
             (fit.scale - true_scale).abs() < 1e-9,
             "plain scale error too large: {}",
@@ -454,7 +492,7 @@ mod tests {
         }
 
         // Robust solver should agree exactly (no outliers, all weights -> 1).
-        let robust_fit = align_sim3_robust(&src, &dst, HuberIrlsConfig::default());
+        let robust_fit = align_sim3_robust(&src, &dst, HuberIrlsConfig::default()).unwrap();
         assert!(
             (robust_fit.scale - true_scale).abs() < 1e-9,
             "robust scale error too large: {}",
@@ -507,8 +545,8 @@ mod tests {
             );
         }
 
-        let plain_fit = align_sim3(&src, &dst);
-        let robust_fit = align_sim3_robust(&src, &dst, HuberIrlsConfig::default());
+        let plain_fit = align_sim3(&src, &dst).unwrap();
+        let robust_fit = align_sim3_robust(&src, &dst, HuberIrlsConfig::default()).unwrap();
 
         // Plain solve should be visibly dragged off by the outliers.
         let plain_scale_err = (plain_fit.scale - true_scale).abs();
@@ -586,7 +624,7 @@ mod tests {
             .map(|&p| apply_transform(true_scale, &true_r, true_t, p))
             .collect();
 
-        let plain_fit = align_sim3(&src, &dst);
+        let plain_fit = align_sim3(&src, &dst).unwrap();
 
         // `align_sim3` delegates to the upstream solver while the weighted core
         // is ours, so the two agree to solver precision rather than bit-exactly.
@@ -624,7 +662,7 @@ mod tests {
         let src = random_points(&mut rng, n);
         let dst: Vec<Vec3F64> = src.iter().map(|&p| (yaw * p) + t).collect();
 
-        let fit = align_sim3_gravity_preserving(&src, &dst, gravity);
+        let fit = align_sim3_gravity_preserving(&src, &dst, gravity).unwrap();
         assert!((fit.scale - 1.0).abs() < 1e-12);
         assert!(mat3_frobenius_diff(&fit.rotation, &yaw) < 1e-9, "yaw error");
         assert!(vec3_norm(fit.translation - t) < 1e-9, "translation error");
@@ -646,7 +684,7 @@ mod tests {
         let src = random_points(&mut rng, n);
         let dst: Vec<Vec3F64> = src.iter().map(|&p| tilt * p).collect();
 
-        let fit = align_sim3_gravity_preserving(&src, &dst, gravity);
+        let fit = align_sim3_gravity_preserving(&src, &dst, gravity).unwrap();
         assert!((fit.scale - 1.0).abs() < 1e-12);
         let g_after = fit.rotation * g_hat;
         assert!(
@@ -686,7 +724,7 @@ mod tests {
             *d += Vec3F64::new(30.0, -25.0, 40.0);
         }
 
-        let fit = align_sim3_robust(&src, &dst, HuberIrlsConfig::default());
+        let fit = align_sim3_robust(&src, &dst, HuberIrlsConfig::default()).unwrap();
         assert!((fit.scale - true_scale).abs() < 1e-2, "scale {}", fit.scale);
         assert!(mat3_frobenius_diff(&fit.rotation, &true_r) < 5e-2);
     }
@@ -710,9 +748,26 @@ mod tests {
         let t = Vec3F64::new(1.0, -2.0, 0.5);
         let dst: Vec<Vec3F64> = src.iter().map(|&p| (r * p) * scale + t).collect();
 
-        let fit = align_sim3(&src, &dst);
+        let fit = align_sim3(&src, &dst).unwrap();
         assert!((fit.scale - scale).abs() < 1e-9, "scale {}", fit.scale);
         assert!(mat3_frobenius_diff(&fit.rotation, &r) < 1e-9);
         assert!(vec3_norm(fit.translation - t) < 1e-9);
+    }
+
+    #[test]
+    fn mismatched_point_counts_are_rejected_by_every_fit() {
+        let a = vec![Vec3F64::ZERO; 4];
+        let b = vec![Vec3F64::ZERO; 3];
+        let expected = Sim3Error::MismatchedInputLengths { src: 4, dst: 3 };
+
+        assert_eq!(align_sim3(&a, &b), Err(expected.clone()));
+        assert_eq!(
+            align_sim3_robust(&a, &b, HuberIrlsConfig::default()),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            align_sim3_gravity_preserving(&a, &b, Vec3F64::new(0.0, 0.0, -1.0)),
+            Err(expected)
+        );
     }
 }

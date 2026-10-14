@@ -85,6 +85,10 @@ pub enum AprilTagAnchorError {
     /// The pipeline has no AprilTag anchor configured.
     #[error("no AprilTag anchor configured")]
     AnchorNotConfigured,
+    /// The correspondence fit was rejected: a defensive path, since the
+    /// observations are always flattened into equal-length point sets.
+    #[error(transparent)]
+    Sim3(#[from] crate::sim3::Sim3Error),
     /// The robust Sim3 solve produced a degenerate fit (non-finite or
     /// implausible scale, or a residual far larger than the tag size). The map
     /// is left untouched rather than being silently corrupted.
@@ -312,13 +316,13 @@ impl AprilTagAnchor {
         let (est, gt) = largest_consistent_group(&quads, &canonical, self.config.tag_size_m)?;
 
         let fit = match gravity {
-            Some(axis) => align_sim3_gravity_preserving(&est, &gt, axis),
+            Some(axis) => align_sim3_gravity_preserving(&est, &gt, axis)?,
             None => {
                 let robust = HuberIrlsConfig {
                     delta: self.config.robust.delta.max(0.5 * self.config.tag_size_m),
                     ..self.config.robust
                 };
-                align_sim3_robust(&est, &gt, robust)
+                align_sim3_robust(&est, &gt, robust)?
             }
         };
         self.gate_fit(fit, &est, &gt)
@@ -455,7 +459,10 @@ fn largest_consistent_group(
             gt.extend(canonical);
             est.extend(quads[j]);
             gt.extend(canonical);
-            let hypothesis = align_sim3(&est, &gt);
+            // A hypothesis whose fit is refused cannot score inliers; skip it.
+            let Ok(hypothesis) = align_sim3(&est, &gt) else {
+                continue;
+            };
 
             // The hypothesis maps map coordinates onto the canonical tag frame,
             // so `worst` is in metres — and half a tag is a fixed metric

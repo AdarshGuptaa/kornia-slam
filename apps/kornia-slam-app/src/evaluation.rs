@@ -93,7 +93,11 @@ pub fn report(
     let (aligned, alignment_label): (Vec<Vec3F64>, String) = if anchored {
         (est.to_vec(), "none (AprilTag metric anchor)".to_string())
     } else {
-        let a = align_sim3(est, gt);
+        // The length guard above means the fit cannot be refused; a refusal is
+        // treated as "nothing to report".
+        let Ok(a) = align_sim3(est, gt) else {
+            return Ok(());
+        };
         let aligned = est
             .iter()
             .map(|p| a.translation + (a.rotation * *p) * a.scale)
