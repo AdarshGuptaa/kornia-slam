@@ -106,10 +106,18 @@ pub enum Sim3Error {
         /// Number of destination points.
         dst: usize,
     },
+    /// Both point sets are empty; at least one correspondence is required.
+    #[error("Sim3 alignment needs at least one correspondence")]
+    EmptyInput,
 }
 
-/// Rejects mismatched correspondence counts before either solver runs.
+/// Validates the correspondence counts before either solver runs: non-empty
+/// and equal. An empty pair would divide by a zero point count (0/0 centroids)
+/// in both solvers, so it is refused rather than producing NaN.
 fn check_lengths(src: usize, dst: usize) -> Result<(), Sim3Error> {
+    if src == 0 {
+        return Err(Sim3Error::EmptyInput);
+    }
     if src == dst {
         Ok(())
     } else {
@@ -752,6 +760,20 @@ mod tests {
         assert!((fit.scale - scale).abs() < 1e-9, "scale {}", fit.scale);
         assert!(mat3_frobenius_diff(&fit.rotation, &r) < 1e-9);
         assert!(vec3_norm(fit.translation - t) < 1e-9);
+    }
+
+    #[test]
+    fn empty_point_sets_are_rejected_by_every_fit() {
+        let empty: [Vec3F64; 0] = [];
+        assert_eq!(align_sim3(&empty, &empty), Err(Sim3Error::EmptyInput));
+        assert_eq!(
+            align_sim3_robust(&empty, &empty, HuberIrlsConfig::default()),
+            Err(Sim3Error::EmptyInput)
+        );
+        assert_eq!(
+            align_sim3_gravity_preserving(&empty, &empty, Vec3F64::new(0.0, 0.0, -1.0)),
+            Err(Sim3Error::EmptyInput)
+        );
     }
 
     #[test]

@@ -62,16 +62,56 @@ pub fn compute_drift(est: &[Vec3F64], gt: &[Vec3F64]) -> f64 {
 
 // ── Reporting ────────────────────────────────────────────────────────────
 
+/// Registers `est` onto `gt` for scoring, returning the aligned trajectory and
+/// a label describing the registration.
+///
+/// `anchored` marks an already-applied AprilTag metric correction: the anchor
+/// put the map in the *tag* frame, which is generally not the ground-truth
+/// frame, so a registration is still required. It is deliberately **rigid**
+/// (scale fixed): a wrong anchor scale cannot be absorbed by a scale-1
+/// transform and so still surfaces as ATE. The label reports the full-Sim3
+/// scale as a diagnostic (≈1.000 when the anchor is metric-correct). Without
+/// the anchor the trajectory is still in the map's arbitrary monocular frame,
+/// so it takes the full best-fit Sim3.
+///
+/// `None` when a fit is refused (which the callers' length guards make
+/// unreachable).
+fn aligned_trajectory(
+    est: &[Vec3F64],
+    gt: &[Vec3F64],
+    anchored: bool,
+) -> Option<(Vec<Vec3F64>, String)> {
+    if anchored {
+        let (rotation, translation, _scale) =
+            kornia_algebra::linalg::rigid::umeyama_f64(est, gt, false).ok()?;
+        let aligned = est.iter().map(|p| translation + rotation * *p).collect();
+        let metric_scale = align_sim3(est, gt)
+            .map(|a| format!("{:.6}", a.scale))
+            .unwrap_or_else(|_| "n/a".to_string());
+        Some((
+            aligned,
+            format!("anchored (metric); rigidly registered to GT (fit scale {metric_scale})"),
+        ))
+    } else {
+        let a = align_sim3(est, gt).ok()?;
+        let aligned = est
+            .iter()
+            .map(|p| a.translation + (a.rotation * *p) * a.scale)
+            .collect();
+        Some((
+            aligned,
+            format!("best-fit Sim3 to ground truth (scale {:.6})", a.scale),
+        ))
+    }
+}
+
 /// Writes the trajectory as CSVs under `out_dir` (created if missing) and
 /// prints ATE/RPE/drift. A no-op for fewer than two samples or a length
 /// mismatch.
 ///
 /// `anchored` is true only when the AprilTag metric correction was actually
-/// applied to the positions (its Sim3 is already in them), so they are scored
-/// as-is — no second best-fit Sim3, which would otherwise hide whether the
-/// anchor succeeded. When `false` — no stage, or the solve failed — the
-/// trajectory is still in the map's arbitrary monocular frame and is first
-/// aligned to ground truth by a best-fit Sim3.
+/// applied to the positions. See [`aligned_trajectory`] for how each case is
+/// registered to ground truth.
 pub fn report(
     est: &[Vec3F64],
     gt: &[Vec3F64],
@@ -81,6 +121,9 @@ pub fn report(
     if est.len() < 2 || gt.len() != est.len() {
         return Ok(());
     }
+    let Some((aligned, alignment_label)) = aligned_trajectory(est, gt, anchored) else {
+        return Ok(());
+    };
     std::fs::create_dir_all(out_dir)?;
 
     // Raw trajectory as recorded (post-anchor when the anchor applied).
@@ -89,24 +132,6 @@ pub fn report(
     for (i, p) in est.iter().enumerate() {
         writeln!(raw, "{i},{:.9},{:.9},{:.9}", p.x, p.y, p.z)?;
     }
-
-    let (aligned, alignment_label): (Vec<Vec3F64>, String) = if anchored {
-        (est.to_vec(), "none (AprilTag metric anchor)".to_string())
-    } else {
-        // The length guard above means the fit cannot be refused; a refusal is
-        // treated as "nothing to report".
-        let Ok(a) = align_sim3(est, gt) else {
-            return Ok(());
-        };
-        let aligned = est
-            .iter()
-            .map(|p| a.translation + (a.rotation * *p) * a.scale)
-            .collect();
-        (
-            aligned,
-            format!("best-fit Sim3 to ground truth (scale {:.6})", a.scale),
-        )
-    };
 
     let mut af = std::fs::File::create(out_dir.join("kornia_slam_aligned.csv"))?;
     writeln!(af, "idx,x,y,z,gt_x,gt_y,gt_z")?;
@@ -130,4 +155,69 @@ pub fn report(
     );
     eprintln!("=======================================================");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kornia_algebra::SO3F64;
+
+    /// A metric trajectory seen in the tag frame, and the same trajectory rigidly
+    /// placed in a ground-truth frame: the two differ by an unknown rigid offset
+    /// only, which is the situation an anchored run is scored in.
+    fn offset_pair() -> (Vec<Vec3F64>, Vec<Vec3F64>) {
+        let est: Vec<Vec3F64> = (0..6)
+            .map(|i| Vec3F64::new(i as f64 * 0.3, (i as f64 * 0.2).sin(), 1.0 + i as f64 * 0.1))
+            .collect();
+        let rotation = SO3F64::exp(Vec3F64::new(0.0, 0.5, 0.0)).matrix();
+        let translation = Vec3F64::new(1.0, -2.0, 0.5);
+        let gt = est.iter().map(|p| translation + rotation * *p).collect();
+        (est, gt)
+    }
+
+    #[test]
+    fn anchored_trajectory_is_registered_rigidly_to_ground_truth() {
+        let (est, gt) = offset_pair();
+        let (aligned, label) = aligned_trajectory(&est, &gt, true).expect("fit succeeds");
+        for (p, g) in aligned.iter().zip(&gt) {
+            assert!((*p - *g).length() < 1e-9, "rigid registration left a gap");
+        }
+        assert!(label.contains("anchored"), "{label}");
+        // The diagnostic scale is ~1 because the offset is rigid, not a rescale.
+        assert!(label.contains("1.000"), "{label}");
+    }
+
+    #[test]
+    fn anchored_registration_cannot_hide_a_wrong_scale() {
+        // Ground truth is the tag-frame trajectory rescaled by 1.5; a rigid
+        // registration cannot absorb that, so the residual stays large.
+        let (est, _) = offset_pair();
+        let gt: Vec<Vec3F64> = est.iter().map(|p| *p * 1.5).collect();
+        let (aligned, label) = aligned_trajectory(&est, &gt, true).expect("fit succeeds");
+        let worst = aligned
+            .iter()
+            .zip(&gt)
+            .map(|(p, g)| (*p - *g).length())
+            .fold(0.0_f64, f64::max);
+        assert!(worst > 0.1, "scale error must surface, got {worst}");
+        assert!(label.contains("1.500"), "diagnostic scale: {label}");
+    }
+
+    #[test]
+    fn unanchored_trajectory_takes_the_best_fit_sim3() {
+        let (est, gt) = offset_pair();
+        let (aligned, label) = aligned_trajectory(&est, &gt, false).expect("fit succeeds");
+        for (p, g) in aligned.iter().zip(&gt) {
+            assert!((*p - *g).length() < 1e-9);
+        }
+        assert!(label.contains("best-fit Sim3"), "{label}");
+    }
+
+    #[test]
+    fn mismatched_lengths_are_not_scored() {
+        let (est, mut gt) = offset_pair();
+        gt.pop();
+        assert!(aligned_trajectory(&est, &gt, true).is_none());
+        assert!(aligned_trajectory(&est, &gt, false).is_none());
+    }
 }

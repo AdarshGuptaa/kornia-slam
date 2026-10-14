@@ -312,8 +312,10 @@ impl SlamSystem {
     /// a gravity-preserving yaw + translation with scale fixed at 1; otherwise
     /// it is the full Sim3 the tag geometry defines. The map publication gate is
     /// held across the solve and writeback, so an in-flight local-mapping worker
-    /// cannot publish between them. Intended to be called once, after processing
-    /// (the tracking pose is corrected; velocities are left untouched).
+    /// cannot publish between them. Intended to be called once, after processing.
+    /// The tracking pose and the metric world velocity are corrected with the
+    /// same similarity; the relative `state.velocity` is invariant under a world
+    /// similarity and is left untouched.
     ///
     /// # Errors
     ///
@@ -334,7 +336,10 @@ impl SlamSystem {
             // Snapshot the final keyframe poses so the closure never holds the
             // map lock while the anchor solves.
             let poses: HashMap<usize, Pose3d> = {
-                let map = self.map.lock().unwrap();
+                let map = self
+                    .map
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 map.keyframes()
                     .iter()
                     .map(|kf| (kf.frame.idx, kf.frame.pose_world_to_cam))
@@ -356,11 +361,10 @@ impl SlamSystem {
             )
         };
 
-        self.map.lock().unwrap().apply_world_similarity(
-            alignment.scale,
-            &alignment.rotation,
-            alignment.translation,
-        )?;
+        self.map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .apply_world_similarity(alignment.scale, &alignment.rotation, alignment.translation)?;
 
         // Keep the runtime tracking state consistent with the corrected map:
         // the pose and the metric world velocity live in the world frame, so

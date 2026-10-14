@@ -36,4 +36,4 @@ serde = ["dep:serde", "dep:ron"]
 apriltag = ["dep:kornia-apriltag"]
 
 [package.metadata.docs.rs]
-features = ["serde"]
+features = ["serde", "apriltag"]

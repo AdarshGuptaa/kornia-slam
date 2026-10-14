@@ -103,6 +103,19 @@ pub enum AprilTagAnchorError {
         /// Physical tag size in metres.
         tag_size_m: f64,
     },
+    /// The IMU-only gravity-preserving mode needs the tag plane roughly
+    /// perpendicular to gravity: a near-vertical tag cannot be represented by
+    /// a yaw-about-gravity correction.
+    #[error(
+        "tag plane is not gravity-aligned: |tag normal . gravity| = {cosine:.3} < {min:.3} \
+         (mount the tag level, or the IMU map needs full-Sim3 mode)"
+    )]
+    TagNotGravityAligned {
+        /// |tag-plane normal · gravity unit vector|.
+        cosine: f64,
+        /// Rejection threshold.
+        min: f64,
+    },
 }
 
 /// Accumulates anchor-tag observations across keyframes.
@@ -316,10 +329,19 @@ impl AprilTagAnchor {
         let (est, gt) = largest_consistent_group(&quads, &canonical, self.config.tag_size_m)?;
 
         let fit = match gravity {
-            Some(axis) => align_sim3_gravity_preserving(&est, &gt, axis)?,
+            Some(axis) => {
+                ensure_tag_gravity_aligned(&est, axis)?;
+                align_sim3_gravity_preserving(&est, &gt, axis)?
+            }
             None => {
+                // A tag-scaled Huber threshold: residuals are in metres and a
+                // wrong corner is off by a good fraction of the tag, so the
+                // threshold must sit around the tag scale. `.min` keeps it
+                // there (an explicit smaller override still wins); `.max`
+                // would take the 1.0 m generic default and silently disable
+                // the weighting for any real tag.
                 let robust = HuberIrlsConfig {
-                    delta: self.config.robust.delta.max(0.5 * self.config.tag_size_m),
+                    delta: self.config.robust.delta.min(0.5 * self.config.tag_size_m),
                     ..self.config.robust
                 };
                 align_sim3_robust(&est, &gt, robust)?
@@ -404,7 +426,7 @@ impl AprilTagAnchor {
         est: &[Vec3F64],
         gt: &[Vec3F64],
     ) -> Result<Sim3Alignment, AprilTagAnchorError> {
-        let mut residuals: Vec<f64> = est
+        let residuals: Vec<f64> = est
             .iter()
             .zip(gt)
             .map(|(e, g)| {
@@ -412,8 +434,7 @@ impl AprilTagAnchor {
                 (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
             })
             .collect();
-        residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let med = residuals[residuals.len() / 2];
+        let med = median_of(&residuals);
 
         let scale = fit.scale;
         if !scale.is_finite()
@@ -431,6 +452,48 @@ impl AprilTagAnchor {
 
         Ok(fit)
     }
+}
+
+/// The smallest |tag normal · gravity| the gravity-preserving mode accepts,
+/// i.e. the tag may be tilted up to 60 degrees from level. A wall/vertical tag
+/// (cosine near 0) is refused: the yaw-only correction cannot represent it and
+/// the tilt residual is too small to trip the fit gate.
+const MIN_TAG_GRAVITY_COSINE: f64 = 0.5;
+
+/// Rejects a tag whose plane is not roughly perpendicular to gravity, for the
+/// IMU-only gravity-preserving mode. Skips the check when the plane normal is
+/// degenerate (a collinear quad), leaving that to the fit gate.
+fn ensure_tag_gravity_aligned(
+    corners: &[Vec3F64],
+    gravity_axis: Vec3F64,
+) -> Result<(), AprilTagAnchorError> {
+    let Some(normal) = tag_plane_normal(corners) else {
+        return Ok(());
+    };
+    let g_len = gravity_axis.length();
+    let cosine = if g_len > f64::EPSILON {
+        (normal.dot(gravity_axis / g_len)).abs()
+    } else {
+        0.0
+    };
+    if cosine < MIN_TAG_GRAVITY_COSINE {
+        return Err(AprilTagAnchorError::TagNotGravityAligned {
+            cosine,
+            min: MIN_TAG_GRAVITY_COSINE,
+        });
+    }
+    Ok(())
+}
+
+/// Unit normal of the plane through a solved corner set, or `None` when the
+/// corners are collinear/degenerate.
+fn tag_plane_normal(corners: &[Vec3F64]) -> Option<Vec3F64> {
+    let base = *corners.first()?;
+    let a = *corners.get(1)? - base;
+    let b = *corners.get(2)? - base;
+    let n = a.cross(b);
+    let len = n.length();
+    (len > f64::EPSILON).then(|| n / len)
 }
 
 /// Largest group of observations that a single similarity reproduces.
@@ -473,19 +536,19 @@ fn largest_consistent_group(
             // tolerance by the map scale would let it pass on large maps.
             let tol = 0.5 * tag_size_m;
             let mut residuals = Vec::with_capacity(n);
-            let inliers: Vec<usize> = (0..n)
-                .filter(|&k| {
-                    let worst = quads[k]
-                        .iter()
-                        .zip(canonical)
-                        .map(|(c, g)| (hypothesis.apply(*c) - *g).length())
-                        .fold(0.0_f64, f64::max);
-                    residuals.push(worst);
-                    tol > 0.0 && worst <= tol
-                })
-                .collect();
-            residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = residuals.get(residuals.len() / 2).copied().unwrap_or(0.0);
+            let mut inliers = Vec::new();
+            for (k, quad) in quads.iter().enumerate() {
+                let worst = quad
+                    .iter()
+                    .zip(canonical)
+                    .map(|(c, g)| (hypothesis.apply(*c) - *g).length())
+                    .fold(0.0_f64, f64::max);
+                residuals.push(worst);
+                if worst <= tol {
+                    inliers.push(k);
+                }
+            }
+            let median = median_of(&residuals);
 
             // More inliers wins; ties break on the lower median residual.
             if inliers.len() > best_inliers.len()
@@ -527,7 +590,7 @@ fn implied_scale(corners: &[Vec3F64; 4], canonical: &[Vec3F64; 4]) -> f64 {
         }
         ratios[k] = (corners[*i] - corners[*j]).length() / canon;
     }
-    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ratios.sort_by(|a, b| a.total_cmp(b));
     0.5 * (ratios[2] + ratios[3])
 }
 
@@ -693,6 +756,33 @@ mod tests {
             tag_to_cam: Pose3d::IDENTITY,
         });
         assert!(anchor.solve(identity_kf_pose()).is_ok());
+    }
+
+    #[test]
+    fn gravity_mode_rejects_a_vertical_tag() {
+        // A wall-mounted tag (plane normal perpendicular to gravity) cannot be
+        // represented by a yaw-about-gravity correction; it must be refused
+        // rather than silently mis-corrected.
+        let mut anchor = AprilTagAnchor::new(AprilTagAnchorConfig {
+            tag_size_m: 0.1,
+            ..Default::default()
+        });
+        let quarter_turn =
+            rotation_from_axis_angle(Vec3F64::new(1.0, 0.0, 0.0), std::f64::consts::FRAC_PI_2);
+        for kf_idx in [0, 1] {
+            anchor.push_observation_for_test(TagObservation {
+                kf_idx,
+                tag_to_cam: Pose3d::from_rt(quarter_turn, Vec3F64::new(0.0, 0.0, 1.0)),
+            });
+        }
+
+        let err = anchor
+            .solve_gravity_preserving(|_| Some(Pose3d::IDENTITY), Vec3F64::new(0.0, 0.0, -9.81))
+            .expect_err("a vertical tag must be refused");
+        assert!(matches!(
+            err,
+            AprilTagAnchorError::TagNotGravityAligned { .. }
+        ));
     }
 
     #[test]

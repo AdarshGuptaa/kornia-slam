@@ -61,6 +61,17 @@ jobs:
             test_cmd: cargo test -p kornia-slam --features apriltag
             build_cmd: ""
 
+          # App with the AprilTag feature: the app's apriltag unit tests and
+          # the CLI smoke path with the anchor stage available.
+          - name: app-apriltag
+            apt: ""
+            test_cmd: cargo test --manifest-path apps/kornia-slam-app/Cargo.toml --features apriltag
+            build_cmd: >-
+              cargo run
+              --manifest-path apps/kornia-slam-app/Cargo.toml
+              --features apriltag
+              -- --help
+
           # App with no default features — just confirms the non-viz build
           # links and the CLI parses.
           - name: app-no-default

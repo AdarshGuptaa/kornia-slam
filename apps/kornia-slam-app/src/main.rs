@@ -295,11 +295,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is the full Sim3 the tag geometry defines.
     //
     // Only a *successful* anchor is the alignment of record: the recorded
-    // trajectory is corrected by the same Sim3 the map received and the
-    // evaluation trusts it (no second best-fit), so the reported errors show
-    // whether the tag made the map metric. A failed solve leaves the map in
-    // its arbitrary frame, so the report falls back to the best-fit Sim3
-    // alignment rather than scoring raw map units against metric ground truth.
+    // trajectory is corrected by the same Sim3 the map received, and the
+    // evaluation then registers it to ground truth with a scale-fixed (rigid)
+    // transform, so a wrong anchor scale still surfaces as error instead of
+    // being absorbed by a second best-fit. A failed solve leaves the map in its
+    // arbitrary frame, so the report falls back to the best-fit Sim3.
     #[cfg(feature = "apriltag")]
     let anchor_trusted = if system.apriltag_anchor_enabled() {
         match system.apply_apriltag_anchor() {
