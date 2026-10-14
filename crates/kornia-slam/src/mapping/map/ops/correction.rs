@@ -9,7 +9,9 @@
 use super::snapshot::KeyframeBaState;
 use crate::mapping::map::{BaUpdate, Map};
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+#[cfg(feature = "apriltag")]
+use kornia_algebra::Mat3F64;
+use kornia_algebra::{SO3F64, Vec3F64};
 use kornia_sensors::imu::ImuBias;
 use std::collections::{HashMap, HashSet};
 
@@ -407,6 +409,7 @@ impl Map {
     /// untouched. This is the post-hoc metric anchor's writeback: `s`, `R` and
     /// `t` map the (arbitrary, monocular) map frame onto the metric reference
     /// frame a known-size target defines.
+    #[cfg(feature = "apriltag")]
     pub fn apply_world_similarity(
         &mut self,
         scale: f64,
@@ -472,6 +475,7 @@ impl Map {
 }
 
 /// Refusal to apply a world similarity transform to the live map.
+#[cfg(feature = "apriltag")]
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum WorldSimilarityError {
     #[error("invalid similarity scale {0}")]
@@ -654,6 +658,7 @@ fn finite_bias(bias: &ImuBias) -> bool {
 /// Accepts a rotation matrix only if it is a proper orthonormal rotation
 /// (`RᵀR = I`, `det R = +1`) within [`ROTATION_NORM_TOLERANCE`] — rejecting
 /// both scaled/unnormalized matrices and reflections.
+#[cfg(feature = "apriltag")]
 fn proper_rotation(rotation: &Mat3F64) -> bool {
     if !finite_mat3(rotation) {
         return false;
@@ -724,7 +729,9 @@ mod tests {
         tests::{test_frame, test_frame_with_pose},
     };
     use kornia_3d::pose::Pose3d;
-    use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
+    #[cfg(feature = "apriltag")]
+    use kornia_algebra::Mat3F64;
+    use kornia_algebra::{SO3F64, Vec3F64};
 
     #[test]
     fn inertial_alignment_assigns_velocities_by_keyframe_id() {
@@ -1031,6 +1038,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "apriltag")]
     #[test]
     fn world_similarity_transforms_keyframes_landmarks_and_velocities() {
         let scale = 1.7;
@@ -1080,6 +1088,7 @@ mod tests {
         assert!((map.get_keyframe(0).unwrap().velocity_world - expected_velocity).length() < 1e-9);
     }
 
+    #[cfg(feature = "apriltag")]
     #[test]
     fn world_similarity_rejects_invalid_inputs_without_mutation() {
         let mut map = Map::new();
@@ -1117,6 +1126,7 @@ mod tests {
         assert_eq!(map.state_fingerprint_for_test(), before);
     }
 
+    #[cfg(feature = "apriltag")]
     #[test]
     fn world_similarity_identity_leaves_geometry_unchanged() {
         let mut map = Map::new();

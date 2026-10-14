@@ -61,10 +61,12 @@ mod ops;
 pub use imu_factor::ImuFactor;
 pub use keyframe::Keyframe;
 pub use map_point::{LandmarkObservation, MapPoint, ObservationKey};
+#[cfg(feature = "apriltag")]
+pub use ops::WorldSimilarityError;
 pub use ops::{
     BaSnapshot, BaUpdate, BaUpdateError, BaWindow, InertialAlignment, InertialAlignmentError,
     KeyframeBaCorrection, KeyframeVelocity, LocalBaMergeResult, MapPointMergeResult,
-    PoseGraphCorrectionError, PoseGraphCorrectionResult, WorldSimilarityError,
+    PoseGraphCorrectionError, PoseGraphCorrectionResult,
 };
 pub use ops::{
     InsertionResult, LandmarkSeed, LandmarkTarget, MapInsertion, MapMutationError, ObservationLink,
