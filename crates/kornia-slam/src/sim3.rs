@@ -1,13 +1,17 @@
 //! Similarity (Sim3) alignment of two 3D point sets.
 //!
-//! `align_sim3` is the closed-form weighted Umeyama fit (scale, rotation,
-//! translation); `align_sim3_robust` wraps it in a Huber-weighted IRLS loop
+//! `align_sim3` delegates the plain fit to `kornia-algebra`'s f64 Umeyama.
+//! `align_sim3_robust` wraps a weighted solve in a Huber-weighted IRLS loop
 //! with a hard outlier rejection pass, for correspondences contaminated by
 //! gross errors (e.g. AprilTag corners from a misdecoded tag).
 //!
 //! Frames and units are the caller's: both point sets must be expressed in the
 //! same physical units, and the returned transform maps `src` coordinates onto
 //! `dst` coordinates.
+//!
+//! `umeyama_weighted` and `align_sim3_gravity_preserving` have no equivalent in
+//! kornia-rs today (upstream Umeyama is unweighted and has no robust or
+//! gravity-preserving variant); both are upstream candidates.
 
 use kornia_algebra::{Mat3F64, Vec3F64, linalg::svd::svd3_f64};
 // ── Sim3 alignment ───────────────────────────────────────────────────────
@@ -93,9 +97,22 @@ fn umeyama_weighted(src: &[Vec3F64], dst: &[Vec3F64], w: &[f64]) -> Sim3Alignmen
 
 /// Umeyama Sim3 fit mapping `est` onto `gt` (least-squares scale, rotation,
 /// translation).
+///
+/// Delegates to `kornia-algebra`'s f64 Umeyama, which computes the SVD
+/// numerically robustly. The weighted core below is only the fallback for the
+/// SVD error that upstream API reports, so this stays infallible.
 pub fn align_sim3(est: &[Vec3F64], gt: &[Vec3F64]) -> Sim3Alignment {
-    let w = vec![1.0_f64; est.len()];
-    umeyama_weighted(est, gt, &w)
+    match kornia_algebra::linalg::rigid::umeyama_f64(est, gt, true) {
+        Ok((rotation, translation, scale)) => Sim3Alignment {
+            scale,
+            rotation,
+            translation,
+        },
+        Err(_) => {
+            let w = vec![1.0_f64; est.len()];
+            umeyama_weighted(est, gt, &w)
+        }
+    }
 }
 
 /// Configuration for the Huber-weighted IRLS robust Sim3 fit.
@@ -238,9 +255,9 @@ pub fn align_sim3_gravity_preserving(
     } else {
         Vec3F64::new(0.0, 0.0, 1.0)
     };
-    let u_raw = cross(&seed, &g);
+    let u_raw = seed.cross(g);
     let u = u_raw / u_raw.length().max(f64::EPSILON);
-    let v = cross(&g, &u);
+    let v = g.cross(u);
 
     let n = src.len() as f64;
     let mut mu_src = Vec3F64::ZERO;
@@ -272,14 +289,6 @@ pub fn align_sim3_gravity_preserving(
         rotation,
         translation,
     }
-}
-
-fn cross(a: &Vec3F64, b: &Vec3F64) -> Vec3F64 {
-    Vec3F64::new(
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x,
-    )
 }
 
 /// Median of a slice. Sorts a copy, so the input order never matters; an empty
@@ -579,25 +588,27 @@ mod tests {
 
         let plain_fit = align_sim3(&src, &dst);
 
-        // All-ones weights must reproduce align_sim3 exactly, since
-        // align_sim3 is defined as umeyama_weighted with w = 1.0.
+        // `align_sim3` delegates to the upstream solver while the weighted core
+        // is ours, so the two agree to solver precision rather than bit-exactly.
         let ones = vec![1.0_f64; n];
         let weighted_ones_fit = umeyama_weighted(&src, &dst, &ones);
 
-        assert!((weighted_ones_fit.scale - plain_fit.scale).abs() < 1e-12);
-        assert!(mat3_frobenius_diff(&weighted_ones_fit.rotation, &plain_fit.rotation) < 1e-12);
-        assert!(vec3_norm(weighted_ones_fit.translation - plain_fit.translation) < 1e-12);
+        assert!((weighted_ones_fit.scale - plain_fit.scale).abs() < 1e-9);
+        assert!(mat3_frobenius_diff(&weighted_ones_fit.rotation, &plain_fit.rotation) < 1e-9);
+        assert!(vec3_norm(weighted_ones_fit.translation - plain_fit.translation) < 1e-9);
 
         // Weights must only matter up to a global scale factor: since the
         // weighted centroid, covariance, and var_est are all normalized by
-        // Σw, any uniform nonzero constant should also reproduce the
-        // unweighted result exactly.
+        // Σw, any uniform nonzero constant reproduces the all-ones solve
+        // exactly.
         let constant = vec![3.7_f64; n];
         let weighted_const_fit = umeyama_weighted(&src, &dst, &constant);
 
-        assert!((weighted_const_fit.scale - plain_fit.scale).abs() < 1e-12);
-        assert!(mat3_frobenius_diff(&weighted_const_fit.rotation, &plain_fit.rotation) < 1e-12);
-        assert!(vec3_norm(weighted_const_fit.translation - plain_fit.translation) < 1e-12);
+        assert!((weighted_const_fit.scale - weighted_ones_fit.scale).abs() < 1e-12);
+        assert!(
+            mat3_frobenius_diff(&weighted_const_fit.rotation, &weighted_ones_fit.rotation) < 1e-12
+        );
+        assert!(vec3_norm(weighted_const_fit.translation - weighted_ones_fit.translation) < 1e-12);
     }
 
     #[test]
@@ -678,5 +689,30 @@ mod tests {
         let fit = align_sim3_robust(&src, &dst, HuberIrlsConfig::default());
         assert!((fit.scale - true_scale).abs() < 1e-2, "scale {}", fit.scale);
         assert!(mat3_frobenius_diff(&fit.rotation, &true_r) < 5e-2);
+    }
+
+    #[test]
+    fn align_sim3_fits_coplanar_corners_exactly() {
+        // A RANSAC hypothesis fits two observations = 8 coplanar tag corners.
+        // The delegated upstream solver must recover the transform exactly
+        // despite the rank-deficient covariance (the case the old svd3_f64
+        // path needed a Tikhonov term for).
+        let s = 0.05;
+        let canonical = [
+            Vec3F64::new(s, -s, 0.0),
+            Vec3F64::new(s, s, 0.0),
+            Vec3F64::new(-s, s, 0.0),
+            Vec3F64::new(-s, -s, 0.0),
+        ];
+        let src: Vec<Vec3F64> = canonical.iter().chain(canonical.iter()).copied().collect();
+        let scale = 2.5;
+        let r = rotation_from_axis_angle(Vec3F64::new(0.3, 1.0, 0.2), 0.9);
+        let t = Vec3F64::new(1.0, -2.0, 0.5);
+        let dst: Vec<Vec3F64> = src.iter().map(|&p| (r * p) * scale + t).collect();
+
+        let fit = align_sim3(&src, &dst);
+        assert!((fit.scale - scale).abs() < 1e-9, "scale {}", fit.scale);
+        assert!(mat3_frobenius_diff(&fit.rotation, &r) < 1e-9);
+        assert!(vec3_norm(fit.translation - t) < 1e-9);
     }
 }

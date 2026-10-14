@@ -45,6 +45,8 @@ pub enum ConfigError {
     EmptyVocabularyPath,
     #[error("loop closing needs metric input: enable stereo cameras or the IMU")]
     LoopClosingWithoutMetricScale,
+    #[error("unknown AprilTag family '{0}' (use a kornia-apriltag canonical name, e.g. tag36_h11)")]
+    UnknownTagFamily(String),
     #[error("configuration requests {0}, but the source does not provide it")]
     MissingSensor(&'static str),
     #[error("stereo cameras need rectified images; the source supplies raw fisheye images")]
@@ -91,8 +93,17 @@ impl OrbSlamPipeline {
 /// makes an unknown family unrepresentable.
 #[cfg(feature = "apriltag")]
 fn validate_apriltag_anchor(mode: &AprilTagAnchorMode) -> Result<(), ConfigError> {
-    if let AprilTagAnchorMode::Enabled { tag_size_m, .. } = mode {
+    if let AprilTagAnchorMode::Enabled {
+        tag_size_m, family, ..
+    } = mode
+    {
         check("apriltag_anchor.tag_size_m", *tag_size_m, POSITIVE)?;
+        if family
+            .parse::<crate::apriltag_anchor::TagFamilyKind>()
+            .is_err()
+        {
+            return Err(ConfigError::UnknownTagFamily(family.clone()));
+        }
     }
     Ok(())
 }

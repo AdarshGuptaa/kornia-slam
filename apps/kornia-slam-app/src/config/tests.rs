@@ -267,7 +267,7 @@ fn shipped_run_files_load() {
 #[cfg(feature = "apriltag")]
 #[test]
 fn apriltag_run_file_enables_the_stage() {
-    use kornia_slam::system::{AprilTagAnchorMode, AprilTagFamily};
+    use kornia_slam::system::AprilTagAnchorMode;
     let run = RunConfig::from_ron_file(configs_dir().join("apriltag-anchor.ron")).unwrap();
     let PipelineDefinition::OrbSlam(orb) = &run.system.pipeline;
     assert_eq!(
@@ -275,7 +275,7 @@ fn apriltag_run_file_enables_the_stage() {
         AprilTagAnchorMode::Enabled {
             tag_id: 2,
             tag_size_m: 0.1,
-            family: AprilTagFamily::Tag36H11,
+            family: "tag36_h11".to_string(),
         }
     );
 }

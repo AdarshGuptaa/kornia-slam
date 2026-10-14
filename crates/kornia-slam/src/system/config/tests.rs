@@ -624,7 +624,7 @@ mod apriltag_anchor_tests {
         AprilTagAnchorMode::Enabled {
             tag_id: 2,
             tag_size_m: 0.1,
-            family: AprilTagFamily::Tag36H11,
+            family: "tag36_h11".to_string(),
         }
     }
 
@@ -651,12 +651,26 @@ mod apriltag_anchor_tests {
     }
 
     #[test]
+    fn rejects_an_unknown_tag_family() {
+        let mut config = SystemConfig::default();
+        orb_mut(&mut config).apriltag_anchor = AprilTagAnchorMode::Enabled {
+            tag_id: 0,
+            tag_size_m: 0.1,
+            family: "tag36h12".to_string(),
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::UnknownTagFamily(name)) if name == "tag36h12"
+        ));
+    }
+
+    #[test]
     fn rejects_a_non_positive_tag_size() {
         let mut config = SystemConfig::default();
         orb_mut(&mut config).apriltag_anchor = AprilTagAnchorMode::Enabled {
             tag_id: 0,
             tag_size_m: 0.0,
-            family: AprilTagFamily::Tag16H5,
+            family: "tag16_h5".to_string(),
         };
         assert!(matches!(
             config.validate(),

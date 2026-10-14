@@ -14,7 +14,7 @@ mod validation;
 
 pub use build::BuildError;
 #[cfg(feature = "apriltag")]
-pub use config::{AprilTagAnchorMode, AprilTagFamily};
+pub use config::AprilTagAnchorMode;
 pub use config::{
     CameraSelection, FrontendConfig, LoopClosingMode, MappingConfig, OrbFrontendConfig,
     OrbSlamPipeline, OrbTuning, PipelineDefinition, SYSTEM_CONFIG_VERSION, SensorSelection,

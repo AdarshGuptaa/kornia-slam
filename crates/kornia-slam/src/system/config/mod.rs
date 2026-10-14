@@ -213,52 +213,20 @@ pub enum AprilTagAnchorMode {
         tag_id: u16,
         /// Physical tag size in metres (edge length of the black square).
         tag_size_m: f64,
-        /// Tag family the printed tag belongs to.
-        family: AprilTagFamily,
+        /// Tag family, by the detector's canonical name (`"tag36_h11"`, ...);
+        /// parsed by `kornia-apriltag`'s `FromStr`, so the crate stays the one
+        /// source of truth for which families exist.
+        family: String,
     },
-}
-
-/// A built-in AprilTag family a run file may name.
-#[cfg(feature = "apriltag")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum AprilTagFamily {
-    Tag16H5,
-    Tag25H9,
-    Tag36H10,
-    Tag36H11,
-    TagCircle21H7,
-    TagCircle49H12,
-    TagCustom48H12,
-    TagStandard41H12,
-    TagStandard52H13,
-}
-
-#[cfg(feature = "apriltag")]
-impl AprilTagFamily {
-    /// The detector's family kind.
-    pub(crate) fn kind(self) -> crate::apriltag_anchor::TagFamilyKind {
-        use crate::apriltag_anchor::TagFamilyKind;
-        match self {
-            Self::Tag16H5 => TagFamilyKind::Tag16H5,
-            Self::Tag25H9 => TagFamilyKind::Tag25H9,
-            Self::Tag36H10 => TagFamilyKind::Tag36H10,
-            Self::Tag36H11 => TagFamilyKind::Tag36H11,
-            Self::TagCircle21H7 => TagFamilyKind::TagCircle21H7,
-            Self::TagCircle49H12 => TagFamilyKind::TagCircle49H12,
-            Self::TagCustom48H12 => TagFamilyKind::TagCustom48H12,
-            Self::TagStandard41H12 => TagFamilyKind::TagStandard41H12,
-            Self::TagStandard52H13 => TagFamilyKind::TagStandard52H13,
-        }
-    }
 }
 
 #[cfg(feature = "apriltag")]
 impl AprilTagAnchorMode {
     /// Resolves the stage into its anchor configuration, or `None` when
-    /// disabled. Detector tuning (decision margin, Hamming distance, robust
-    /// weights) stays Rust-side, the `OrbTuning` precedent; a run file sets
-    /// only the id, size and family.
+    /// disabled or the family name is unknown (`validate` rejects the latter
+    /// before the system is built). Detector tuning (decision margin, Hamming
+    /// distance, robust weights) stays Rust-side, the `OrbTuning` precedent; a
+    /// run file sets only the id, size and family.
     pub(crate) fn config(&self) -> Option<crate::apriltag_anchor::AprilTagAnchorConfig> {
         match self {
             Self::Disabled => None,
@@ -269,7 +237,7 @@ impl AprilTagAnchorMode {
             } => Some(crate::apriltag_anchor::AprilTagAnchorConfig {
                 tag_id: *tag_id,
                 tag_size_m: *tag_size_m,
-                family: family.kind(),
+                family: family.parse().ok()?,
                 ..Default::default()
             }),
         }
@@ -357,7 +325,7 @@ impl fmt::Display for SystemConfig {
         {
             writeln!(
                 f,
-                "  apriltag anchor: id={tag_id} size={tag_size_m} m family={family:?}"
+                "  apriltag anchor: id={tag_id} size={tag_size_m} m family={family}"
             )?;
         }
         Ok(())

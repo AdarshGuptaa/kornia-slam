@@ -404,7 +404,7 @@ mod apriltag_anchor_tests {
         orb.apriltag_anchor = AprilTagAnchorMode::Enabled {
             tag_id: 2,
             tag_size_m: 0.1,
-            family: AprilTagFamily::Tag36H11,
+            family: "tag36_h11".to_string(),
         };
         let mut system = SlamSystem::build(system_config, stereo_imu_rig()).unwrap();
 
@@ -433,7 +433,7 @@ mod apriltag_gravity_mode_tests {
         orb.apriltag_anchor = AprilTagAnchorMode::Enabled {
             tag_id: 2,
             tag_size_m: 0.1,
-            family: AprilTagFamily::Tag36H11,
+            family: "tag36_h11".to_string(),
         };
         let mut system = SlamSystem::build(system_config, stereo_imu_rig()).unwrap();
 

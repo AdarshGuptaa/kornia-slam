@@ -19,11 +19,11 @@
         version: 1,
         sensors: ( cameras: Mono, imu: false ),
         pipeline: OrbSlam((
-            // A 100 mm tag36h11 with id 2 makes the final map metric.
+            // A 100 mm tag36_h11 with id 2 makes the final map metric.
             apriltag_anchor: Enabled(
                 tag_id: 2,
                 tag_size_m: 0.1,
-                family: Tag36H11,
+                family: "tag36_h11",
             ),
         )),
     ),
